@@ -19,10 +19,12 @@
 //!
 //! 超限或 CRC 错误 → 关闭连接（`PROTO_UNSUPPORTED` 计数）。
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::base::ErrCode;
-use crate::buf::{Buf, BufSlice};
+use crate::buf::{Buf, BufSlice, Lane, MemPool};
 
 pub const MAGIC: [u8; 4] = *b"WMF1";
 pub const PROTO_MAJOR: u8 = 1;
@@ -172,6 +174,31 @@ pub struct ErrorBody {
     pub extra: u64,
 }
 
+impl ErrorBody {
+    /// 只有错误码与附加值的 ERROR 帧 body（msg 是错误码名；leader_hint 由需要的调用方自己填）。
+    pub fn new(code: ErrCode, extra: u64) -> ErrorBody {
+        ErrorBody { code: code.0, msg: code.to_string(), leader_hint: None, retry_after_ms: 0, extra }
+    }
+}
+
+/// msg_type 的名字（日志与指标的 `family` 标签用）；不认识的返回 None。
+pub fn msg_name(msg_type: u16) -> Option<&'static str> {
+    Some(match msg_type {
+        MSG_HELLO => "Hello",
+        MSG_CHALLENGE => "Challenge",
+        MSG_AUTH => "Auth",
+        MSG_WELCOME => "Welcome",
+        MSG_PING => "Ping",
+        MSG_META_CALL => "MetaCall",
+        MSG_DATA_CALL => "DataCall",
+        MSG_PEER_CALL => "PeerCall",
+        MSG_NODE_CALL => "NodeCall",
+        MSG_RAFT => "RaftMsg",
+        MSG_SNAPSHOT_FETCH => "SnapshotFetch",
+        _ => return None,
+    })
+}
+
 // ---- 3.6.4：core 只看到这两个 ----
 pub struct OutFrame {
     pub hdr: FrameHeader,
@@ -186,8 +213,34 @@ pub struct InFrame {
     pub bulk: Option<Buf>,
     pub bulk_dropped: bool, // bulk_dropped：取不到缓冲，bulk 已读出丢弃；请求 → core 回 BUSY，OneWay（RaftMsg）→ 丢弃（raft 会重发）
 }
+impl InFrame {
+    /// 这是 ERROR 帧（flags bit3）时返回它的 ErrorBody（body 解不开时按 INTERNAL）；否则 None。
+    pub fn error(&self) -> Option<ErrorBody> {
+        if self.hdr.flags & FLAG_ERROR == 0 {
+            return None;
+        }
+        Some(crate::proto::decode_body(&self.body).unwrap_or_else(|_| ErrorBody::new(ErrCode::INTERNAL, 0)))
+    }
+}
+
 // bulk 的各段在线上按顺序拼成一段（TCP 依次 write_all；RDMA 依次 READ 进一个 Buf），接收方看到的永远是一个 Buf。
 // recv_into 是请求方为"期望的响应 bulk"预先分配的缓冲：TCP 把响应 bulk read_exact 进去，RDMA 让对端 WRITE 进去。
+
+/// 传输插件收帧时给 bulk 找缓冲（3.6.1、4.1；tcp、mem、rdma 共用这一条规则）：回复帧优先用请求方给的 `recv_into`
+/// （容量够时）；否则从池里取——`PeerCall` 用复制 lane（链上后继一定收得进前驱的转发，附录 C 的 C-5），其余用普通 lane——
+/// 最多等 `wait`，取不到回 `BUSY`（这时传输插件把 bulk 读出丢弃，交出 `bulk_dropped = true`）。返回的缓冲 `len()` = bulk_len。
+pub fn bulk_buf(pool: &MemPool, hdr: &FrameHeader, recv_into: Option<Buf>, wait: Duration) -> Result<Buf, ErrCode> {
+    let n = hdr.bulk_len as usize;
+    let mut b = match recv_into {
+        Some(b) if b.capacity() >= n => b,
+        _ => {
+            let lane = if hdr.msg_type == MSG_PEER_CALL { Lane::Repl } else { Lane::Normal };
+            pool.get(n, lane, wait)?
+        }
+    };
+    b.set_len(n);
+    Ok(b)
+}
 
 #[cfg(test)]
 mod tests {

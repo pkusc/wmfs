@@ -40,8 +40,8 @@
 2. 除 `#[derive(...)]` 外不写宏（不写 `macro_rules!`、不写过程宏）；可以调用标准库与依赖库已有的宏（`format!`、`vec!`、`include_str!`、`assert!`、`slog::o!`）。构造 raft 的 logger 用 `slog::Logger::root(SlogBridge, slog::o!())`（`slog::OwnedKV` 的字段是 `#[doc(hidden)]`，不是稳定 API）。
 3. 不写复杂泛型：跨模块接口一律用 trait 对象（`Arc<dyn T>` / `Box<dyn T>`），trait 必须对象安全；生命周期参数只出现在短期借用视图上。
 4. `unsafe` 只允许出现在：`core/src/buf/pool.rs`（mmap、切片）、`core/src/base/sys.rs`（libc 封装：`statvfs`、`copy_file_range`、`getrandom`、`fsync` 目录、`send_signal(pid, sig)`（实现注记（M0）：pid ≤ 0 一律 `EINVAL`——`kill(0, ..)`/`kill(-1, ..)` 会作用于整个进程组/全部进程）、`block_signals_and_wait(&[SIGTERM, SIGINT])`（启动时所有线程屏蔽这些信号，由 main 线程 `sigwait`）（实现注记（M0）：拆成 `block_signals(&[..])`（main 在创建任何线程之前调用，之后的线程继承屏蔽）与 `wait_signals(&[..])`（main 最后阻塞等待）两个函数——只在创建线程之后屏蔽的话，信号可能投递到别的线程并按默认动作杀掉进程）、`set_keepalive(&TcpStream)`、`memlock_limit()`）、`core/src/hooks/cabi.rs`（libloading 与 FFI 调用）、`plugins/rdma/`（sideway 的 `reg_mr` 等 unsafe 接口）。每处写 `// SAFETY:` 中文说明。其他 crate（cli、plugins/tcp、testkit）只调用 `sys.rs` 的安全封装；**不引入任何信号处理 crate**（ctrlc、signal-hook 等）。
-5. 错误统一用 `ErrCode`（3.3.7）；网络与磁盘结果不得 `unwrap()`；`panic!` 只用于"不可能发生"的不变量破坏，并在消息里写清楚是哪条不变量。**例外（fail-stop）**：raft 线程与执行器线程上的 redb 错误（`begin_write/commit/读表` 失败）一律"写一条错误日志 + `std::process::abort()`"——状态机写一半时继续运行比崩溃更危险；重启后由 raft 日志恢复。伪代码里的 `or_abort(...)` 就是这个意思。（实现注记（M0）：解析和校验**用户输入**的函数——尺寸与时长、node.toml、key 文件、fail point 配置，M7 起的属性值——返回 `Result<T, String>`，内容是给人看的中文原因，因为 `ErrCode` 说不清"哪个键写错了"，而且 wmfs-api 用不了 core 的 `ErrCode`；系统、磁盘、网络与协议错误一律用 `ErrCode`；经 RPC 或管理 API 返回时由调用方映射成 `EINVAL` + message。）
-6. 所有时间来自 `core::base::clock`：`mono_ms()`（单调，租约与超时）与 `wall_ms()`（墙钟，mtime 与 cap 过期）；fail point 可以注入偏移与速率（3.11）。
+5. 错误统一用 `ErrCode`（3.3.7）；网络与磁盘结果不得 `unwrap()`；`panic!` 只用于"不可能发生"的不变量破坏，并在消息里写清楚是哪条不变量。**例外（fail-stop）**：raft 线程与执行器线程上的 redb 错误（`begin_write/commit/读表` 失败）一律"写一条错误日志 + `std::process::abort()`"——状态机写一半时继续运行比崩溃更危险；重启后由 raft 日志恢复。伪代码里的 `or_abort(...)` 就是这个意思。（实现注记（M0）：解析和校验**用户输入**的函数——尺寸与时长、node.toml、key 文件、fail point 配置，M7 起的属性值——返回 `Result<T, String>`，内容是给人看的中文原因，因为 `ErrCode` 说不清"哪个键写错了"，而且 wmfs-api 用不了 core 的 `ErrCode`；系统、磁盘、网络与协议错误一律用 `ErrCode`；经 RPC 或管理 API 返回时由调用方映射成 `EINVAL` + message。）（实现注记（M1）：只被 CLI 调用、错误直接打印给人看的启动装配与 init 函数——`server::start`、`init_node`、`read_master`、`NodeFile::read`、`MgmtServer::bind`——也返回 `Result<T, String>`，其中的系统、磁盘、网络错误一律在消息里带上文件路径或地址；它们的调用方只是把消息打印出来。）
+6. 所有时间来自 `core::base::clock`：`mono_ms()`（单调，租约与超时）与 `wall_ms()`（墙钟，mtime 与 cap 过期）；fail point 可以注入偏移与速率（3.11）。（实现注记（M1）：例外是 wmfs-mgr——它不依赖 core，`ApiClient` 的签名时间戳用标准库的 `SystemTime`，所以 `clock.wall.skew_ms` 对 CLI 与 mgr 的签名时间不起作用；其他代码一律用 `core::base::clock`。）
 7. 所有随机数来自 `core::base::rand::fill(&mut [u8])`（`libc::getrandom`）；不引入 rand crate。（实现注记（M0）：wmfs-api 不依赖 core，所以 fail point 的 `pct()` 用标准库 `RandomState` 播种的每线程 xorshift，只决定"这次触发不触发"，不用于任何安全用途；其他代码一律用 `core::base::rand`。）
 8. 所有对 `127.0.0.1` 的 HTTP 访问必须用 `ureq::Agent::config_builder().proxy(None)...build().into()` 构造的 agent（本机设置了 `http_proxy`，不这样会走代理失败）。
 9. 新增任何可配置行为先回答理念文档 10.1 的六个问题；能是目录属性就必须是目录属性。
@@ -239,6 +239,8 @@ wmfs/
 
 为什么不是每个插件一个 crate：首发约 27 个插件，每个一个 Cargo.toml 太碎。`wmfs-plugins` 内每个插件一个目录、一个 feature，插件只能 `use wmfs_core::...` 的公开 API，不得 `use` 其他插件模块（`tests/` 里一个测试扫描源码强制这一点）。第三方插件可以是独立 crate（`examples/plugin-mem-transport` 就是范例）。
 
+> 实现注记（M1）：这条源码扫描放在 `scripts/ci.sh rules`（与 0.2 的其他机械检查放在一起，`scripts/accept.sh M0` 会跑），而不是 `tests/` 里的测试：`plugins/<名字>/` 下不得出现 `wmfs_api`、不得引用别的插件模块（`crate::`/`super::`/`wmfs_plugins::` 加别的插件名），`plugins/Cargo.toml` 不得直接依赖 wmfs-api。插件的指标与 fail point 经 `wmfs_core::api`，部署参数表是 `wmfs_core::base::config::PluginTable`（= `toml::Table` 的别名），所以插件 crate 只依赖 wmfs-core（不必直接依赖 toml）。下一段 M2 验收里的"`core/src` 除注释外 grep 不到 rdma"也在 `rules` 里检查（命令与 roadmap 完全相同）。
+
 **新增一个传输插件 = 新建插件目录（或独立 crate）+ `cli/src/registry.rs` 加一行 + 一个 feature，`core/` 一行不改**（理念文档第 9 章成功标准）。M2 的验收：开工时打 tag `m2-base`，完成后 `git diff --stat m2-base..m2 -- core/` 为空，并且 `core/src` 里除注释外 grep 不到 `rdma`。
 
 ### 2.2 模块清单与行数（不含测试）
@@ -271,6 +273,8 @@ wmfs/
 | **合计** | | **≈ 29,600**（目标上限 30k；测试另计约 12k） |
 
 > 实现注记（M0）：M0 结束时非测试代码约 4,050 行，超出 M0 累计预算（2,900）约 40%：3.2.7–3.12 的契约类型骨架按 `rustfmt`（行宽 120）展开后比估算大（proto ≈ 590、schema ≈ 540、hooks ≈ 440 行），另有审查后补的单调时钟注入、`raft_state` 编解码等。按 roadmap §0 第 7 条重估了剩余工作，三个模块的估算改为：**wmfs-api 550 → 900**（7.1 约 30 个管理端点的请求/响应结构都要放进 `types.rs`，一个还没写）；**cli 2,810 → 2,950**（doctor 已约 300 行，原估 180）；**core/proto 1,300 → 900**（M0 已写完全部消息类型，只剩握手证明与密钥派生、cap 签名与校验，约 200 行）。重估后 Σ max(当前, 估算) ≈ 29,650（上限 30,000）；若不下调 core/proto 则约 30,050。主管于 2026-10-21 确认接受这三项重估（core/proto 的消息类型确实已在 M0 写完）。`scripts/loc.sh` 用重估后的数字。
+> 实现注记（M1）：M1 结束时非测试代码约 7,000 行（M1 新增约 2,950 行，预算 2,540，超出约 16%：主要是 core/net——服务端、客户端、连接包装、握手、重试一次写完——与 cli 的 `dev`/`ping`/`failpoint`）。按 roadmap §0 第 7 条重估了四个模块：**core/net 800 → 1,000**（已写完约 900，余下 leader_hint、OneWay 服务、call_cb 后台建连）；**examples/plugin-mem-transport 150 → 180**（已写完）；**plugins 4,980 → 4,810**（tcp 300 → 200、shared-key 150 → 80，都已写完）；**dashboard 920 → 880**（ApiClient 160 → 120，已写完）。重估后 Σ max(当前, 估算) ≈ 29,670（上限 30,000）。`scripts/loc.sh` 用重估后的数字。
+> 实现注记（M1，审查修复后）：修 M1 审查发现（超限帧只让一个请求失败、握手前不发保活、流被丢弃回 EIO、回复缺 bulk 按 BUSY、本地失败交给 rpc-timer、热路径指标句柄、计数器预注册等）后非测试代码约 7,310 行，又重估两个模块：**core/net 1,000 → 1,120**（已写约 1,060，余下 leader_hint、OneWay 服务、call_cb 后台建连约 60）；**examples/plugin-mem-transport 180 → 195**（已写完：加了帧上限与收帧计时）。重估后 Σ max ≈ 29,800（上限 30,000）。
 
 体量控制：每个里程碑结束时 `scripts/loc.sh` 与 roadmap 的预算表对账，并**按模块重新估算剩余工作**（core/data、cli/fuse、core/client 最容易超）。预计总量超过 30k 时，先按 roadmap"简化储备"删减；删完仍超出，就停下来与人类商量砍哪些功能，不悄悄扩大范围。
 
@@ -295,6 +299,8 @@ wmfs/
 | `sideway 0.4`（feature `rdma`） | RDMA（verbs；可注册外部内存、支持 RDMA READ/WRITE）；经 rdma-mummy-sys 在**运行时** dlopen libibverbs，所以不带 RDMA 的机器与容器不需要装 rdma-core | plugins/rdma |
 
 **不用**：`ibverbs 0.9`（只有 SEND/RECV、只能注册自己分配的内存、类型带生命周期）、`tokio`、`openraft`、`io-uring`、`rand`、`log`、任何信号处理 crate。
+
+> 实现注记（M1）：`ureq` 在根 `Cargo.toml` 里关掉默认 feature（不编 rustls/TLS 与 gzip）：首发只访问本机与内网的 http 管理 API；M14 的 webhook 若要 https 再打开 `rustls`。`wmfs-plugins` 在工作区依赖里也关掉默认 feature，由使用者（`cli/Cargo.toml` 的 `tcp`、`shared-key`、`mem` feature）决定编哪些插件。
 
 
 ---
@@ -362,6 +368,7 @@ semantics: consistency=cto attr_ttl=1s (来源 /); quota=quantum:64MiB overshoot
 - 校验默认 crc32c（aarch64 有硬件指令）。
 - 所有持久化记录 = 1 字节记录版本号 + `postcard` 编码的结构体（例外：`INLINE` 是原始字节）。
 - 唯一的原子替换工具 `atomic_write(path, bytes)`：写 `<dir>/.<name>.tmp-<随机>` → `fdatasync` → `rename` 覆盖 → `fsync(目录)`。`NODE`、`TARGET`、本地任务游标用它；chunk 的同步/修复安装用同样的步骤，只是临时文件放在 target 的 `t/` 目录（R3）。
+  实现注记（M1）：`atomic_write` 在 `core/src/base/sys.rs`（不需要 unsafe），文件权限一律 0600（NODE、密钥、超级块、任务游标都只给本用户读）。
 
 #### 3.2.2 节点数据目录
 
@@ -748,6 +755,7 @@ TCP 与 RDMA 跑**同一种帧**（理念文档第 7 章 [默认]）。帧 = 48 
 #### 3.3.2 握手、认证与能力协商
 
 > 实现注记（M0）：本节类型自 M0 起以 `core/src/proto/handshake.rs`（feature 位在 `core/src/proto/features.rs`）为唯一真源；下面的代码块仅供阅读，若不一致以源码为准。
+> 实现注记（M1）：① 证明与派生的计算在 `core/src/proto/handshake.rs`（`derive_secret`、`auth_proof`、`server_proof` 等），客户端与 shared-key 插件共用。规格没写 `proof` 输入里整数的编码，取 **`role` 1 字节、`key_id` 大端 4 字节**（与 `secret(k)` 的 `k_be32` 一致），`cluster_id` 用 Hello 里的 16 字节（未知全 0）；金样 `tests/golden/auth.golden`。② 握手在每条连接的**读线程**上执行（发帧经写线程），见 `core/src/net/handshake.rs`；被拒时回的 ERROR 帧 `kind = Response`、`msg_type` 沿用请求的（Hello 或 Auth）、flags 带 ERROR，然后断开。③ M1 本端支持的协议 feature 位为 0（随功能实现逐个加入）。④ 密钥文件里没有角色，客户端在 Hello 里声明的角色：`RpcClient::new` 按 init 的约定推断（key 0 = server、key 1 = admin、其余 = client），别的 key 用 `RpcClient::new_with_role`；`wmfs ping --role` 可以故意声明别的角色（演示 client key 冒充 server 被拒）。⑤ M1 还没有元数据 KV，服务端认得的 key 是 init 写进 KEYMETA 的初始值（`core/src/init.rs` 的 `InitKeys`：key 1 = admin、key 2 = 默认 client），M3/M4 起改读复制状态。 ⑥ 握手成功后两端都调用 `ConnHandle::authenticated`（服务端同时记下 `ConnIdentity`），它再调用 `Conn::mark_authenticated`。"未完成认证的连接只允许握手帧"分两层执行：传输插件在 `mark_authenticated` 之前收到**声明了 bulk** 的帧就直接断开、不为它取池槽（握手帧从不带 bulk；tcp、mem 都这样做，rdma 对 `BULK_REMOTE/REPLY_REMOTE` 同理）；core 的握手代码收到别的帧也直接断开，并计入 `wmfs_conn_handshake_failed_total{code="PROTO_UNSUPPORTED"}`。
 
 握手由 **core** 在传输插件交出的 `Conn` 上执行，与传输无关（TCP、RDMA、mem 完全相同；传输插件只负责把连接建起来）。
 
@@ -770,6 +778,7 @@ S → C  Welcome   { key_id: u32, role: u8 /*同 Hello*/, tenant: u32, server_pr
 #### 3.3.3 消息族、msg_type、角色权限与传输选择
 
 > 实现注记（M0）：本节类型自 M0 起以 `core/src/proto/frame.rs`（msg_type 常量；`PingBody` 在 `core/src/proto/handshake.rs`）为唯一真源；下面的代码块仅供阅读，若不一致以源码为准。
+> 实现注记（M1）：服务端（`core/src/net/server.rs`）先查角色权限表（不符 → `EACCES`，计数 `wmfs_rpc_denied_total{role,family}`），再处理 bulk 被丢弃（→ `BUSY`），再分发：Ping 由 core 原样回显（bulk 用收到的池缓冲，零拷贝）；其他族交给注册的 `Service`（`RpcServer::add_service`，M3 起）；没有服务或不认识的 msg_type → `FEATURE_UNSUPPORTED`，不断开。**保活**：客户端连接**握手完成之后**，写线程空闲 5 s 发一个 `req_id = 0` 的 Ping（回复被忽略；握手完成之前不发——服务端会把它当成"未认证连接上的非握手帧"断开，于是 Challenge 慢于 5 s 的握手会永远失败）；服务端从不向客户端发请求；"15 s 收不到任何帧判死"由传输插件做（tcp：读超时 15 s）。角色权限表对 **OneWay 帧也查**：不符的 OneWay（例如 client 发 RaftMsg）没法回 `EACCES`，只计数 `wmfs_rpc_denied_total` 并丢弃（M8 加 OneWay 服务时不会绕过角色表）。指标 `wmfs_rpc_requests_total{family,op,code}` 的 `op` 在 M1 暂时等于 family，各服务解出具体操作后再细分；每个族的指标句柄在第一次用到时注册、之后从 `RpcServer` 里直接取（3.11"热路径无锁"，错误码的计数器第一次出现时注册）。
 
 | msg_type | 名称 | kind | body | 族 |
 |---|---|---|---|---|
@@ -1019,6 +1028,8 @@ pub struct ClusterMap {
 - **传输层的任何错误都按"连接断开"处理**：`Conn::send/recv` 返回错误、写超时（5 s）、发送队列满、fail point `plugin.<name>.transport` 触发——一律关闭这条连接，它上面的在途调用以 `ECONNRESET` 结束，调用方重连后重试。唯一例外：帧超过该传输的上限（`FEATURE_UNSUPPORTED`）只让这一个请求失败，不断开。
 - 可重试码（1000–1007；1013 重新取 cap 一次；1014 重写；1019；`ECONNRESET`、`ETIMEDOUT`）按指数退避重试：10 ms 起、×2、上限 1 s。1008 只在服务端之间出现；1009 按 C5 处理；1010/1011 换副本。修改型元数据请求重试用同一个 seq；数据请求天然幂等（同一 extents 写两次结果相同）。
 - 总期限 = 挂载参数 `--op-timeout`（默认 120 s，类似 NFS hard 挂载）；超过才把 `EIO` 交给应用，并在慢请求日志留下 trace_id。
+- 实现注记（M1）：退避重试在 `core/src/net/retry.rs`（`retry(what, 总期限, op)`，每次重试写一行日志，连接断开时写"连接断开 → 重连重试"）；`RpcClient` 本身不重试。建连失败、握手中连接出错一律按 `ECONNRESET`（原因写进日志）；地址本身写错（解析不出）→ `EINVAL`，不重试。CLI 一次性命令的总期限用 30 s（`wmfs ping`）。
+- 实现注记（M1）："帧超过该传输的上限只让这一个请求失败"的做法：协议上限（body > 1 MiB、bulk > 16 MiB + 128 KiB）在 `ConnHandle::send` 里同步检查、直接返回 `FEATURE_UNSUPPORTED`（`Responder` 回复超限时改发一个 `ERROR(FEATURE_UNSUPPORTED)`）；传输自己的上限（例如 RDMA 的帧头 + body ≤ 120 KiB）由写线程处理——`Conn::send` 返回 `FEATURE_UNSUPPORTED` 时不断开：请求帧通知 `RpcClient`，这个调用以 `FEATURE_UNSUPPORTED` 结束；回复帧与流帧改发一个同 req_id、同 msg_type 的 ERROR 帧；OneWay 只丢掉这一帧。fail point `plugin.<name>.transport` 触发时**不论配置的是哪个码**（包括 `FEATURE_UNSUPPORTED`）都按连接断开处理（3.7.4）。`FEATURE_UNSUPPORTED` 不可重试。调用的期限 = 现在 + timeout + 1 ms（`mono_ms` 只精确到毫秒，不加 1 的话调用可能比 timeout 早不到 1 ms 结束）。
 - 预期故障切换时间：元数据 leader 切换约 1–3 s（选举超时 1–2 s + 新 leader 就绪）；数据链重配 ≈ `target_lease`（8 s）+ 集群图传播（≤ 1 s）。都远小于 120 s。
 
 
@@ -1525,6 +1536,8 @@ wmfs join <任一节点 rpc 地址> --cluster-key <cluster.key 文件> --data-di
 
 `cluster.key` 需要管理员自己复制到新机器（scp）；**不通过网络传输秘密**（首发无 TLS）。`wmfs dev` 在单机上就是同一个文件。
 
+> 实现注记（M1）：M1 的 `wmfs init` 只做第 1、2、4、5 步里"目录、密钥与 node.toml"的部分（`--data-dir`、`--addr`、`--rpc-port`、`--mgmt-port`、`--no-start`）：写 NODE、cluster.key、node.toml、keys/admin.key、keys/client.key，然后前台运行 server；元数据初始状态（第 3 步）M3 起、TARGET 超级块与 `--target` M5 起、`--profile`/`--owner` 随用到它们的里程碑加入。复制到 `~/.config/wmfs/` 时，那里已有**内容不同**的同名文件就不覆盖（可能属于另一个集群），并提示用 `--key-file`。写文件的顺序是 cluster.key → node.toml → keys/* → **NODE 最后**（都用 `atomic_write`）：NODE 是 init 的提交点，"NODE 存在 = init 已完成"（`wmfs dev` 靠它判断节点是否已初始化）；init 中途失败或被杀时目录里没有 NODE，删掉目录重来即可。
+
 #### 3.4.4 租约与客户端驱逐【ADR-0023】
 
 | 租约 | 授予方 | 时长（`ClusterSettingsV1`） | 续租 | 持有方自停 | 授予方回收 |
@@ -1721,6 +1734,7 @@ impl PoolConfig { pub fn server() -> Self; pub fn client() -> Self; pub fn dev_s
 - `get(min_len, lane, wait)` 选能放下 `min_len` 的最小一档：`Lane::Repl` 先取 Repl 槽、再取 Normal 槽；`Lane::Normal` 只能取 Normal 槽。没有空槽就在 Condvar 上等，最多 `wait`，超时回 `BUSY`（天然背压）。
 - **谁用 Repl lane**：接收 `ForwardWrite` 的 bulk、`FetchChunk` 的响应缓冲、NeedFull/重新驱动时打包 pending 文件。客户端请求、读请求一律 Normal。于是客户端流量再大也不会让链上后继收不进前驱的转发——这是避免"链上节点互相等缓冲"的第一道保证；第二道是"连接读线程取 Repl 缓冲最多等 100 ms，取不到就把这条转发的 bulk 读进一个固定的 64 KiB 暂存区丢弃并回 `BUSY`"，发送方保留 pending，由 chain-timer 稍后重发。没有任何线程会无限期等缓冲或等网络，所以不存在分布式死锁。
 - **注册**：池在传输插件启动之前创建；每个传输插件启动时 `register_region(&RegionInfo { base, len })` 一次：RDMA 对整个池 `reg_mr(base, len, LocalWrite | RemoteRead | RemoteWrite)` 得到一个 MR（`ProtectionDomain::reg_mr` 是 `unsafe fn`，在 rdma 插件里调用），TCP 什么也不做。
+- 实现注记（M1）：`MemPool::get` 返回的 `Buf` 的 `len()` = `min_len`、`capacity()` = 槽位大小；槽位里是上一个主人留下的旧字节，调用方只能读自己写过的部分。归还槽位用 `notify_all`（等待者里可能同时有 Normal 与 Repl）。另加 `MemPool::stats() -> Vec<ClassStats>`（每档的名字、槽位大小、槽位数与两张空闲表的长度，给 `/api/v1/node` 与测试用）与指标 `wmfs_bufpool_free{class,lane}`、`wmfs_bufpool_wait_seconds`。整个池（最后一个 `Buf` 也归还之后）被丢弃时才 `munmap`（只在进程退出与测试里发生）。
 
 #### 3.6.2 用 Rust 所有权表达"零拷贝所有权显式转移"
 
@@ -1804,6 +1818,8 @@ pub struct InFrame  { pub hdr: FrameHeader, pub body: Vec<u8>, pub bulk: Option<
 
 `bulk` 的各段在线上按顺序拼成一段（TCP 依次 `write_all`；RDMA 依次 READ 进一个 Buf），接收方看到的永远是一个 `Buf`。`recv_into` 是请求方为"期望的响应 bulk"预先分配的缓冲：TCP 把响应 bulk `read_exact` 进去，RDMA 让对端 WRITE 进去——两种传输对 core 的语义完全一致。所以加 RDMA 不改数据路径（原则 5），新增传输插件不改 core 一行。
 
+> 实现注记（M1）：① 收帧时给 bulk 找缓冲的规则（回复帧优先用 `recv_into`；否则 `PeerCall` 用 Repl lane、其余用 Normal lane，最多等 100 ms）写成 core 的一个函数 `proto::frame::bulk_buf`，tcp、mem（以及 M2 的 rdma）都调用它，不各抄一遍。② `bulk_dropped` 也可能出现在**回复**上（请求方没给 `recv_into` 或给得不够大、本端池又满了）：`RpcClient` 把这样的回复当成 `BUSY`（可重试）交给调用方，流也一样（之后流结束），缺数据的回复不会被当成成功。③ 示例的 mem 传输可以用 `MemTransport::with_frame_limit(n)` 给帧头 + body 设上限（模拟 RDMA 的 120 KiB），测试"超过传输上限只让这一个请求失败"（3.3.8）。
+
 ### 3.7 钩子管线与插件 ABI【ADR-0025】
 
 #### 3.7.1 manifest
@@ -1866,6 +1882,8 @@ fail_points = ["plugin.quota.quota_admission"]
 | event_sink / mgmt_ext | 进程外，不排序 | audit-log、webhook / prometheus-exporter、dashboard、alert | — |
 
 启动时 `PluginSet::validate()`（core）检查：altitude 在区间内且同钩子内唯一；transform 落在其类别子区间；唯一型钩子恰好一个；`abi_version` 匹配（不匹配拒绝启动，不尝试适配，理念文档 4.3.6）；热路径插件（含 transport、chunk_store）`budget_ns > 0`；`fail_points` 非空；配置键都在 `config_schema` 里（不认识的键 = 错误）。`node.toml` 只能启停插件：`[plugins] disable = ["path-caps"]` 与 `[plugin.<name>]` 配置表，**不能改顺序**。插件配置只允许部署参数；行为策略必须走目录属性。
+
+> 实现注记（M1）：`PluginSet` 在 `core/src/hooks/registry.rs`；`validate(&cfg.plugin)` 返回给人看的中文错误（`Result<(), String>`），同时检查 `[plugin.<name>]` 只能给已注册的插件、只能写它 `config_schema` 里有的键，以及 `fail_points` 里必须声明 `plugin.<名字>.<钩子>`。M1 的 `PluginSet` 里只有 transport 与 authn 两种钩子（只有它们的 add 方法），`validate` 也只校验这两种用得到的规则：每个插件的 manifest（abi_version、钩子声明、altitude 区间、传输一定是 hot_path、热路径插件给出 budget_ns、fail point 声明、config_schema），同一钩子内不重名、altitude 不相同，不同的插件不同名（同一个插件可以挂在多个钩子上：manifest 内容相同即视为同一个插件，`Manifest` 因此加了 `PartialEq`），传输的 scheme 唯一。其余钩子特有的规则随各自的 add 方法一起加入：唯一型钩子（chunk_store、meta_engine）"恰好一个"（M3、M5），transform 的类别子区间与 qos"只允许一个活跃"（M5、M13）。`[plugins] disable` 里不认识的名字不报错（例如 minimal profile 的 `quota`、`mclock` 在实现之前）。`manifest.toml` 与代码常量的逐字段比对是 `core::hooks::manifest::check_manifest_toml`，各插件的单元测试调用它。
 
 **插件集合全集群一致（集群插件清单）**：authz、quota、placement 在 leader 上执行，qos、transform 在数据节点上执行——如果各节点启用的插件不同，leader 一换、或者请求落到另一个数据节点，已设置的授权、配额、QoS 策略就会被静默跳过（违反原则 7）。所以：
 
@@ -2059,12 +2077,16 @@ core 的 `Pipeline` 对每次钩子调用统一包一层：`fail_point(&fp_name)
 
 transport 的 fail point `plugin.<name>.transport` 包在 core 写线程对 `Conn::send` 的调用外层：触发 = 这条连接作废（关闭、计为连接错误），于是走"连接断开 → 重连重试"的路径（3.3.8）。
 
+> 实现注记（M1）：包装是 `core/src/hooks/pipeline.rs` 的 `HookCall`（`enter()` 过 fail point 并开始计时，`exit()` 计数、计时、超预算与错误计数），authn 与 transport 已经用上；`Pipeline::new(PluginSet)`、`Pipeline::authn(..)`（返回连接身份与接受它的插件算出的 `server_proof`）、`Pipeline::transports()` 是 M1 加的。transport 的计时分两半：发的一半由 core 的写线程包在 `Conn::send` 外层（带 fail point；fail point 触发时不论配置的是哪个码都让连接作废）；收的一半由传输插件自己计——读到帧头之后开始、读完 body + bulk 时调用 `HookCall::exit`（不过 fail point），插件用 `HookCall::new(&MANIFEST, Hook::Transport)` 拿到与 core 同一组指标句柄（tcp、mem 都这样做，M2 的 rdma 照做，core 不用改）。
+
 #### 3.7.5 静态注册（首发全部内置插件）
 
 注册表在二进制 crate（不在 core），core 只认 trait：
 
 ```rust
 // cli/src/registry.rs —— 全仓库唯一"知道有哪些插件"的文件
+// 实现注记（M1）：实际代码以 cli/src/registry.rs 为准——tcp 的构造多一个参数 TcpTransport::new(&cfg.plugin_cfg("tcp"), cfg.net.write_timeout_ms)
+// （写超时来自 [net]），校验写成 s.validate(&cfg.plugin)，错误是给人看的中文字符串；dylib 在 M14 之前直接报"不支持"。
 pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, ErrCode> {
     let mut s = PluginSet::new(&cfg.plugins.disable);
     #[cfg(feature = "tcp")]  s.transport(Arc::new(wmfs_plugins::tcp::TcpTransport::new(cfg.plugin_cfg("tcp"))?));
@@ -2262,7 +2284,7 @@ pub fn histogram(name: &'static str, help: &'static str, labels: &[(&'static str
 pub fn render_prometheus(out: &mut String);       // GET /metrics，Prometheus 文本格式（自己写，约 150 行）
 ```
 
-  注册时加锁（启动阶段或首次使用），取值是 `AtomicU64`（热路径无锁）。命名 `wmfs_<子系统>_<量>_<单位>`；标签基数受控：路径标签只用于设置了配额/qos 的策略根目录。每个插件至少注册一个自己的指标（理念文档 4.3.4）。主要指标见 7.3。
+  注册时加锁（启动阶段或首次使用），取值是 `AtomicU64`（热路径无锁）。命名 `wmfs_<子系统>_<量>_<单位>`；标签基数受控：路径标签只用于设置了配额/qos 的策略根目录。每个插件至少注册一个自己的指标（理念文档 4.3.4）。主要指标见 7.3。（实现注记（M1）：不带标签的连接层计数器——`wmfs_conn_write_timeout_total`、`wmfs_conn_send_queue_full_total`、`wmfs_conn_proto_errors_total`、`wmfs_req_dropped_total`——在 `RpcServer::new` / `RpcClient::new` 时就注册，新进程的 `/metrics` 里也能看到 0，分得清"没发生过"与"没有这个指标"；带标签的（`wmfs_rpc_denied_total{role,family}`、`wmfs_conn_handshake_failed_total{code}` 等）照常在第一次发生时出现。热路径上的句柄（每个消息族的请求计数与耗时、传输退回计数）注册一次后存在结构体里，不再每次查注册表。）
 - **策略违约可见**：配额软超限 / 硬拒绝、链降级、实际副本 < 声明、QoS 保底未满足、类的 p99 延迟超过 `latency_target`、校验失败、属性无法满足、隔离降级等，既有指标也写 changelog 事件（`op = PolicyViolation`，`extra` 写明种类），dashboard 与 alert 消费它们。
 - **changelog 流**：`GET /api/v1/changelog?after=<seq>&limit=1000&wait_ms=30000`（长轮询：raft 线程应用新 changelog 记录时唤醒等待者；每个节点同时最多 2 个长轮询，第 3 个起立即返回空页，1.2）；记录的 JSON 字段定义在 `wmfs-api`（`ChangeEvent`）；消费者 `POST /api/v1/changelog/cursor {name, seq}` 提交游标（存 `CURSOR`，插件不持有本体不知道的状态）；`wmfs mgr` 内部只有**一个**长轮询循环，从各插件游标的最小值开始拉，按插件分发，每个 sink 各自提交自己的游标；保留策略 = 所有游标的最小值之后的全部记录，但最多 7 天 / 1000 万条，由 gc 任务修剪（扫描后点删除）；消费者落后超出保留范围时返回 `410 Gone` 和最早可用 seq——**缺口是显式的，不是静默的**。
 - **fail points**（`wmfs-api` crate 的 `failpoint.rs`，函数而非宏；core 与 `wmfs-mgr` 共用）：
@@ -2286,6 +2308,7 @@ pub fn fail_point_hit(name: &str) -> bool;          // 只问"这次是否触发
 ### 3.12 跨模块接口（M0 落成可编译的签名，各模块的 agent 照此对接）
 
 > 实现注记（M0）：本节类型自 M0 起以下面注释里写的各文件（`core/src/base/types.rs`、`core/src/net/{client,server,conn}.rs`、`core/src/client/{meta_client,data_client}.rs`、`core/src/hooks/pipeline.rs`、`core/src/meta/attrs.rs`；小类型：`RegionInfo` → `core/src/buf/pool.rs`，`KeyFile` → `api/src/types.rs`，`NetConfig` → `core/src/base/config.rs`，`RoleInfo`/`EngineStatus` → `core/src/meta/engine/txn.rs`，`QueueStat`/`StoreStat` → `core/src/hooks/traits.rs`，`FileFacts` → `core/src/hooks/policy.rs`，`TierRule`/`AuditSpec`/`QuotaDecl` → `core/src/meta/attrs.rs`；`ApiClient`/`ApiError` → `dashboard/src/api.rs`，`HttpIn`/`HttpOut`/`Router` → `dashboard/src/host.rs`）为唯一真源；下面的代码块仅供阅读，若不一致以源码为准。
+> 实现注记（M1）：在骨架之外新增（只加不改）：`RpcClient::new_with_role(pool, transports, key, role, net)` 与 `client::default_role(key_id)`（见 3.3.2 注记）、`client::check_reply(InFrame)`（ERROR 帧 → 错误码；`call` 本身把服务端的 ERROR 帧原样返回，需要 `leader_hint`/`extra` 的调用方用 `InFrame::error()`）、`Responder::into_stream() -> StreamTx`（`StreamTx::send(body, bulk, last)`，SnapshotFetch 用）、`RpcServer`/`ServerId`/`Service`（服务端装配与按 msg_type 注册的服务）、`ErrorBody::new`、`frame::msg_name`。`call_cb` 在还没有连接时会在调用线程上建连（M9 的 repl 线程用它之前改成后台建连）。core 把 wmfs-api 原样转出为 `wmfs_core::api`，独立 crate 的插件只依赖 wmfs-core。另：① `call`/`start`/`call_cb`/`stream` 在本地的任何失败（选路失败、建连或握手失败、入队失败、请求帧超过传输上限）都先记进在途表，由 `rpc-timer` 在 100 ms 内以该错误码结束——于是 `call_cb` 的回调恰好一次、而且只在连接读线程或 `rpc-timer` 线程上执行，从不在调用方线程上（M9 的 repl 线程可以放心用）；`RpcClient` 被丢弃时还没结束的调用以 `ECONNRESET` 结束。② `StreamTx::send(&mut self, body, bulk, last)`、`StreamTx::error(code)`（以错误码结束流）；`StreamTx` 没发最后一帧就被丢弃时与 `Responder` 一样自动回 `EIO` 并计数 `wmfs_req_dropped_total`（客户端的流立即结束，不用等 10 min 的流超时）。请求在流结束时才计入 `wmfs_rpc_requests_total`。③ `Role::name()/from_name()`（"admin"/"client"/"server"，指标标签与 `wmfs ping --role` 用）、`init::SERVER_KEY = 0`、`MemPool::stats() -> Vec<ClassStats>`、`base::config::PluginTable`、`wmfs_api::hex::{hex, unhex}`（全仓库唯一的 hex 编解码）、`wmfs_api::auth::AuthHeader`（`parse_auth_header` 的结果）。
 
 下面这些类型被 core/net、core/data、core/client、core/meta、cli/fuse、wmfs-mgr 同时使用，签名以这里为准（M0 的接口骨架原样落成文件）。
 
@@ -2431,6 +2454,7 @@ impl Router { pub fn add(&mut self, prefix: &str, h: Box<dyn Fn(&HttpIn) -> Http
 ### 4.1 transport
 
 - **tcp**（`plugins/tcp/`，≈ 300 行）。职责：帧的收发。实现：`std::net`；`TCP_NODELAY`、`SO_KEEPALIVE`（调用 core 的 `sys::set_keepalive`，插件里没有 unsafe）、`set_write_timeout(Some(5 s))`；`listen` 读自己的 `[plugin.tcp] listen` 配置，返回实际绑定的地址；`send`（只在 core 的写线程上调用，所以不需要锁）依次 `write_all` 帧头、body、各段 bulk（`BufSlice` 逐个写，不拼接）；`recv`：读 48 字节帧头 → 校验 CRC 与长度上限 → 读 body 进 `Vec` → 有 bulk 时：响应帧读进请求方给的 `recv_into`，请求帧按 msg_type 选 lane（`PeerCall` 用 `Lane::Repl`，其余 `Lane::Normal`）从池取 Buf 后 `read_exact` → 校验 bulk CRC；Repl lane 100 ms 取不到（Normal lane 同样最多等 100 ms）→ 把 bulk 读进固定的 64 KiB 暂存区丢弃，交出 `InFrame { bulk: None, bulk_dropped: true }`，由 core 回 `BUSY`（OneWay 的 RaftMsg 直接丢弃）。空闲 5 s 发 Ping，15 s 无任何帧判死。`register_region` 空操作。位置：server 与 client 的连接读/写线程。预算 100 ms（3.7.4），`wmfs_tcp_bytes_total{dir}`。
+  实现注记（M1）：① body 与 bulk 的 CRC 由 core 在读线程统一校验（`net/conn.rs` 的 `recv_checked`，对所有传输都一样），tcp 只用 `FrameHeader::decode` 校验帧头；② 写超时按**整帧**算：阻塞的 socket 在 SO_SNDTIMEO 到期但已写出一部分时会返回"部分写"，`write_all` 会再等一个 5 s，所以 tcp 自己循环 `write`，**每次 write 之前把 SO_SNDTIMEO 设成这一帧剩下的时间**（至少 1 ms；已过期限就直接 `ETIMEDOUT`），一帧最多等满一个写超时；③ "空闲 5 s 发 Ping"由 core 的客户端写线程做（对所有传输都一样，握手完成之后才发），tcp 只负责读超时 15 s；④ 丢弃 bulk 用 `io::copy(take(n), sink())`（8 KiB 栈缓冲），不另开 64 KiB 暂存区；⑤ 写超时来自 `[net] write_timeout_ms`（构造参数）；⑥ 收帧的计时（3.7.4）从读到帧头之后开始、读完 body + bulk 结束，由 tcp 自己调 `HookCall::exit`；⑦ `mark_authenticated` 之前收到声明了 bulk 的帧直接断开、不取池槽（3.3.2 实现注记 ⑥）；给 bulk 找缓冲用 core 的 `frame::bulk_buf`（3.6.4 实现注记）。
 - **rdma**（`plugins/rdma/`，≈ 920 行，cargo feature `rdma`）。职责：同一帧格式跑在 RC QP 上（只有数据族与 Ping 会用它，3.3.3）。实现：sideway（verbs 部分）；设备、`gid_index`、`listen`（引导 TCP 地址）、`max_qps` 来自 `node.toml [plugin.rdma]`（RoCEv2 要选 IPv4 映射的 GID，`wmfs doctor` 列出候选；实现注记（M0）：M0 的 doctor 只报告 RDMA 设备与端口状态，列出 GID 候选推迟到 M2，与"doctor 识别 rxe 设备"一起做）；每设备一个 PD、一个 CQ、一个轮询线程；对整个内存池一次 `reg_mr(LocalWrite | RemoteRead | RemoteWrite)`；每连接一个 RC QP、16 个接收槽（S 档，3.6.1 的启动校验）。建连：在引导 TCP 连接上用插件私有消息 0x0600 `RdmaSetup{qpn, psn, gid, mtu}`（**不含 rkey**）交换 QP 信息 → QP 状态迁移 → 包成 `Conn` 交给 core 做 3.3.2 握手；`mark_authenticated` 之前收到带 `BULK_REMOTE/REPLY_REMOTE` 的帧 → 断开。QP 状态迁移照 sideway `examples/rc_pingpong.rs`，**但不能照抄三处**：INIT 的访问位要 `LocalWrite | RemoteWrite | RemoteRead`（示例没有 RemoteRead）；RTR 用 `setup_max_dest_read_atomic(16)`（示例是 0）；RTS 用 `setup_max_read_atomic(16)`（示例是 0）——否则 RDMA READ 会失败。RTS 其余：`setup_timeout(14)`、`setup_retry_cnt(7)`、`setup_rnr_retry(7)`；地址向量用 `setup_grh_src_gid_index(gid_index)`。bulk 规则见 3.6.4（描述符表 n ≤ 16，接收方依次 READ 进一个 Buf）；发送方把 `BufSlice` 留在"在途表"（按 req_id）里，响应到达或连接关闭才 Drop；在途请求 16 个时 `send` 阻塞写线程（信用控制）。位置：连接读/写线程 + `rdma-cq-<dev>` 线程。预算 100 ms（每次 post 本身 ≤ 2 µs）。本机无可用 RDMA 链路，测试需要人类启用 Soft-RoCE（roadmap M2）。
 
 ### 4.2 authn
@@ -2617,6 +2641,7 @@ when = "idle>30d"          # 等价于在绑定该类的目录上隐式设置 ti
 - **只有元数据 leader 回答依赖元数据的请求**；其他节点回 `409 {"error":"not_leader","leader":"http://<host:port>"}`，CLI 与 mgr 自动跟随（不做服务端代理，最简单）。节点本地的端点（`/metrics`、`/api/v1/health`、`/api/v1/node`、`/api/v1/trace/<id>`、`/api/v1/qos`、`/api/v1/failpoints`）每个节点都回答。`ApiClient` 接受多个地址：连不上就换下一个，遇到 409 就跟随。
 - **认证**：`Authorization: WMFS-HMAC key=<id>,ts=<unix_ms>,sig=<hex>`，`sig = HMAC-SHA256(secret(key), METHOD ‖ "\n" ‖ path_and_query ‖ "\n" ‖ ts ‖ "\n" ‖ hex(sha256(body)))`，`|now − ts| ≤ 300 s`。写需要 admin 角色，读需要任一已认证 key；`/metrics` 与 `/api/v1/health` 免认证。错误统一为 `{"error": "<code>", "message": "<中文说明>"}`。**诚实说明**：服务端不记录见过的签名，所以 5 分钟窗口内被截获的写请求可以原样重放；超过 5 分钟就不行。首发只在可信网络中使用（ADR-0009）。
 - **本机注意**：环境里设置了 `http_proxy`。所有内部 HTTP 客户端必须 `ureq::Agent::config_builder().proxy(None).build().into()`；演示命令里的 curl 一律加 `--noproxy '*'`（roadmap 的每终端准备步骤也设置了 `no_proxy`）。
+- 实现注记（M1）：框架在 `core/src/mgmt/`（`http.rs`：tiny_http 监听与 4 个处理线程、路由；`auth.rs`：签名校验）；要签名的文本与请求头格式在 `wmfs-api` 的 `auth.rs`（服务端与 ApiClient 共用），hex 一律小写，两边各有同一组输入的签名金样。错误回复的 `error` 取错误码名的小写（`auth_failed`、`eacces`、`einval`、`enoent`、`not_leader`……）。`GET /api/v1/health` 的结构是 `wmfs_api::types::Health`：`{ok, version, cluster_id, node: {node_id, addrs, mgmt_addr}, meta_role, leader, audit_lag}`（M1：`meta_role = "none"`，`leader`、`audit_lag` 为 null）。fail point 接口另加了 **`GET /api/v1/failpoints`**（`wmfs failpoint list` 要用；读，任一已认证 key），GET/POST/DELETE 都回本节点当前的全部 fail point（`FailpointList`）；`failpoints_api = false` 时整组接口回 404。清除一个没设置过的名字回 `404 enoent`（拼错名字不会被静默忽略）；fail point 名字只能由字母、数字和 `.` `_` `-` 组成（环境变量、API 与 CLI 同一条规则，于是放进 `?name=` 不用转义）。**请求体**：先看请求头里声明的长度——超过 1 MiB 的请求既不读、也不回、也不交还给 tiny_http（整个"忘掉"，这条连接一直挂着）：tiny_http 0.12 丢弃没读完的 body 时会按剩余长度**一次分配内存**，`Content-Length` 写成几十 TB 就能让整个进程因分配失败而退出（读到一半对端断开也一样）。剩余风险（写进这里，不另做）：声明了 body 却不发的连接会一直占着一个处理线程——tiny_http 没有读超时，回复之后丢弃请求时也要把 body 读完，所以"读 body 之前先验签"挡不住它；首发只在可信网络中使用（ADR-0009）。
 
 | 方法 路径 | 作用 |
 |---|---|
@@ -2661,6 +2686,7 @@ when = "idle>30d"          # 等价于在绑定该类的目录上隐式设置 ti
 - **`--json`**：所有查询类命令（`status`、`get`、`usage`、`node/chain/session/task list`、`changelog tail`、`dev status`）都支持 `--json`，输出就是管理 API 的 JSON；`scripts/accept.sh` **只解析 JSON**，不解析给人看的输出。
 - **`wmfs dev wait <条件>`**（替代演示里的固定 `sleep`；条件满足立即返回 0，超时返回 1 并打印当前状态）：`leader`（有就绪的元数据 leader）、`chains-serving`（所有链长度达到期望且全部 Serving）、`task-idle <kind>`（该任务这一轮做完且积压为 0）、`session-evicted <挂载点>`、`alert <名字> firing|resolved`（查 mgr 的 `GET /alerts`）、`audit-caught-up`（`audit-log` 游标追上最新 changelog）。
 - **`wmfs dev down --purge` 的顺序**（被冻住或崩溃的挂载点上 `fusermount3 -u` 会 EBUSY 或卡住）：对所有开发客户端进程依次 `SIGCONT` → `SIGTERM` → 3 s 后仍在则 `SIGKILL` → 对每个开发挂载点 `fusermount3 -uz`（lazy 卸载）→ 停服务端 → 最后删除开发目录。`wmfs doctor` 发现残留的 `fuse.wmfs` 挂载时给出这条命令。
+- 实现注记（M1）：① `wmfs dev` 基础版只有 `up/down/env/status/kill/start/logs`，`up` 只支持 `--nodes 1`（多节点要 `wmfs join`，M8）；`--dir` 对所有 `dev` 子命令都有效，默认取环境变量 `WMFS_DEV_DIR`、否则 `~/wmfs-dev`，`wmfs dev env` 也导出 `WMFS_DEV_DIR`；节点在自己的进程组里后台运行，stdout/stderr 追加到 `<节点>/logs/server.log`；`up`/`start` 等到该节点的 health 有响应（且是本集群）才返回，进程退出或 30 s 超时则打印日志路径、非 0 退出；只对 pid 文件里、命令行确实是"`wmfs server --data-dir <该节点>`"的进程发信号；`down --purge` 只删除默认的 `~/wmfs-dev` 或带 `.wmfs-dev` 标记文件的目录（防止 `--dir` 写错删掉别的目录）；"就绪" = health 有响应**并且** pid 文件里就是刚起的那个进程（server 在管理 API 开始应答之前写 pid 文件），所以 `up` 之后紧接着的 `status`/`down` 一定找得到它；`down` 先发 SIGCONT（被冻住的节点也能处理 SIGTERM）、5 s 后仍在才 SIGKILL，并替被 SIGKILL 的进程删掉 pid 文件；开发目录一律换成规范的绝对路径（`./devC`、`/tmp//devC/`、符号链接都认得出是同一个）；起不来时把日志的最后一行也打印出来。② `wmfs failpoint <node>` 的 `<node>` 是节点号：依次问 `WMFS_CLUSTER`（或 `--cluster`）里每个地址的 health 找到它；也可以直接写管理地址。③ `wmfs ping` 另有 `--role admin|client|server` 与 `--json`。④ `wmfs debug gen-key` 生成的是 key 2（默认 client 的号）+ 随机秘密：号对、秘密不对，演示的是"证明不对"被拒。
 
 ### 7.3 `/metrics`（节选，前缀 `wmfs_`）
 
@@ -2878,7 +2904,7 @@ CI（`scripts/ci.sh`）：`cargo fmt --check` → `cargo clippy --all-targets --
 | 19 | 5.2 `compress`、`encrypt` 生效方式"新数据 + 协调器"，`checksum`、`locality`"新数据" | 变换参数与放置属于 layout：属性改动对**新文件与截断到 0 的文件**立即生效；已有文件的新写入沿用旧 layout，直到协调器迁移（写打开的文件被跳过、单独计数、24 h 告警）；checksum、locality 不迁移 | 按块切换 layout 需要块级元数据与混合解码，复杂度高；截断到 0 重建 layout 覆盖了最常见的"覆盖写" | 0021 chunk 文件格式 v1（附带的偏离） | 需确认 |
 | 20 | 理念文档 4.3.1 只要求 manifest；首发另加"集群插件清单" | 不是偏离，是对原则 7 的落实：各节点会影响策略的插件集合必须一致，否则退出 | 否则 leader 切换会静默跳过授权/配额/QoS 策略 | 0025 | 随 0025 |
 
-另有 11 条**不是偏离、但属于契约层首次定义**的设计 ADR（理念文档 10.1："这是契约吗？是 → 先写 ADR，等人类批准"），除 0026 外全部在 M0 开工前（批次 0）一次确认：0018 线上协议 v1、0019 元数据引擎与执行模型、0020 元数据 KV 布局 v1、0021 chunk 文件格式 v1 与数据侧崩溃一致性、0022 缓冲池与零拷贝所有权、0023 租约 / 能力令牌 / 两阶段驱逐、0024 CRAQ 链式复制（成员、版本、incarnation、重同步）、0025 钩子清单与插件 ABI 规则、0027 后台任务框架与可观测基座、0028 命名空间语义与 cto 缓存失效协议 v1。0026 目录属性与递归用量 / 配额 quantum 模型在 M7 开工前确认（它的实现从 M7 开始；其中"配额允许短暂超限"是要你决定的产品取舍）。实现中补齐的技术缺口：0029 changelog 操作码表 v1（2026-10-21，主管按本文开头的例外条款决定）。
+另有 11 条**不是偏离、但属于契约层首次定义**的设计 ADR（理念文档 10.1："这是契约吗？是 → 先写 ADR，等人类批准"），除 0026 外全部在 M0 开工前（批次 0）一次确认：0018 线上协议 v1、0019 元数据引擎与执行模型、0020 元数据 KV 布局 v1、0021 chunk 文件格式 v1 与数据侧崩溃一致性、0022 缓冲池与零拷贝所有权、0023 租约 / 能力令牌 / 两阶段驱逐、0024 CRAQ 链式复制（成员、版本、incarnation、重同步）、0025 钩子清单与插件 ABI 规则、0027 后台任务框架与可观测基座、0028 命名空间语义与 cto 缓存失效协议 v1。0026 目录属性与递归用量 / 配额 quantum 模型在 M7 开工前确认（它的实现从 M7 开始；其中"配额允许短暂超限"是要你决定的产品取舍）。实现中补齐的技术缺口（2026-10-21 起，主管按本文开头的例外条款决定）：0029 changelog 操作码表 v1、0030 M1 补齐的握手与管理 API 细节。
 
 ---
 

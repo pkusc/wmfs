@@ -43,6 +43,10 @@ use serde::{Deserialize, Serialize};
 use super::units;
 use crate::buf::pool::PoolConfig;
 
+/// 一个插件的部署参数表（node.toml 的 `[plugin.<name>]`，也是插件构造函数的参数）。插件与测试用这个名字，
+/// 不必自己依赖 toml crate（`"listen = \"127.0.0.1:0\"".parse::<PluginTable>()` 照样能用）。
+pub type PluginTable = toml::Table;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
@@ -52,7 +56,7 @@ pub struct NodeConfig {
     pub mgmt: MgmtConfig,
     pub mem: PoolConfig,
     pub plugins: PluginsConfig,
-    pub plugin: BTreeMap<String, toml::Table>, // [plugin.<name>]：插件的部署参数
+    pub plugin: BTreeMap<String, PluginTable>, // [plugin.<name>]：插件的部署参数
     #[serde(rename = "target")]
     pub targets: Vec<TargetConfig>, // [[target]]
     pub debug: DebugConfig,
@@ -162,7 +166,7 @@ impl NodeConfig {
     }
 
     /// `[plugin.<name>]` 表（传给插件的构造函数）；没有就是空表。
-    pub fn plugin_cfg(&self, name: &str) -> toml::Table {
+    pub fn plugin_cfg(&self, name: &str) -> PluginTable {
         self.plugin.get(name).cloned().unwrap_or_default()
     }
 }
@@ -174,7 +178,7 @@ mod tests {
     const EXAMPLE: &str = r#"
 debug_ops = true
 [net]
-data_scheme = "rdma"
+data_scheme = "fastx"
 [mgmt]
 listen = "127.0.0.1:19180"
 [mem]
@@ -201,12 +205,12 @@ host_id = "host-2"
         let c = NodeConfig::parse(EXAMPLE).unwrap();
         assert!(c.debug_ops && !c.failpoints_api);
         assert_eq!(c.net.control_scheme, "tcp", "没写的键取默认值");
-        assert_eq!(c.net.data_scheme, "rdma");
+        assert_eq!(c.net.data_scheme, "fastx");
         assert_eq!(c.net.write_timeout_ms, 5000);
         assert_eq!(c.mem, PoolConfig::dev_server());
         assert_eq!(c.plugins.disable, vec!["quota", "mclock"]);
         assert_eq!(c.plugin_cfg("tcp").get("listen").and_then(|v| v.as_str()), Some("127.0.0.1:19100"));
-        assert!(c.plugin_cfg("rdma").is_empty());
+        assert!(c.plugin_cfg("fastx").is_empty());
         assert_eq!(c.targets.len(), 2);
         assert_eq!(c.targets[0].capacity_bytes(), Ok(20 << 30));
         assert_eq!(c.targets[1].capacity_bytes(), Ok(0), "没写 capacity = 不限");

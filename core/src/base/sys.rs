@@ -84,6 +84,27 @@ pub fn fsync_dir(dir: &Path) -> Result<(), ErrCode> {
     Ok(())
 }
 
+/// 唯一的原子替换工具（design.md 3.2.1）：写 `<dir>/.<name>.tmp-<随机>` → fdatasync → rename 覆盖 → fsync(目录)。
+/// 崩溃后要么是旧内容、要么是新内容。文件权限 0600（NODE、密钥、超级块、任务游标都只给本用户读）。不需要 unsafe。
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ErrCode> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or(ErrCode::EINVAL)?.to_string_lossy();
+    let tmp = dir.join(format!(".{name}.tmp-{:016x}", super::rand::random_u64()));
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_data()?;
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    fsync_dir(dir)
+}
+
 /// 给**一个**进程发信号（`wmfs dev kill/stop/pause/resume` 用；sig = 0 只检查进程是否存在）。
 /// pid ≤ 0 一律 `EINVAL`：`kill(0, ..)` 会发给自己所在的整个进程组，`kill(-1, ..)` 会发给当前用户的所有进程——
 /// pid 文件为空或损坏时绝不能变成这两种。真要给进程组发信号时，另写一个名字明确的函数。
@@ -181,6 +202,20 @@ mod tests {
         assert_eq!(got, b"\x00\x00\x00\x0023456", "目标前 4 字节是洞（读为 0）");
         fsync_dir(&dir).unwrap();
         assert_eq!(fsync_dir(&dir.join("missing")), Err(ErrCode::ENOENT));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_replaces_whole_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::base::test_dir("sys-aw");
+        let p = dir.join("NODE");
+        atomic_write(&p, b"old").unwrap();
+        atomic_write(&p, b"new content").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new content");
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "不留临时文件");
+        assert!(atomic_write(&dir.join("no/such/dir/x"), b"x").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

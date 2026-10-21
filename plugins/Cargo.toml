@@ -10,11 +10,18 @@ publish.workspace = true
 path = "lib.rs"
 
 [features]
-# 每个插件一个 feature（design.md 2.1）；插件从 M1 起逐个加入。
-default = []
+# 每个插件一个 feature（design.md 2.1），默认全开；插件从 M1 起逐个加入。
+default = ["tcp", "shared-key"]
+tcp = []
+shared-key = []
 
+# 插件只用 wmfs-core 的公开 API（指标、fail point 经 wmfs_core::api；插件配置表是 wmfs_core::base::config::PluginTable），
+# 不直接依赖 wmfs-api 或 toml（design.md 2.1；scripts/ci.sh rules 检查）。
 [dependencies]
 wmfs-core.workspace = true
+
+[dev-dependencies]
+crc32c.workspace = true
 
 [lints]
 workspace = true

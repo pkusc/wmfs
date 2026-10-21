@@ -1,9 +1,52 @@
 //! 管理 API 与进程外插件共用的数据结构（design.md 7.1、3.12）。
 //!
-//! M0 只有密钥文件与 changelog 事件；各管理端点的请求/响应结构随所在里程碑加入
-//! （core 的服务端与 wmfs-mgr 的 ApiClient 都用这里的定义，每个都要有金样测试）。
+//! 密钥文件、changelog 事件，以及各管理端点的请求/响应结构（随所在里程碑加入；M1：health、failpoints、错误回复）。
+//! core 的服务端与 wmfs-mgr 的 ApiClient 都用这里的定义；每个结构的 JSON 字段名都有逐字的金样测试（本文件末尾）。
+//! 演进规则：路径带 `/v1`，字段只增不改（ADR-0005）。
 
 use serde::{Deserialize, Serialize};
+
+/// 所有错误回复的 body：`{"error": "<code>", "message": "<中文说明>"}`（7.1）。
+/// `error` 是错误码名的小写（例如 `auth_failed`、`eacces`、`einval`、`enoent`、`not_leader`）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ErrorReply {
+    pub error: String,
+    pub message: String,
+}
+
+/// 一个节点的地址：rpc 地址按传输分开（与 `NodeRecV1.addrs` 相同的 `(scheme, 地址)`）与管理 API 地址。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct NodeAddrs {
+    pub node_id: u32,
+    pub addrs: Vec<(String, String)>, // 例如 [("tcp", "127.0.0.1:19100")]
+    pub mgmt_addr: String,            // 例如 "127.0.0.1:19180"
+}
+
+/// `GET /api/v1/health`（免认证）：本节点健康、角色、版本、本节点与 leader 的地址；
+/// `wmfs fs`、`wmfs ping`、`wmfs mount`、`wmfs failpoint <node>` 用它从管理地址找到 rpc 地址与节点号。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct Health {
+    pub ok: bool,
+    pub version: String,    // 与 `wmfs --version` 相同，例如 "0.1.0 (proto 1, core-abi 1, c-abi 1)"
+    pub cluster_id: String, // 32 位小写 hex
+    pub node: NodeAddrs,
+    pub meta_role: String, // 元数据角色："none"（M1 还没有元数据）、"leader"、"follower"、"learner"
+    pub leader: Option<NodeAddrs>, // 元数据 leader 的地址（M3 起；不知道时为 null）
+    pub audit_lag: Option<u64>, // 审计消费者落后的 changelog 条数（M12 起；没有审计消费者时为 null）
+}
+
+/// 一个 fail point：`POST /api/v1/failpoints` 的请求，也是列表里的一项（3.11）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Failpoint {
+    pub name: String,
+    pub action: String, // 例如 "times(1,return(EIO))"
+}
+
+/// `GET/POST/DELETE /api/v1/failpoints` 的回复：本节点当前的全部 fail point（按名字排序）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct FailpointList {
+    pub failpoints: Vec<Failpoint>,
+}
 
 /// 放在 wmfs-api（core 与 wmfs-mgr 都要读密钥文件）：一行 `wmfs-key-v1:<key_id>:<64 位 hex secret>` 的解析结果（3.3.2）。
 #[derive(Clone, PartialEq, Eq)]
@@ -26,21 +69,16 @@ impl KeyFile {
         if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("secret 里有非 hex 字符（只能是 0-9、a-f、A-F）".into());
         }
-        if hex.len() != 64 {
-            return Err(format!("secret 应是 64 位 hex，实际 {} 位", hex.len()));
-        }
         let mut secret = [0u8; 32];
-        for (i, b) in secret.iter_mut().enumerate() {
-            // 上面已确认全是 ASCII hex 字符，所以按字节下标切分不会落在字符中间
-            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| "secret 里有非 hex 字符".to_string())?;
+        if !crate::hex::unhex(hex, &mut secret) {
+            return Err(format!("secret 应是 64 位 hex，实际 {} 位", hex.len()));
         }
         Ok(KeyFile { key_id, secret })
     }
 
     /// 写回文件用的一行文本（末尾带换行）。
     pub fn to_line(&self) -> String {
-        let hex: String = self.secret.iter().map(|b| format!("{b:02x}")).collect();
-        format!("wmfs-key-v1:{}:{}\n", self.key_id, hex)
+        format!("wmfs-key-v1:{}:{}\n", self.key_id, crate::hex::hex(&self.secret))
     }
 }
 
@@ -117,6 +155,35 @@ mod tests {
     fn key_file_debug_hides_secret() {
         let k = KeyFile { key_id: 1, secret: [0x5a; 32] };
         assert!(!format!("{k:?}").contains("5a"));
+    }
+
+    /// 金样：管理 API 的 JSON 逐字固定（服务端与 ApiClient 都用这些结构，字段名不靠猜）。
+    #[test]
+    fn mgmt_json_golden() {
+        let n = NodeAddrs {
+            node_id: 1,
+            addrs: vec![("tcp".into(), "127.0.0.1:19100".into())],
+            mgmt_addr: "127.0.0.1:19180".into(),
+        };
+        let h = Health {
+            ok: true,
+            version: "0.1.0 (proto 1, core-abi 1, c-abi 1)".into(),
+            cluster_id: "c1".repeat(16),
+            node: n,
+            meta_role: "none".into(),
+            leader: None,
+            audit_lag: None,
+        };
+        let want = format!(
+            r#"{{"ok":true,"version":"0.1.0 (proto 1, core-abi 1, c-abi 1)","cluster_id":"{}","node":{{"node_id":1,"addrs":[["tcp","127.0.0.1:19100"]],"mgmt_addr":"127.0.0.1:19180"}},"meta_role":"none","leader":null,"audit_lag":null}}"#,
+            "c1".repeat(16)
+        );
+        assert_eq!(serde_json::to_string(&h).unwrap(), want);
+        assert_eq!(serde_json::from_str::<Health>(&want).unwrap(), h);
+        let l = FailpointList { failpoints: vec![Failpoint { name: "a.b".into(), action: "off".into() }] };
+        assert_eq!(serde_json::to_string(&l).unwrap(), r#"{"failpoints":[{"name":"a.b","action":"off"}]}"#);
+        let e = ErrorReply { error: "auth_failed".into(), message: "签名不对".into() };
+        assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"error":"auth_failed","message":"签名不对"}"#);
     }
 
     #[test]

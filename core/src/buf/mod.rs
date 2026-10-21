@@ -2,4 +2,4 @@
 
 pub mod pool;
 
-pub use pool::{Buf, BufSlice, FrozenBuf, Lane, MemPool, PoolConfig, RegionInfo};
+pub use pool::{Buf, BufSlice, ClassStats, FrozenBuf, Lane, MemPool, PoolConfig, RegionInfo};

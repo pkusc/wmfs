@@ -7,12 +7,17 @@
 //! - [`base`]：错误码、单位、时钟、随机数、日志、node.toml、libc 封装、物理盘解析
 //! - [`proto`]：帧头与全部线上消息（3.3）
 //! - [`buf`]：预注册内存池与缓冲区所有权（3.6）
-//! - [`net`]：连接包装、RpcClient、Responder（3.12）
+//! - [`net`]：连接包装、RpcClient / RpcServer、握手、重试（3.3、3.12）
 //! - [`hooks`]：manifest、钩子 trait、管线、策略求值点（3.7）
 //! - [`meta`]：KV 布局与记录（3.2.7–3.2.9）、元数据事务模型（3.5.1）、目录属性（3.12）
 //! - [`data`]：chunk 文件格式与 target 超级块（3.2.3、3.2.4）
 //! - [`client`]：MetaClient / DataClient（3.12）
 //! - [`bg`]：后台任务框架（3.10）
+//! - [`mgmt`]：管理 API 的 HTTP 框架与签名校验（7.1）
+//! - [`init`] / [`server`]：`wmfs init` 的本地侧与节点运行时装配
+
+/// 本体对外的稳定接口（指标、fail point、错误码表……）原样转出，独立 crate 的插件只依赖 wmfs-core 就能用到。
+pub use wmfs_api as api;
 
 pub mod base;
 pub mod bg;
@@ -20,6 +25,9 @@ pub mod buf;
 pub mod client;
 pub mod data;
 pub mod hooks;
+pub mod init;
 pub mod meta;
+pub mod mgmt;
 pub mod net;
 pub mod proto;
+pub mod server;

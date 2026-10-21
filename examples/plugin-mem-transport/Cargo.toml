@@ -1,11 +1,12 @@
 [package]
 name = "plugin-mem-transport"
-description = "独立 crate 的内存传输插件：'新增传输插件不改本体一行'的可执行证明，也给组件测试用（M1 实现）"
+description = "独立 crate 的内存传输插件：'新增传输插件不改本体一行'的可执行证明，也给组件测试用"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# 只依赖 wmfs-core 的公开 API（Transport/Conn trait、帧、内存池；指标经 wmfs_core::api）。
 [dependencies]
 wmfs-core.workspace = true
 

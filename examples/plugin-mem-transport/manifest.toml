@@ -1,0 +1,13 @@
+# mem 传输插件的 manifest（design.md 3.7.1）：与 src/lib.rs 里的 MANIFEST 逐字段相等（tests/mem.rs 检查）。
+name = "mem"
+version = "0.1.0"
+hooks = ["transport"]
+altitude = 0
+hot_path = true
+abi_version = 1
+attrs = []
+budget_ns = 100000000
+fail_points = ["plugin.mem.transport"]
+
+[config_schema]
+# 没有部署参数：监听名字只在代码里给（MemTransport::listening），它只用于单进程测试

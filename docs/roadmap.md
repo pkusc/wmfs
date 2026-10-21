@@ -117,6 +117,7 @@ wmfs ping tcp://127.0.0.1:19100 --count 1000        # 预期：1000/1000 ok，�
 wmfs ping tcp://127.0.0.1:19100 --bulk 4M --count 200    # 预期：bulk crc ok 200/200，吞吐若干 GB/s
 wmfs debug gen-key --out /tmp/wrong.key
 wmfs ping tcp://127.0.0.1:19100 --key-file /tmp/wrong.key   # 预期：AUTH_FAILED（认证被拒）
+wmfs ping tcp://127.0.0.1:19100 --key-file ~/wmfs-dev/n1/keys/client.key --role server   # 预期：AUTH_FAILED（client key 冒充不了服务端）
 WMFS_FAILPOINTS='plugin.tcp.transport=pct(30,return(EIO))' wmfs ping tcp://127.0.0.1:19100 --count 100   # 预期：日志里有"连接断开 → 重连重试"，结果 100/100 ok
 wmfs failpoint list 1                               # 预期：空列表（这条命令走带签名的管理 API；M4 会用它注入故障）
 curl --noproxy '*' -s 127.0.0.1:19180/api/v1/health # 预期：JSON，含本节点的 rpc 与管理地址

@@ -15,6 +15,8 @@ step() { echo "== $*"; }
 # design.md 0.2 里能机械检查的硬规则：每个 .rs 文件 ≤ 400 行；unsafe 只在白名单文件里；不写 macro_rules!；
 # 不引入信号处理 crate（ctrlc、signal-hook）与 rand crate；不写过程宏。`// SAFETY:` 注释由 clippy 的
 # undocumented_unsafe_blocks 检查（根 Cargo.toml 的 [workspace.lints]）。
+# 另有 2.1 的两条：core/src 里除注释外没有 rdma（M2 的验收也用这一条 grep）；插件只用 wmfs_core 的公开 API
+# （不直接 use wmfs_api，也不引用别的插件的模块）。
 rules() {
     local bad=0 files f
     files="$(find api core cli dashboard plugins tests examples -name '*.rs' -not -path '*/target/*' | sort)"
@@ -48,6 +50,32 @@ rules() {
             bad=1
         fi
     done
+    # core/src 除注释外 grep 不到 rdma（2.1；与 roadmap M2 的验收命令完全相同）
+    if grep -rn --include='*.rs' -i rdma core/src | grep -v '//'; then
+        echo "core/src 里除注释外不得出现 rdma（design.md 2.1：core 里没有任何传输名字的特殊分支）"
+        bad=1
+    fi
+    # 插件只能 use wmfs_core::... 的公开 API，不得 use 其他插件模块（2.1）
+    local d name other
+    for d in plugins/*/; do
+        name="$(basename "$d")"
+        if grep -rnE '\bwmfs_api\b' --include='*.rs' "$d"; then
+            echo "插件 $name 不得直接用 wmfs_api（用 wmfs_core::api，design.md 2.1）"
+            bad=1
+        fi
+        for other in plugins/*/; do
+            other="$(basename "$other" | tr '-' '_')"
+            [ "$other" = "$(echo "$name" | tr '-' '_')" ] && continue
+            if grep -rnE "(crate|super|wmfs_plugins)::$other\b" --include='*.rs' "$d"; then
+                echo "插件 $name 不得引用别的插件模块 $other（design.md 2.1）"
+                bad=1
+            fi
+        done
+    done
+    if grep -nE '^[[:space:]]*wmfs-api[[:space:]]*(=|\.)' plugins/Cargo.toml; then
+        echo "plugins/Cargo.toml 不得直接依赖 wmfs-api（插件经 wmfs_core::api 使用，design.md 2.1）"
+        bad=1
+    fi
     if [ "$bad" -eq 0 ]; then
         echo "编码约定检查通过：$(echo "$files" | wc -l) 个 .rs 文件"
     fi

@@ -37,10 +37,15 @@ LIMIT=30000
 # 首发时各模块的行数估算（顺序即输出顺序）。来自 design.md 2.2，M0 结束时按剩余工作重估了三个模块（见 design.md 2.2
 # 表下的实现注记）：wmfs-api 550 → 900（7.1 约 30 个管理端点的请求/响应结构都还没写）、core/proto 1300 → 900（全部消息
 # 类型已在 M0 写完，只剩握手证明与密钥派生、cap 签名与校验）、cli 2810 → 2950（doctor 已约 300 行，原估 180）。
-MODULES="wmfs-api:900 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:800 core/hooks:1060
+# M1 结束时又重估了四个（design.md 2.2 的 M1 注记）：core/net 800 → 1000（M1 已写完几乎全部，余下 leader_hint、
+# OneWay 服务、call_cb 后台建连）、examples/plugin-mem-transport 150 → 180（已写完）、plugins 4980 → 4810（tcp 300 → 200、
+# shared-key 150 → 80，都已写完）、dashboard 920 → 880（ApiClient 160 → 120，已写完）。
+# M1 审查修复后又重估了两个（design.md 2.2 的 M1 注记）：core/net 1000 → 1120（修复后约 1,060，余下约 60）、
+# examples/plugin-mem-transport 180 → 195（已写完：加了帧上限与收帧计时）。
+MODULES="wmfs-api:900 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1120 core/hooks:1060
 core/meta/raft:1570 core/meta/engine:720 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
-core/data:3000 core/client:1800 core/bg:850 core/mgmt:790 core:540 plugins:4980 cli:2950 dashboard:920
-examples/plugin-mem-transport:150"
+core/data:3000 core/client:1800 core/bg:850 core/mgmt:790 core:540 plugins:4810 cli:2950 dashboard:880
+examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。
 module_of() {

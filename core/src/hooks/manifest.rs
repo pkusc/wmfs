@@ -23,7 +23,7 @@ pub enum Hook {
     MgmtExt,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub name: &'static str,
     pub version: &'static str,
@@ -86,6 +86,65 @@ impl Hook {
     pub fn from_name(s: &str) -> Option<Hook> {
         Hook::ALL.into_iter().find(|h| h.name() == s)
     }
+
+    /// 这个钩子的 altitude 区间（3.7.2）；None = 不排序或唯一型，manifest 里填 0。
+    pub fn altitude_range(self) -> Option<(u16, u16)> {
+        match self {
+            Hook::Authn => Some((100, 199)),
+            Hook::Authz => Some((200, 299)),
+            Hook::QuotaAdmission => Some((300, 399)),
+            Hook::Qos => Some((400, 499)),
+            Hook::Placement => Some((500, 599)),
+            Hook::Codec => Some((600, 699)),
+            Hook::Transform => Some((700, 799)),
+            _ => None,
+        }
+    }
+
+    /// 是否进集群插件清单（3.7.2 第 1 条：会影响策略的 8 个钩子）。
+    pub fn in_cluster_list(self) -> bool {
+        matches!(
+            self,
+            Hook::Authn
+                | Hook::Authz
+                | Hook::QuotaAdmission
+                | Hook::Qos
+                | Hook::Placement
+                | Hook::Codec
+                | Hook::Transform
+                | Hook::BgTask
+        )
+    }
+}
+
+/// 核对插件目录里给人看的 `manifest.toml` 与代码里的 [`Manifest`] 常量逐字段相等（3.7.1；各插件的单元测试调用它，
+/// 防止两者漂移）。`manifest.toml` 必须正好有这 10 个字段（理念文档 4.3.1 的 7 个 + attrs、budget_ns、fail_points），
+/// `[config_schema]` 表与 `Manifest.config_schema` 的 TOML 文本解析结果相同。
+pub fn check_manifest_toml(m: &Manifest, text: &str) -> Result<(), String> {
+    use toml::Value as V;
+    let strs = |v: &[&str]| V::Array(v.iter().map(|s| V::String(s.to_string())).collect());
+    let schema: toml::Table =
+        m.config_schema.parse().map_err(|e| format!("{} 的 config_schema 不是合法 TOML：{e}", m.name))?;
+    let want = toml::Table::from_iter([
+        ("name".to_string(), V::String(m.name.into())),
+        ("version".to_string(), V::String(m.version.into())),
+        ("hooks".to_string(), strs(&m.hooks.iter().map(|h| h.name()).collect::<Vec<_>>())),
+        ("altitude".to_string(), V::Integer(m.altitude as i64)),
+        ("hot_path".to_string(), V::Boolean(m.hot_path)),
+        ("config_schema".to_string(), V::Table(schema)),
+        ("abi_version".to_string(), V::Integer(m.abi_version as i64)),
+        ("attrs".to_string(), strs(m.attrs)),
+        ("budget_ns".to_string(), V::Integer(m.budget_ns as i64)),
+        ("fail_points".to_string(), strs(m.fail_points)),
+    ]);
+    let got: toml::Table = text.parse().map_err(|e| format!("{} 的 manifest.toml 不是合法 TOML：{e}", m.name))?;
+    if got != want {
+        return Err(format!(
+            "{} 的 manifest.toml 与代码里的 Manifest 不一致：\n  文件：{got:?}\n  代码：{want:?}",
+            m.name
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ publish = false
 # 本工作区的 crate
 wmfs-api = { path = "api" }
 wmfs-core = { path = "core" }
-wmfs-plugins = { path = "plugins" }
+wmfs-plugins = { path = "plugins", default-features = false }   # 启用哪些插件由使用者的 feature 决定（cli/Cargo.toml）
 wmfs-mgr = { path = "dashboard" }
 plugin-mem-transport = { path = "examples/plugin-mem-transport" }
 # 外部依赖（design.md 2.3；全部已在本机编译核对）
@@ -36,7 +36,7 @@ aes-gcm = "0.11"
 hmac = "0.13"
 sha2 = "0.11"
 tiny_http = "0.12"
-ureq = "3"
+ureq = { version = "3", default-features = false }   # 只访问本机/内网的 http；不需要 TLS（M14 的 webhook 需要 https 时再开 rustls）
 clap = { version = "4", features = ["derive"] }
 libloading = "0.9"
 toml = "1"

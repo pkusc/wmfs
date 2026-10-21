@@ -30,6 +30,17 @@ impl Role {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
+    /// 名字："admin" / "client" / "server"（日志、指标标签、`wmfs ping --role` 用；写死在这里，不取 Debug 输出）。
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Client => "client",
+            Role::Server => "server",
+        }
+    }
+    pub fn from_name(s: &str) -> Option<Role> {
+        [Role::Admin, Role::Client, Role::Server].into_iter().find(|r| r.name() == s)
+    }
 }
 
 /// 时间戳：秒 + 纳秒（atime/mtime/ctime/btime、changelog 都用它）。
@@ -85,6 +96,10 @@ mod tests {
         }
         assert_eq!(Role::from_u8(0), None);
         assert_eq!(Role::from_u8(4), None);
+        for (r, n) in [(Role::Admin, "admin"), (Role::Client, "client"), (Role::Server, "server")] {
+            assert_eq!((r.name(), Role::from_name(n)), (n, Some(r)));
+        }
+        assert_eq!(Role::from_name("Server"), None);
     }
 
     #[test]

@@ -11,8 +11,34 @@ path = "lib.rs"
 
 [dependencies]
 wmfs-core.workspace = true
-wmfs-plugins.workspace = true
+wmfs-plugins = { workspace = true, features = ["tcp", "shared-key"] }
 plugin-mem-transport.workspace = true
+crc32c.workspace = true
+
+# 组件测试（design.md 9.3 的思路：单进程，经 mem 或回环 TCP 互连）。端口一律 127.0.0.1:0，由系统分配。
+[[test]]
+name = "net_rpc"
+path = "it/net_rpc.rs"
+
+[[test]]
+name = "slow_client"
+path = "it/slow_client.rs"
+
+[[test]]
+name = "failpoint_retry"
+path = "it/failpoint_retry.rs"
+
+[[test]]
+name = "failpoint_authn"
+path = "it/failpoint_authn.rs"
+
+[[test]]
+name = "conn_faults"
+path = "it/conn_faults.rs"
+
+[[test]]
+name = "conn_idle"
+path = "it/conn_idle.rs"
 
 [lints]
 workspace = true

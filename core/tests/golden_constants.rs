@@ -189,5 +189,9 @@ fn golden_constants() {
     for name in RESERVED_FEATURE_NAMES {
         g.add(&format!("feature_name.{name}"), name.as_bytes().to_vec());
     }
+    // M1 追加（ADR-0029）：changelog 操作码表 v1，只追加、永不改号
+    for (code, name) in wmfs_api::ops::CHANGE_OPS {
+        g.add(&format!("changelog_op.{name}"), code.to_le_bytes().to_vec());
+    }
     g.check();
 }

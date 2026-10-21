@@ -86,6 +86,11 @@ impl fmt::Display for ErrCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.name() {
             Some(n) => write!(f, "{n}"),
+            None if self.is_posix() => {
+                // 名字表里没有的 errno：附上系统的说明，例如"错误码 98（Address already in use）"
+                let s = std::io::Error::from_raw_os_error(self.0 as i32).to_string();
+                write!(f, "错误码 {}（{}）", self.0, s.split(" (os error").next().unwrap_or(&s))
+            }
             None => write!(f, "错误码 {}", self.0),
         }
     }
@@ -122,6 +127,7 @@ mod tests {
         assert_eq!(ErrCode::EIO.to_string(), "EIO");
         assert_eq!(ErrCode::NOT_LEADER.name(), Some("NOT_LEADER"));
         assert_eq!(ErrCode(4321).to_string(), "错误码 4321");
+        assert_eq!(ErrCode(98).to_string(), "错误码 98（Address already in use）", "名字表里没有的 errno 附上系统说明");
         assert_eq!(format!("{:?}", ErrCode::EDQUOT), "ErrCode(EDQUOT=122)");
         assert_eq!(ErrCode::from_name("BUSY"), Some(ErrCode::BUSY));
         assert!(ErrCode::EAGAIN.is_posix());

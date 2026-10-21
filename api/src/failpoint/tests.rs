@@ -87,8 +87,11 @@ fn bad_actions_are_rejected() {
     for bad in ["bogus", "return(NOPE)", "pct(101,off)", "times(x,off)", "sleep()", "return(EIO", "pct(5)"] {
         assert!(set("test.bad", bad).is_err(), "应拒绝：{bad}");
     }
-    assert!(set("", "off").is_err());
-    assert!(set("a b", "off").is_err());
+    for name in ["", "a b", "a&b", "测试.点", "a=b", "a/b"] {
+        assert!(set(name, "off").is_err(), "名字只能由字母、数字和 . _ - 组成：{name:?}");
+    }
+    check_name("plugin.shared-key.authn").unwrap();
+    check_name("plugin.quota.quota_admission").unwrap();
     assert_eq!(fail_point("test.bad"), Ok(()), "解析失败不改变配置");
 }
 

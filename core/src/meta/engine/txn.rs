@@ -161,8 +161,12 @@ mod tests {
         let who = Principal { uid: 0, gid: 0, groups: vec![], tenant: 0, job_id: 0, conn };
         let req =
             ReqCtx { who, session: 0, seq: 0, pid: 0, trace_id: 0, now: Ts::default(), now_ms: 0, internal: true };
-        let (pipeline, attrs, map, settings) =
-            (Pipeline {}, AttrResolver {}, empty_map(), ClusterSettingsV1::default());
+        let (pipeline, attrs, map, settings) = (
+            Pipeline::new(crate::hooks::registry::PluginSet::new(&[])),
+            AttrResolver {},
+            empty_map(),
+            ClusterSettingsV1::default(),
+        );
         let ctx = OpCtx { req: &req, pipeline: &pipeline, attrs: &attrs, map: &map, settings: &settings };
 
         let mut kv = BTreeMap::new();

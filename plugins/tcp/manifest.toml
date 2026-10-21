@@ -1,0 +1,13 @@
+# tcp 传输插件的 manifest（design.md 3.7.1、4.1）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "tcp"
+version = "0.1.0"
+hooks = ["transport"]
+altitude = 0
+hot_path = true
+abi_version = 1
+attrs = []
+budget_ns = 100000000
+fail_points = ["plugin.tcp.transport"]
+
+[config_schema]
+listen = { type = "addr", default = "0.0.0.0:9300", doc = "rpc 监听地址（wmfs init 写成 --addr:--rpc-port）" }

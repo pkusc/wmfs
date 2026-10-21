@@ -13,7 +13,7 @@
 //! - [`fail_point_hit`]：`return(..)` 与 `corrupt` 返回 true（drop、corrupt 这类动作由调用方自己做）；
 //! - [`fail_point_value`]：`return(<整数>)` 的整数值（可以为负、可以大于 u16），给时钟注入偏移与速率用。
 //!
-//! 名字按完整字符串匹配（例如 `plugin.quota.quota_admission`、`net.drop.to.2`）。
+//! 名字按完整字符串匹配（例如 `plugin.quota.quota_admission`、`net.drop.to.2`），只能由字母、数字和 `.` `_` `-` 组成。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -138,10 +138,12 @@ pub fn set(name: &str, action: &str) -> Result<(), String> {
     insert(name, action)
 }
 
-/// 名字不能为空、不能含空白（环境变量与 set() 用同一条规则）。
-fn check_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.contains(char::is_whitespace) {
-        return Err(format!("fail point 名字不能为空或含空白：{name:?}"));
+/// 名字只能由 ASCII 字母、数字与 `.` `_` `-` 组成、不能为空（3.11 的名字与 `plugin.<名字>.<钩子>` 都符合）。
+/// 环境变量、[`set`] 与管理 API（含 CLI）用同一条规则：于是名字放进 URL 的查询参数也不用转义。
+pub fn check_name(name: &str) -> Result<(), String> {
+    let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    if name.is_empty() || !name.chars().all(ok) {
+        return Err(format!("fail point 名字只能由字母、数字和 . _ - 组成（不能为空）：{name:?}"));
     }
     Ok(())
 }

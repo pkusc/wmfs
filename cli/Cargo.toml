@@ -10,8 +10,18 @@ publish.workspace = true
 name = "wmfs"
 path = "src/main.rs"
 
+[features]
+# 每个插件一个 feature（design.md 2.1、3.7.5），默认启用全部首发插件；mem 是独立 crate 的示例传输，默认不编进来。
+default = ["tcp", "shared-key"]
+tcp = ["wmfs-plugins/tcp"]
+shared-key = ["wmfs-plugins/shared-key"]
+mem = ["dep:plugin-mem-transport"]
+
 [dependencies]
 wmfs-core.workspace = true
+wmfs-plugins.workspace = true
+wmfs-mgr.workspace = true
+plugin-mem-transport = { workspace = true, optional = true }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
