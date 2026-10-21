@@ -31,7 +31,7 @@ export no_proxy=127.0.0.1,localhost,10.77.0.1 NO_PROXY=127.0.0.1,localhost,10.77
 ## 1. 依赖顺序与总表
 
 ```
-M0 ─▶ M1 ─┬─▶ M2（RDMA，可选；需要你执行一次 sudo；可以在 M3 之后任何时候再做）
+M0 ─▶ M1 ─┬─▶ M2（RDMA，本机不做实机测试；可以在 M3 之后任何时候再做）
           └─▶ M3 ─▶ M4 ─▶ M5 ─▶ M6 ─▶ M7 ─▶ M8 ─▶ M9 ─▶ M10 ─▶ M11 ─▶ M12 ─▶ M13 ─▶ M14 ─▶ M15
 ```
 
@@ -60,7 +60,7 @@ M0 ─▶ M1 ─┬─▶ M2（RDMA，可选；需要你执行一次 sudo；可�
 
 ## 2. 什么时候要你确认什么
 
-> **2026-10-20 更新**：你已一次性同意下表全部批次（0–5）的推荐方案，所有 ADR 的状态改为 accepted，开工前不再逐批询问；下表保留作记录。之后如果出现表里没有的新取舍，agent 仍会先问你。
+> **2026-10-20 更新**：你已一次性同意下表全部批次（0–5）的推荐方案，所有 ADR 的状态改为 accepted，开工前不再逐批询问；下表保留作记录。之后如果出现表里没有的新取舍，agent 仍会先问你。**2026-10-21 补充**：实现中发现的纯技术缺口（不改变对外承诺、不增删功能，例如 M0 审查发现漏了 changelog 操作码表 → ADR-0029）由主管直接定、写 ADR，并在进度说明里告诉你；改变对外承诺或要砍功能的，照样先问你。
 
 理念文档规定：契约层的 ADR 处于 `proposed` 时不得实现。做法是：**所有技术契约在 M0 开工前一次确认**（你看不了字节格式、Ready 处理顺序这种细节，评审已经逐条核对过，你回一句"同意"就行；这样 M0 就能把全部接口写成代码，之后任何里程碑都不会"先实现、后批准"）；**真正要你做产品取舍的几条，在用到它的那个里程碑开工前单独问你**，那时你对系统已经更熟。
 
@@ -79,8 +79,8 @@ M0 ─▶ M1 ─┬─▶ M2（RDMA，可选；需要你执行一次 sudo；可�
 
 ### M0 骨架、体检与接口骨架（约 2,900 行）
 
-- **目标**：工程能编译；一条命令告诉你这台机器能测什么、哪一步需要 sudo；把 design.md 里全部"格式与接口"一次写成可编译的代码并拍下字节快照，之后各模块照它对接。
-- **包含**：workspace 与全部 crate 空壳（`api`、`core`、`plugins`、`cli`、`dashboard`、`tests`、`examples/plugin-mem-transport`）；`wmfs-api`（指标注册表 + Prometheus 文本、fail point 框架与语法、错误码名字表）；`core/base`（错误码、单位与时长解析、时钟、随机数、日志、node.toml 结构、`sys.rs` 的安全封装、`devinfo.rs`）；**接口骨架**：把 design.md 3.2.7–3.2.9、3.3、3.5.1、3.6.2、3.6.4、3.7.1、3.7.3、3.7.7、3.10、3.12 的全部类型、枚举、trait 原样写成 Rust 文件（只有签名，函数体先 `unimplemented!()`），连同 `tests/golden/` 的金样（每种消息、记录、帧头、chunk 头一份固定字节）；`wmfs --version`、`wmfs doctor`；`scripts/accept.sh`、`scripts/loc.sh`、`scripts/ci.sh`。M0 结束时把 design.md 里对应的代码块改成"见 `core/src/…`"——从此骨架文件是唯一真源。对应理念文档：第 3 章"可观测性基座"的计数器注册表与 fail points、"持久化格式与线上协议"的格式定义。
+- **目标**：工程能编译；一条命令告诉你这台机器能测什么、哪些测试本机做不了；把 design.md 里全部"格式与接口"一次写成可编译的代码并拍下字节快照，之后各模块照它对接。
+- **包含**：workspace 与全部 crate 空壳（`api`、`core`、`plugins`、`cli`、`dashboard`、`tests`、`examples/plugin-mem-transport`）；`wmfs-api`（指标注册表 + Prometheus 文本、fail point 框架与语法、错误码名字表）；`core/base`（错误码、单位与时长解析、时钟、随机数、日志、node.toml 结构、`sys.rs` 的安全封装、`devinfo.rs`）；**接口骨架**：把 design.md 3.2.7–3.2.9、3.3、3.5.1、3.6.2、3.6.4、3.7.1、3.7.3、3.7.7、3.10、3.12 的全部类型、枚举、trait 原样写成 Rust 文件（只有签名，函数体先 `unimplemented!()`），连同 `tests/golden/` 的金样（每种消息、记录、帧头、chunk 头一份固定字节）；`wmfs --version`、`wmfs doctor`；`scripts/accept.sh`、`scripts/loc.sh`、`scripts/ci.sh`。从此骨架文件是唯一真源：design.md 里对应的代码块保留、仅供阅读，每个对应小节开头加一行实现注记写明以哪个源码文件为准（原计划是把代码块改成"见 `core/src/…`"，主管于 2026-10-21 改为这种做法，方便新手读文档）。对应理念文档：第 3 章"可观测性基座"的计数器注册表与 fail points、"持久化格式与线上协议"的格式定义。
 - **开工前确认**：批次 0。
 - **验收标准**：`cargo build --release` 零警告；`cargo test` 通过（含全部金样）；`wmfs doctor` 输出检查表并以 0 退出；`scripts/accept.sh M0` PASS。
 - **演示命令**：

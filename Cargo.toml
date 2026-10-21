@@ -1,0 +1,52 @@
+# wmfs 工作区（design.md 2.1）。依赖版本在 [workspace.dependencies] 统一管理，与 design.md 2.3 一致；
+# 各 crate 只写 `xxx.workspace = true`，用到哪个才引入哪个。
+[workspace]
+resolver = "3"
+members = ["api", "core", "plugins", "cli", "dashboard", "tests", "examples/plugin-mem-transport"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# 本工作区的 crate
+wmfs-api = { path = "api" }
+wmfs-core = { path = "core" }
+wmfs-plugins = { path = "plugins" }
+wmfs-mgr = { path = "dashboard" }
+plugin-mem-transport = { path = "examples/plugin-mem-transport" }
+# 外部依赖（design.md 2.3；全部已在本机编译核对）
+raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
+protobuf = "2.28"
+slog = "2"
+redb = "2"
+fuser = { version = "0.18", default-features = false }
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3 = "1"
+lz4_flex = "0.14"
+zstd = "0.14"
+aes-gcm = "0.11"
+hmac = "0.13"
+sha2 = "0.11"
+tiny_http = "0.12"
+ureq = "3"
+clap = { version = "4", features = ["derive"] }
+libloading = "0.9"
+toml = "1"
+libc = "0.2"
+sideway = "0.4"
+
+# design.md 0.2 第 4 条"每处 unsafe 写 // SAFETY: 说明"交给 clippy 检查（scripts/ci.sh 与验收里 clippy 带 -D warnings）。
+# 各 crate 用 `[lints] workspace = true` 继承。
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+debug = 1          # 保留行号信息：崩溃栈与慢请求排查更容易（不影响性能）

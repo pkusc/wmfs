@@ -1,0 +1,3 @@
+# 格式化规则（cargo fmt）：行宽 120；短的结构体字面量与参数列表尽量写在一行，减少纯换行带来的行数。
+max_width = 120
+use_small_heuristics = "Max"

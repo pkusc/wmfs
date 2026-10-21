@@ -1,0 +1,20 @@
+[package]
+name = "wmfs"
+description = "wmfs 的唯一二进制：所有子命令、插件注册表 registry.rs、FUSE 适配层"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wmfs"
+path = "src/main.rs"
+
+[dependencies]
+wmfs-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

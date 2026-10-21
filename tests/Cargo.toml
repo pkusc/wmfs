@@ -1,0 +1,18 @@
+[package]
+name = "wmfs-testkit"
+description = "测试专用：多进程集群框架、Jepsen-lite 检查器、profile 测试、模拟掉电的存储后端；金样文件在 golden/"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+wmfs-core.workspace = true
+wmfs-plugins.workspace = true
+plugin-mem-transport.workspace = true
+
+[lints]
+workspace = true

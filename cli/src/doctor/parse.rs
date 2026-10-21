@@ -1,0 +1,75 @@
+//! `wmfs doctor` 用的纯函数：解析 /proc、/sys、/etc 里的文本，列目录（都有单元测试，不依赖本机环境）。
+
+use std::path::{Path, PathBuf};
+
+/// 列出目录里的条目（排好序）；目录不存在或读不了 = 空列表。
+pub fn list_dir(p: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> =
+        std::fs::read_dir(p).map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// 路径的最后一段（例如 "/sys/class/infiniband/mlx5_0" → "mlx5_0"）。
+pub fn name_of(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// "6.17.0-1029-nvidia" → (6, 17)
+pub fn parse_kernel(rel: &str) -> Option<(u32, u32)> {
+    let mut it = rel.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty());
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
+/// /proc/self/mountinfo → [(挂载点, 文件系统类型)]
+pub fn parse_mountinfo(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let (left, right) = l.split_once(" - ")?;
+            let mp = left.split(' ').nth(4)?;
+            let fstype = right.split(' ').next()?;
+            Some((mp.to_string(), fstype.to_string()))
+        })
+        .collect()
+}
+
+/// /proc/self/status 的 "Uid:" 行的第一个数（真实 uid）。
+pub fn uid_from_status(text: &str) -> Option<u32> {
+    text.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|r| r.split_whitespace().next()?.parse().ok())
+}
+
+/// /etc/fuse.conf 里有没有未注释的 user_allow_other。
+pub fn fuse_conf_allows_other(text: &str) -> bool {
+    text.lines().map(str::trim).any(|l| l == "user_allow_other")
+}
+
+/// "nvme0n1" → "nvme0"（NVMe 控制器名）；不是 NVMe namespace 返回 None。
+pub fn nvme_ctrl(dev: &str) -> Option<String> {
+    let rest = dev.strip_prefix("nvme")?;
+    let n = rest.find('n')?;
+    Some(format!("nvme{}", &rest[..n]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_parsers() {
+        assert_eq!(parse_kernel("6.17.0-1029-nvidia"), Some((6, 17)));
+        assert_eq!(parse_kernel("garbage"), None);
+        let mi = "29 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n\
+                  90 29 0:50 / /home/u/wmfs-mnt rw,nosuid shared:2 - fuse.wmfs wmfs:c1c1c1c1 rw,user_id=1000\n";
+        let m = parse_mountinfo(mi);
+        assert_eq!(m[0], ("/".to_string(), "ext4".to_string()));
+        assert_eq!(m[1].1, "fuse.wmfs");
+        assert_eq!(uid_from_status("Name:\tx\nUid:\t1000\t1000\t1000\t1000\n"), Some(1000));
+        assert!(!fuse_conf_allows_other("# user_allow_other\n"));
+        assert!(fuse_conf_allows_other("mount_max = 1000\n user_allow_other \n"));
+        assert_eq!(nvme_ctrl("nvme0n1").as_deref(), Some("nvme0"));
+        assert_eq!(nvme_ctrl("nvme12n3").as_deref(), Some("nvme12"));
+        assert_eq!(nvme_ctrl("sda"), None);
+        assert!(list_dir(Path::new("/no/such/dir")).is_empty());
+        assert_eq!(name_of(Path::new("/sys/class/infiniband/mlx5_0")), "mlx5_0");
+    }
+}

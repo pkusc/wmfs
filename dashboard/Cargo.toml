@@ -1,0 +1,16 @@
+[package]
+name = "wmfs-mgr"
+description = "进程外控制面插件宿主（dashboard、exporter、alert、audit-log、webhook）与管理 API 客户端 ApiClient；不依赖 wmfs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# 依赖方向（design.md 2.1）：wmfs-mgr 只依赖 wmfs-api、ureq、tiny_http、serde、serde_json、toml、hmac、sha2，
+# 绝不依赖 wmfs-core——"进程外插件只能通过管理 API、指标流、事件流接触系统"由编译期保证。
+[dependencies]
+wmfs-api.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

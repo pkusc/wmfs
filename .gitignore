@@ -1,0 +1,12 @@
+# 构建产物
+/target/
+**/target/
+# 编辑器与系统文件
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+# 测试与演示时生成的临时文件
+*.tmp
