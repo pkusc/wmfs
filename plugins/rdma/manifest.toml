@@ -1,0 +1,16 @@
+# rdma 传输插件的 manifest（design.md 3.7.1、4.1）：与 mod.rs 里的 MANIFEST 逐字段相等（tests/mod.rs 检查）。
+name = "rdma"
+version = "0.1.0"
+hooks = ["transport"]
+altitude = 0
+hot_path = true
+abi_version = 1
+attrs = []
+budget_ns = 100000000
+fail_points = ["plugin.rdma.transport"]
+
+[config_schema]
+listen = { type = "addr", default = "", doc = "RDMA 引导 TCP 的监听地址（IPv4:端口）；空 = 不监听" }
+device = { type = "string", default = "", doc = "RDMA 设备名；空 = 按本端 IPv4 自动选" }
+gid_index = { type = "int", default = -1, doc = "GID 表的下标；-1 = 自动选 RoCE v2 的 IPv4 映射 GID" }
+max_qps = { type = "int", default = 64, doc = "最多同时几条 RDMA 连接（每条占 16 个 S 档接收槽）" }

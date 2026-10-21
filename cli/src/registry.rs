@@ -14,6 +14,8 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     let mut s = PluginSet::new(&cfg.plugins.disable);
     #[cfg(feature = "tcp")]
     s.transport(Arc::new(wmfs_plugins::tcp::TcpTransport::new(&cfg.plugin_cfg("tcp"), cfg.net.write_timeout_ms)?));
+    #[cfg(feature = "rdma")]
+    s.transport(Arc::new(wmfs_plugins::rdma::RdmaTransport::new(&cfg.plugin_cfg("rdma"), cfg.net.write_timeout_ms)?));
     #[cfg(feature = "mem")]
     s.transport(Arc::new(plugin_mem_transport::MemTransport::new())); // 独立 crate 示例
     #[cfg(feature = "shared-key")]

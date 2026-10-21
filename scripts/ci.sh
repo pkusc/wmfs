@@ -50,8 +50,12 @@ rules() {
             bad=1
         fi
     done
-    # core/src 除注释外 grep 不到 rdma（2.1；与 roadmap M2 的验收命令完全相同）
-    if grep -rn --include='*.rs' -i rdma core/src | grep -v '//'; then
+    # core/src 除注释外 grep 不到 rdma（2.1）。实现注记（M2）：比 roadmap 的演示命令（grep -v '//' 去掉"含 // 的整行"）更严——
+    # 先去掉每行 // 之后的注释再找，所以 "rdma://…" 这样的字符串与带行尾注释的代码也查得出来（与上面 unsafe 的检查同一写法）
+    local hits
+    hits="$(for f in $(find core/src -name '*.rs' | sort); do sed 's|//.*||' "$f" | { grep -in rdma || true; } | sed "s|^|$f:|"; done)"
+    if [ -n "$hits" ]; then
+        printf '%s\n' "$hits"
         echo "core/src 里除注释外不得出现 rdma（design.md 2.1：core 里没有任何传输名字的特殊分支）"
         bad=1
     fi
@@ -95,6 +99,8 @@ rules
 
 step "3/7 clippy：cargo clippy --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
+# 第三方依赖里"将来的 Rust 会拒绝"的写法（.cargo/config.toml 关掉了每次构建的那行提示，design.md 2.3 实现注记（M2））：在这里看得见
+cargo report future-incompatibilities 2>&1 | head -20 || true
 
 step "4/7 单元测试、fail point 用例与金样：cargo test"
 cargo test --release --workspace

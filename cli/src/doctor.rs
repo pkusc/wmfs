@@ -5,6 +5,7 @@
 //! 有 ✗ 时退出码为 1，否则为 0。`--json` 输出给 scripts/accept.sh 解析。解析文本的纯函数在 [`parse`]。
 
 mod parse;
+mod rdma;
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -32,10 +33,12 @@ struct Check {
     status: Status,
     title: String,  // 一行结论（给人看，也进 JSON）
     detail: String, // 补充说明：影响什么、下一步怎么办
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>, // 机读的补充数据（目前只有 rdma 一项：GID 候选，accept.sh 用）
 }
 
 fn mk(id: &'static str, status: Status, title: impl Into<String>, detail: impl Into<String>) -> Check {
-    Check { id, status, title: title.into(), detail: detail.into() }
+    Check { id, status, title: title.into(), detail: detail.into(), data: None }
 }
 fn ok(id: &'static str, title: impl Into<String>, detail: impl Into<String>) -> Check {
     mk(id, Status::Ok, title, detail)
@@ -65,7 +68,7 @@ pub fn run(json: bool) -> i32 {
         rootfs(&mounts),
         rootdisk(&root_devs),
         proxy(),
-        rdma(),
+        rdma_check(),
         cgroup_io(),
         fdp(&root_devs),
         docker(),
@@ -205,35 +208,9 @@ fn proxy() -> Check {
     )
 }
 
-fn rdma() -> Check {
-    let mut devices = Vec::new();
-    let (mut ports, mut active, mut roce) = (0, 0, 0);
-    for dev in list_dir(Path::new("/sys/class/infiniband")) {
-        devices.push(name_of(&dev));
-        for port in list_dir(&dev.join("ports")) {
-            ports += 1;
-            if read(port.join("state")).contains("ACTIVE") {
-                active += 1;
-            }
-            if read(port.join("link_layer")).trim() == "Ethernet" {
-                roce += 1;
-            }
-        }
-    }
-    const NO_TEST: &str = "没有可用 RDMA 设备（本机不做 RDMA 实机测试）";
-    let skip = "需要 RDMA 设备的检查会显示 SKIP";
-    if active > 0 {
-        return ok("rdma", format!("RDMA：{active} 个端口链路 ACTIVE"), devices.join("、"));
-    }
-    if ports == 0 {
-        return warn("rdma", format!("RDMA：{NO_TEST}"), skip);
-    }
-    let kind = if roce == ports { "RoCE" } else { "RDMA" };
-    warn(
-        "rdma",
-        format!("RDMA：{ports} 个 {kind} 端口链路 DOWN、{NO_TEST}"),
-        format!("{skip}（{}）", devices.join("、")),
-    )
+/// RDMA 一项：识别 rxe 设备、列出 RoCE v2 的 IPv4 GID 候选（doctor/rdma.rs）。
+fn rdma_check() -> Check {
+    rdma::rdma_at(Path::new(rdma::SYSFS))
 }
 
 fn cgroup_io() -> Check {

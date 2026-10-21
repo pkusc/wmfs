@@ -33,7 +33,7 @@ accept_m0() {
         '(tostring | contains("sudo") | not)
          and (.checks[] | select(.id == "rdma") | .status == "ok" or (.title | contains("本机不做 RDMA 实机测试")))' \
         wmfs doctor --json
-    check_json "scripts/loc.sh 统计非测试代码行数、与 M0 预算（2,900 行）对照，且按模块重估的首发总量不超过 30,000 行" \
+    check_json "scripts/loc.sh 统计非测试代码行数、与 M0 预算（2,900 行）对照，且按模块重估的首发总量不超过上限（36,000 行）" \
         '.milestone == "M0" and .budget == 2900 and .total > 0 and (.modules | length) > 0
          and .projected <= .limit' \
         scripts/loc.sh M0 --json

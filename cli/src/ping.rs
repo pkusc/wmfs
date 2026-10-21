@@ -5,6 +5,8 @@
 //! （连接断开 → 重连重试，带退避与 30 s 总期限）；遇到不可重试的错误（例如 `AUTH_FAILED`）立即停下。
 //! 实现注记（M1）：`--role` 指定 Hello 里声明的角色（默认按 key 号推断：0 server、1 admin、其余 client），
 //! 用来演示"client key 申请 server 角色被拒"；`--json` 输出给 scripts/accept.sh 解析。
+//! 实现注记（M2）：`rdma://IP:端口`（对端的 RDMA 引导端口，dev 下是 19n01）同样可用；本机没有能用于这个地址的 RDMA 设备时
+//! 调用以 `EINVAL` 结束（不重试），`--json` 的 `error` 照常是错误码名。
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -163,6 +165,7 @@ fn report(a: &PingArgs, r: Report) -> i32 {
             "ECONNRESET" => "连接断开：服务端没在运行，或地址不对",
             "ETIMEDOUT" => "超时",
             "FEATURE_UNSUPPORTED" => "对端不支持：例如节点没有这种传输，或帧超过了传输的上限",
+            "EINVAL" => "地址写错，或本机没有能用于这个地址的设备（rdma：见 wmfs doctor 与日志）",
             _ => "失败",
         };
         format!("ping {}：{e}（{why}）——{}/{} ok", r.target, r.ok, r.count)

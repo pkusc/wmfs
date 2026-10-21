@@ -1,13 +1,14 @@
 //! `wmfs dev …`：本机开发集群（design.md 7.2，roadmap §0 第 3 条），基础版（M1）：up/down/env/status/kill/start/logs。
 //!
 //! 开发目录默认 `~/wmfs-dev`（`--dir` 或 `WMFS_DEV_DIR` 可改），第 n 个节点的数据在 `<dir>/n<n>`，端口 rpc `19n00`、
-//! http `19n80`（RDMA 引导 `19n01` 留给 M2）；node.toml 打开 `failpoints_api`，内存池用 `PoolConfig::dev_server()`。
+//! http `19n80`、RDMA 引导 `19n01`（只在 `up --rdma IP` 时监听）；node.toml 打开 `failpoints_api`，内存池用 `PoolConfig::dev_server()`。
 //! `up` 起节点后等它就绪才返回——`/api/v1/health` 有响应，并且 pid 文件里就是刚起的这个进程（超时打印日志路径与最后一行
 //! 并以非 0 退出），所以演示与验收不需要 sleep。开发目录一律换成规范的绝对路径（同一个目录换一种写法也认得出来）。
 //! 节点在自己的进程组里后台运行（终端里按 Ctrl-C 不会带走它），stdout/stderr 追加到 `<节点>/logs/server.log`。
 //! 安全：只对 pid 文件里、且命令行确实是"wmfs server --data-dir <这个节点>"的进程发信号；`down --purge` 只删除
 //! 默认的 `~/wmfs-dev` 或带 `.wmfs-dev` 标记的目录。实现注记（M1）：多节点要 `wmfs join`（M8），所以 M1 的 `up` 只支持 `--nodes 1`。
 
+use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,7 +16,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use wmfs_core::api::types::{Health, KeyFile};
-use wmfs_core::base::config::NodeConfig;
+use wmfs_core::base::config::{NodeConfig, PluginTable};
 use wmfs_core::base::{clock, sys};
 use wmfs_core::buf::PoolConfig;
 use wmfs_core::init::{InitOpts, NodeFile, init_node};
@@ -29,6 +30,10 @@ pub enum DevCmd {
     Up {
         #[arg(long, default_value_t = 1)]
         nodes: u32,
+        /// 节点同时在这个 IPv4 上监听 RDMA（引导端口 19n01），数据族走 rdma（要有 RoCE v2 设备，见 wmfs doctor）。
+        /// 每次 up 都按这次的参数改写 node.toml：不带 --rdma 就改回只用 tcp；节点已在运行时要先 wmfs dev down 再 up 才生效
+        #[arg(long, value_name = "IP")]
+        rdma: Option<Ipv4Addr>,
     },
     /// 停掉全部开发节点（SIGTERM，5 s 后 SIGKILL）；--purge 再删除开发目录
     Down {
@@ -64,7 +69,7 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
     }
     let d = std::fs::canonicalize(&d).unwrap_or(d);
     let r = match cmd {
-        DevCmd::Up { nodes } => up(&d, nodes),
+        DevCmd::Up { nodes, rdma } => up(&d, nodes, rdma),
         DevCmd::Down { purge } => down(&d, purge),
         DevCmd::Env => env(&d),
         DevCmd::Status { json } => status(&d, json),
@@ -130,7 +135,7 @@ fn health(d: &Path, n: u32) -> Result<Health, String> {
     Ok(h)
 }
 
-fn up(d: &Path, nodes: u32) -> Result<Vec<String>, String> {
+fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>) -> Result<Vec<String>, String> {
     if nodes != 1 {
         return Err("M1 的 wmfs dev up 只支持 --nodes 1（多节点要 wmfs join，M8 起）".into());
     }
@@ -157,9 +162,44 @@ fn up(d: &Path, nodes: u32) -> Result<Vec<String>, String> {
             };
             init_node(&o)?;
         }
+        if set_rdma(&node_dir(d, n), n, rdma)? && running_pid(d, n).is_some() {
+            lines.push(format!(
+                "node{n} 已在运行：node.toml 里的 RDMA 设置改了，要先 wmfs dev down、再 wmfs dev up 才生效"
+            ));
+        }
         lines.push(start(d, n)?);
     }
     Ok(lines)
+}
+
+/// `up` 的 `--rdma`（声明式：每次 up 都按这次的参数改写 node.toml，返回它变了没有）。给了 IP → `[plugin.rdma] listen =
+/// "IP:19n01"` 与 `max_qps = 32`（dev 的 S 档 128 MiB 只够 32 个 QP 的接收槽，design.md 3.6.1；不写的话插件取服务端默认的
+/// 64，启动校验会让节点起不来），`[net] data_scheme = "rdma"`；没给 → 去掉 `[plugin.rdma]`，data_scheme 是 rdma 的改回 tcp
+/// （`up --rdma` 起不来时，不带 --rdma 再 up 一次就恢复，不用 `down --purge`）。
+fn set_rdma(nd: &Path, n: u32, ip: Option<Ipv4Addr>) -> Result<bool, String> {
+    let p = nd.join("node.toml");
+    let old = NodeConfig::parse(&std::fs::read_to_string(&p).map_err(|e| format!("读 {} 失败：{e}", p.display()))?)?;
+    let mut cfg = old.clone();
+    match ip {
+        Some(ip) => {
+            let t: PluginTable = format!("listen = \"{ip}:{}\"\nmax_qps = 32\n", ports(n).0 + 1)
+                .parse()
+                .map_err(|e| format!("[plugin.rdma] 编码失败：{e}"))?;
+            cfg.plugin.insert("rdma".into(), t);
+            cfg.net.data_scheme = "rdma".into();
+        }
+        None => {
+            cfg.plugin.remove("rdma");
+            if cfg.net.data_scheme == "rdma" {
+                cfg.net.data_scheme = "tcp".into();
+            }
+        }
+    }
+    if cfg == old {
+        return Ok(false);
+    }
+    sys::atomic_write(&p, cfg.to_toml().as_bytes()).map_err(|e| format!("写 {} 失败：{e}", p.display()))?;
+    Ok(true)
 }
 
 /// 启动第 n 个节点（已在运行就只报告），等它就绪：health 有响应，并且 pid 文件里就是这个进程
@@ -319,9 +359,35 @@ fn status(d: &Path, json: bool) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn dev_ports_follow_the_19n00_scheme() {
         assert_eq!(super::ports(1), (19100, 19180));
         assert_eq!(super::ports(3), (19300, 19380));
+    }
+
+    #[test]
+    fn up_rdma_is_declarative() {
+        let nd = std::env::temp_dir().join(format!("wmfs-dev-rdma-{}-{}", std::process::id(), clock::mono_ms()));
+        std::fs::create_dir_all(&nd).unwrap();
+        let cfg = NodeConfig { mem: PoolConfig::dev_server(), ..NodeConfig::default() };
+        std::fs::write(nd.join("node.toml"), cfg.to_toml()).unwrap();
+        let read = || NodeConfig::parse(&std::fs::read_to_string(nd.join("node.toml")).unwrap()).unwrap();
+        let ip = Some("10.77.0.1".parse().unwrap());
+        assert!(set_rdma(&nd, 2, ip).unwrap(), "--rdma：改写了 node.toml");
+        let got = read();
+        let r = got.plugin_cfg("rdma");
+        assert_eq!(r.get("listen").and_then(|v| v.as_str()), Some("10.77.0.1:19201"), "引导端口 19n01");
+        assert_eq!(r.get("max_qps").and_then(|v| v.as_integer()), Some(32), "dev 的 S 档只够 32 个 QP");
+        assert_eq!((got.net.control_scheme.as_str(), got.net.data_scheme.as_str()), ("tcp", "rdma"));
+        crate::registry::build_plugins(&got).unwrap(); // 插件按它的 config_schema 认这些键
+        assert!(!set_rdma(&nd, 2, ip).unwrap(), "同样的参数再 up 一次：不变");
+        assert!(set_rdma(&nd, 2, None).unwrap(), "不带 --rdma：改回只用 tcp");
+        let got = read();
+        assert!(!got.plugin.contains_key("rdma") && got.net.data_scheme == "tcp", "{got:?}");
+        assert_eq!(got, cfg, "与初始化时的 node.toml 一样");
+        assert!(!set_rdma(&nd, 2, None).unwrap());
+        std::fs::remove_dir_all(&nd).unwrap();
     }
 }

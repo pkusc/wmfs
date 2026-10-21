@@ -11,7 +11,7 @@ path = "lib.rs"
 
 [dependencies]
 wmfs-core.workspace = true
-wmfs-plugins = { workspace = true, features = ["tcp", "shared-key"] }
+wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma"] }
 plugin-mem-transport.workspace = true
 crc32c.workspace = true
 
@@ -39,6 +39,10 @@ path = "it/conn_faults.rs"
 [[test]]
 name = "conn_idle"
 path = "it/conn_idle.rs"
+
+[[test]]
+name = "reconnect"
+path = "it/reconnect.rs"
 
 [lints]
 workspace = true

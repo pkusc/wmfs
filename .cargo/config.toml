@@ -1,0 +1,9 @@
+# 工作区的 cargo 配置。
+#
+# sideway（RDMA，design.md 2.3）的依赖链 tabled → tabled_derive → proc-macro-error2 2.0.1 有一处将来的 Rust 会拒绝的写法
+# （第三方代码，不是我们的）。cargo 每次构建都会在 stderr 上打印一行 "warning: the following packages contain code that will be
+# rejected by a future version of Rust"，验收脚本把 stderr 上以 warning 开头的行一律当成编译警告（零警告规则）。
+# 这里只关掉这份"将来不兼容"报告的打印，不影响任何编译器警告；详情仍可用 `cargo report future-incompatibilities` 查看
+# （scripts/ci.sh 会打印它）。实现注记见 design.md 2.3。
+[future-incompat-report]
+frequency = "never"

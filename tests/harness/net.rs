@@ -1,10 +1,13 @@
-//! RPC 组件测试的公共部分：在 tcp（127.0.0.1:0）或 mem 上起一个带 shared-key 认证的 RPC 服务端，造客户端与 Ping 帧；
-//! 另有用裸 TCP 手工收发帧的工具：手工完成握手的"假客户端"（慢客户端、坏 CRC 等用例：它握手之后想怎么发就怎么发），
-//! 以及"假服务端"一侧的握手（测客户端：server_proof 不对、Challenge 回得很慢）。
+//! RPC 组件测试的公共部分：在 tcp（127.0.0.1:0）、mem 或 rdma（需要设备）上起一个带 shared-key 认证的 RPC 服务端，
+//! 造客户端与 Ping 帧；另有用裸 TCP 手工收发帧的工具：手工完成握手的"假客户端"（慢客户端、坏 CRC 等用例：它握手之后
+//! 想怎么发就怎么发），以及"假服务端"一侧的握手（测客户端：server_proof 不对、Challenge 回得很慢）。
+//! 实现注记（M2）：rdma 只注册客户端自己的池，描述符指向别的池会让对端的 READ/WRITE 越权、QP 出错断开，所以发出的
+//! bulk 与 `recv_into` 一律从 [`TestServer::client_pool`] 返回的那个池里取（tcp、mem 也这样写，同一套用例三种传输都能跑）。
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Ipv4Addr, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +31,7 @@ use wmfs_core::proto::handshake::{
     Auth, Challenge, Hello, PingBody, ProofInput, Welcome, auth_proof, derive_secret, server_proof,
 };
 use wmfs_core::proto::{decode_body, encode_body};
+use wmfs_plugins::rdma::{self, RdmaTransport};
 use wmfs_plugins::shared_key::SharedKey;
 use wmfs_plugins::tcp::TcpTransport;
 
@@ -39,6 +43,23 @@ pub const T: Duration = Duration::from_secs(10);
 /// 测试用的小池（≈ 34 MiB）：S 1 MiB、M 4 槽、L 1 槽。
 pub fn pool() -> MemPool {
     MemPool::new(&PoolConfig { s_mb: 1, m_slots: 4, l_slots: 1, repl_lane: true }).unwrap()
+}
+
+/// rdma 服务端最多同时几条 RDMA 连接。要留余量：客户端断开之后，服务端最多要 1 s 多才发现（读线程每秒看一眼引导 TCP），
+/// 这期间那条连接还占着一个名额——auth_case 这样一个接一个建短命客户端时，名额太少会让后面的客户端被直接关掉
+/// （拿到 ECONNRESET 而不是 AUTH_FAILED；plugins/rdma/tests/stack.rs 在假网卡上测同样的顺序）。
+pub const RDMA_MAX_QPS: u32 = 8;
+
+/// rdma 用的池：S 32 MiB（每条连接占 17 个 S 槽；监听一侧的接收槽启动校验要求 S 档 ≥ 2 × max_qps × 16 × 128 KiB =
+/// 2 × 8 × 2 MiB = 32 MiB，复制 lane 之外的 192 个槽也放得下 8 × 17 个）、M 4 槽、L 1 槽。客户端也用它。
+pub fn rdma_pool() -> MemPool {
+    MemPool::new(&PoolConfig { s_mb: 32, m_slots: 4, l_slots: 1, repl_lane: true }).unwrap()
+}
+
+/// 本机一个"RoCE v2、IPv4 映射、端口 ACTIVE"的 GID 的地址（只读 sysfs，不碰设备；规则与 rdma 插件建连时选 GID 相同，
+/// 用的就是插件的 `candidates`）；没有 → None。
+pub fn rdma_ip() -> Option<Ipv4Addr> {
+    rdma::candidates(Path::new(rdma::SYSFS)).into_iter().find(|r| r.active).map(|r| r.ip)
 }
 
 /// 一个跑在某个传输上的测试服务端。
@@ -58,15 +79,27 @@ pub fn tcp() -> TestServer {
 /// 同 [`tcp`]，`[net]` 用给定的值（例如很小的发送队列）。
 pub fn tcp_with(net: NetConfig) -> TestServer {
     let cfg: PluginTable = "listen = \"127.0.0.1:0\"".parse().unwrap();
-    start(Arc::new(TcpTransport::new(&cfg, net.write_timeout_ms).unwrap()), &net)
+    start(Arc::new(TcpTransport::new(&cfg, net.write_timeout_ms).unwrap()), &net, pool())
 }
 
 /// 在进程内的名字 `name` 上起 mem 服务端。
 pub fn mem(name: &str) -> TestServer {
-    start(Arc::new(MemTransport::listening(name)), &NetConfig::default())
+    start(Arc::new(MemTransport::listening(name)), &NetConfig::default(), pool())
 }
 
-fn start(t: Arc<dyn Transport>, net: &NetConfig) -> TestServer {
+/// 在本机的 RDMA 地址上起 rdma 服务端（**需要设备**）；没有 ACTIVE 的 RoCE v2 端口时打印 SKIP 原因并返回 None
+/// （用它的测试一律 `#[ignore = "需要 RDMA 设备"]`：cargo 里"直接返回"会算通过，SKIP 不算通过）。
+pub fn rdma() -> Option<TestServer> {
+    let Some(ip) = rdma_ip() else {
+        println!("SKIP（原因：本机没有 ACTIVE 的 RoCE v2 端口——本机按决定不做 RDMA 实机测试）");
+        return None;
+    };
+    let cfg: PluginTable = format!("listen = \"{ip}:0\"\nmax_qps = {RDMA_MAX_QPS}").parse().unwrap();
+    let net = NetConfig::default();
+    Some(start(Arc::new(RdmaTransport::new(&cfg, net.write_timeout_ms).unwrap()), &net, rdma_pool()))
+}
+
+fn start(t: Arc<dyn Transport>, net: &NetConfig, pool: MemPool) -> TestServer {
     let scheme = t.scheme();
     let mut set = PluginSet::new(&[]);
     set.transport(t);
@@ -75,8 +108,9 @@ fn start(t: Arc<dyn Transport>, net: &NetConfig) -> TestServer {
     let pipeline = Arc::new(Pipeline::new(set));
     let keys = Arc::new(InitKeys::new(MASTER, 0));
     let rpc = RpcServer::new(ServerId { cluster_id: CLUSTER, node_id: 1 }, pipeline.clone(), keys, net);
-    let pool = pool();
-    let addr = rpc.listen(&pipeline.transports()[0], pool.clone()).unwrap().unwrap();
+    let t = &pipeline.transports()[0];
+    t.register_region(&pool.region()).unwrap(); // server.rs 在 listen 之前做的事（rdma 要用）
+    let addr = rpc.listen(t, pool.clone()).unwrap().unwrap();
     let ep = Endpoint { node: 1, addrs: vec![(scheme.to_string(), addr.clone())] };
     TestServer { rpc, ep, addr, scheme, pool }
 }
@@ -91,19 +125,31 @@ impl TestServer {
     pub fn client(&self, key: KeyFile, role: Role) -> Arc<RpcClient> {
         client(self.scheme, key, role)
     }
+
+    /// 同 [`TestServer::client`]，并交出客户端注册给传输的那个池：发出的 bulk 与 `recv_into` 都从它取（rdma 要求）。
+    pub fn client_pool(&self, key: KeyFile, role: Role) -> (Arc<RpcClient>, MemPool) {
+        client_pool(self.scheme, key, role)
+    }
 }
 
-/// 一个只用 `scheme`（"tcp" 或 "mem"）这一种传输的客户端。
+/// 一个只用 `scheme`（"tcp"、"mem" 或 "rdma"）这一种传输的客户端。
 pub fn client(scheme: &str, key: KeyFile, role: Role) -> Arc<RpcClient> {
-    RpcClient::new_with_role(pool(), vec![transport(scheme)], key, role, net(scheme)).unwrap()
+    client_pool(scheme, key, role).0
 }
 
-/// 客户端用的传输（不监听）："tcp" 或 "mem"。
+/// 同 [`client`]，并交出它的池。
+pub fn client_pool(scheme: &str, key: KeyFile, role: Role) -> (Arc<RpcClient>, MemPool) {
+    let p = if scheme == "rdma" { rdma_pool() } else { pool() };
+    (RpcClient::new_with_role(p.clone(), vec![transport(scheme)], key, role, net(scheme)).unwrap(), p)
+}
+
+/// 客户端用的传输（不监听）："tcp"、"mem" 或 "rdma"（rdma 按本端地址自动选设备与 GID）。
 pub fn transport(scheme: &str) -> Arc<dyn Transport> {
-    if scheme == "tcp" {
-        Arc::new(TcpTransport::new(&PluginTable::new(), NetConfig::default().write_timeout_ms).unwrap())
-    } else {
-        Arc::new(MemTransport::new())
+    let wt = NetConfig::default().write_timeout_ms;
+    match scheme {
+        "tcp" => Arc::new(TcpTransport::new(&PluginTable::new(), wt).unwrap()),
+        "rdma" => Arc::new(RdmaTransport::new(&PluginTable::new(), wt).unwrap()),
+        _ => Arc::new(MemTransport::new()),
     }
 }
 

@@ -180,6 +180,10 @@ mod tests {
         let s = super::registry::build_plugins(&Default::default()).unwrap();
         assert_eq!(s.plugin_list().plugins, vec!["authn:shared-key"]);
         let t = super::registry::client_transports().unwrap();
-        assert_eq!(t.iter().map(|t| t.scheme()).collect::<Vec<_>>(), vec!["tcp"]);
+        assert_eq!(
+            t.iter().map(|t| t.scheme()).collect::<Vec<_>>(),
+            vec!["tcp", "rdma"],
+            "rdma 默认编进来（不监听、不碰设备）"
+        );
     }
 }

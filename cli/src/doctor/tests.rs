@@ -40,7 +40,7 @@ fn checks_never_suggest_sudo() {
         fusermount(&std::env::var_os("PATH").unwrap_or_default()),
         memlock(),
         proxy(),
-        rdma(),
+        rdma_check(),
         cgroup_io(),
         allow_other(),
     ];

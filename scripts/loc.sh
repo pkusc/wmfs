@@ -8,7 +8,7 @@
 #   - 只数 .rs 文件；不数 target/、测试 crate tests/（wmfs-testkit）、各 crate 的 tests/ 目录、名为 tests.rs 的文件；
 #   - 每个文件从第一行数到第一个 `#[cfg(test)]` 为止（约定：单元测试模块一律放在文件末尾）；
 #   - 不数空行与纯注释行（以 // 开头，含 /// 与 //!）。
-# 预计首发总量 = Σ max(模块当前行数, 模块估算)。超过 30,000 时先按 roadmap §4"简化储备"删减；删完仍超就停下来和人类商量。
+# 预计首发总量 = Σ max(模块当前行数, 模块估算)。上限 36,000（人类于 2026-10-21 从 30,000 放宽，功能不砍）；超过上限就停下来和人类商量。
 # 提醒（只打印，不改退出码）：累计行数超过本里程碑预算；某个模块超过估算（"超出"）或已达估算的 90%（"≥90%"——
 # 后续里程碑还要往里加代码时，请按剩余工作在下面的 MODULES 里上调估算，并在 design.md 2.2 写实现注记）。
 set -u
@@ -32,7 +32,7 @@ fi
 # roadmap §1：每个里程碑结束时的累计行数预算
 declare -A BUDGET=([M0]=2900 [M1]=5440 [M2]=6440 [M3]=8740 [M4]=11390 [M5]=14190 [M6]=17090 [M7]=19190
     [M8]=20500 [M9]=22650 [M10]=23800 [M11]=25900 [M12]=26750 [M13]=28100 [M14]=29290 [M15]=29600)
-LIMIT=30000
+LIMIT=36000
 
 # 首发时各模块的行数估算（顺序即输出顺序）。来自 design.md 2.2，M0 结束时按剩余工作重估了三个模块（见 design.md 2.2
 # 表下的实现注记）：wmfs-api 550 → 900（7.1 约 30 个管理端点的请求/响应结构都还没写）、core/proto 1300 → 900（全部消息
@@ -42,9 +42,11 @@ LIMIT=30000
 # shared-key 150 → 80，都已写完）、dashboard 920 → 880（ApiClient 160 → 120，已写完）。
 # M1 审查修复后又重估了两个（design.md 2.2 的 M1 注记）：core/net 1000 → 1120（修复后约 1,060，余下约 60）、
 # examples/plugin-mem-transport 180 → 195（已写完：加了帧上限与收帧计时）。
+# M2：rdma 实际约 1,490 行（估算 920），plugins 4810 → 5380。人类于 2026-10-21 把上限从 30,000 放宽到 36,000、功能不砍，
+# 所以不动用"简化储备"（design.md 2.2 的 M2 注记）。
 MODULES="wmfs-api:900 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1120 core/hooks:1060
 core/meta/raft:1570 core/meta/engine:720 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
-core/data:3000 core/client:1800 core/bg:850 core/mgmt:790 core:540 plugins:4810 cli:2950 dashboard:880
+core/data:3000 core/client:1800 core/bg:850 core/mgmt:790 core:540 plugins:5380 cli:2950 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

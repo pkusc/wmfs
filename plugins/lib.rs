@@ -10,3 +10,7 @@ pub mod tcp;
 #[cfg(feature = "shared-key")]
 #[path = "shared-key/mod.rs"]
 pub mod shared_key;
+
+#[cfg(feature = "rdma")]
+#[path = "rdma/mod.rs"]
+pub mod rdma;
