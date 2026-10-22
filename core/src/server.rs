@@ -1,12 +1,14 @@
 //! 节点运行时装配（design.md 1.1、1.2）：`wmfs server --data-dir D` 与 `wmfs init`（不带 --no-start）调用 [`start`]。
 //!
-//! M1 的服务端 = 内存池 + 各传输插件监听 + RPC 服务端（握手、Ping）+ 管理 API。元数据（M3）、数据（M5）等服务随里程碑加入。
+//! M3 的服务端 = 内存池 + 元数据引擎（raft 线程 + 执行器 + 8 个 meta-read 线程，`meta/meta.redb`）+ 各传输插件监听 +
+//! RPC 服务端（握手、Ping、MetaCall）+ 管理 API。认证用的 key 表读已应用的 KEYMETA（3.3.2）。数据服务（M5）等随里程碑加入。
 //! 信号（design.md 0.2 第 4 条）：main 在**创建任何线程之前** `sys::block_signals(&[SIGTERM, SIGINT])`，
 //! 调用 `start` 之后 `sys::wait_signals(..)`，收到后 [`Running::stop`] 再退出。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use raft::StateRole;
 use wmfs_api::hex::hex;
 use wmfs_api::types::{Health, NodeAddrs};
 
@@ -15,9 +17,14 @@ use crate::base::{log, sys};
 use crate::buf::MemPool;
 use crate::hooks::pipeline::Pipeline;
 use crate::hooks::registry::PluginSet;
-use crate::init::{InitKeys, NodeFile, read_master};
-use crate::mgmt::{MgmtCtx, MgmtServer};
+use crate::hooks::traits::KeyLookup;
+use crate::init::{NodeFile, read_master};
+use crate::meta::engine::txn::{MetaEngine, RoleInfo};
+use crate::meta::engine::{self, EmbeddedEngine, EngineOpts};
+use crate::meta::service::MetaService;
+use crate::mgmt::{MgmtCtx, MgmtServer, RoleFn};
 use crate::net::server::{RpcServer, ServerId};
+use crate::proto::frame::MSG_META_CALL;
 
 /// 运行中的节点。
 pub struct Running {
@@ -25,6 +32,7 @@ pub struct Running {
     pub addrs: Vec<(String, String)>, // (scheme, rpc 地址)
     pub mgmt_addr: String,
     pub rpc: Arc<RpcServer>,
+    pub meta: Arc<EmbeddedEngine>,
     pid_file: PathBuf,
 }
 
@@ -35,14 +43,29 @@ pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &st
     log::set_file(&log_path).map_err(|e| format!("打开日志 {} 失败：{e}", log_path.display()))?;
     let node = NodeFile::read(data_dir)?;
     let cluster_id = node.cluster_id_bytes()?;
-    let keys = Arc::new(InitKeys::new(read_master(data_dir)?, node.created_ms));
+    let master = read_master(data_dir)?;
     if plugins.authn_plugins().is_empty() {
         return Err("没有启用任何 authn 插件：服务端无法认证连接".into());
     }
+    match plugins.meta_engine_manifest() {
+        Some(m) if m.name == engine::MANIFEST.name => {}
+        Some(m) => return Err(format!("不认识的 meta_engine 插件 {}（首发只有 embedded-kv）", m.name)),
+        None => return Err("没有启用 meta_engine 插件（node.toml 的 [plugins] disable 里有 embedded-kv？）".into()),
+    }
+    let plugin_list = plugins.plugin_list();
     let pool = MemPool::new(&cfg.mem)
         .map_err(|e| format!("内存池创建失败（node.toml [mem]，共 {} MiB）：{e}", cfg.mem.total_bytes() >> 20))?;
     let pipeline = Arc::new(Pipeline::new(plugins));
+    let opts = EngineOpts { node_id: node.node_id, plugins: plugin_list, pipeline: pipeline.clone() };
+    let meta_path = data_dir.join("meta/meta.redb");
+    if !meta_path.exists() {
+        let hint = "这个数据目录是 M3 之前的 wmfs init 建的？开发集群请 wmfs dev down --purge 之后重新 wmfs dev up";
+        return Err(format!("没有元数据库 {}（{hint}）", meta_path.display()));
+    }
+    let meta = EmbeddedEngine::open(&meta_path, opts)?; // 出错时的消息里已经带了元数据库的路径
+    let keys: Arc<dyn KeyLookup + Send + Sync> = Arc::new(meta.keys(master));
     let rpc = RpcServer::new(ServerId { cluster_id, node_id: node.node_id }, pipeline.clone(), keys.clone(), &cfg.net);
+    rpc.add_service(MSG_META_CALL, MetaService::start(meta.clone(), cfg.debug_ops)?);
     let mut addrs = Vec::new();
     for t in pipeline.transports() {
         let (scheme, name) = (t.scheme(), t.manifest().name);
@@ -61,32 +84,82 @@ pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &st
     }
     let mgmt = MgmtServer::bind(&cfg.mgmt.listen)?;
     let mgmt_addr = mgmt.addr().to_string();
+    let me = NodeAddrs { node_id: node.node_id, addrs: addrs.clone(), mgmt_addr: mgmt_addr.clone() };
     let health = Health {
         ok: true,
         version: version.into(),
         cluster_id: hex(&cluster_id),
-        node: NodeAddrs { node_id: node.node_id, addrs: addrs.clone(), mgmt_addr: mgmt_addr.clone() },
+        node: me.clone(),
         meta_role: "none".into(),
         leader: None,
         audit_lag: None,
     };
+    let eng = meta.clone();
+    let role: RoleFn = Arc::new(move || meta_role(&eng, &me));
     // pid 文件在管理 API 开始应答之前写好：health 一通，`wmfs dev status/down` 就一定找得到这个进程
     let pid_file = data_dir.join("run/server.pid");
     sys::atomic_write(&pid_file, format!("{}\n", std::process::id()).as_bytes())
         .map_err(|e| format!("写 {} 失败：{e}", pid_file.display()))?;
-    if let Err(e) = mgmt.start(Arc::new(MgmtCtx { health, keys, failpoints_api: cfg.failpoints_api })) {
+    let ctx = MgmtCtx { health, role: Some(role), keys, failpoints_api: cfg.failpoints_api };
+    if let Err(e) = mgmt.start(Arc::new(ctx)) {
         let _ = std::fs::remove_file(&pid_file);
         return Err(format!("管理 API 启动失败：{e}"));
     }
     let rpc_list: Vec<String> = addrs.iter().map(|(s, a)| format!("{s} {a}")).collect();
     log::info("server", format_args!("node{} started（rpc {}，http {mgmt_addr}）", node.node_id, rpc_list.join("，")));
-    Ok(Running { node_id: node.node_id, addrs, mgmt_addr, rpc, pid_file })
+    Ok(Running { node_id: node.node_id, addrs, mgmt_addr, rpc, meta, pid_file })
+}
+
+/// health 里的元数据角色与 leader 的地址（实现注记（M3），7.1）。leader 的地址：是自己就用本节点的实际地址，
+/// 否则取已应用的 NodeRecV1。
+fn meta_role(eng: &EmbeddedEngine, me: &NodeAddrs) -> (String, Option<NodeAddrs>) {
+    let r = eng.role();
+    let learner = r.role == StateRole::Follower && eng.status().learners.contains(&me.node_id);
+    let leader = match r.leader_id {
+        0 => None,
+        id if id == me.node_id => Some(me.clone()),
+        id => eng.node_addrs(id),
+    };
+    (role_name(&r, learner).to_string(), leader)
+}
+
+/// `meta_role` 的取值：`leader` = **就绪**的 leader（可以服务请求，`wmfs dev wait leader` 等的就是它）；`candidate` =
+/// 正在选举，或已当选但还没就绪；`follower` / `learner`。
+fn role_name(r: &RoleInfo, learner: bool) -> &'static str {
+    match r.role {
+        StateRole::Leader if r.ready => "leader",
+        StateRole::Leader | StateRole::Candidate | StateRole::PreCandidate => "candidate",
+        StateRole::Follower if learner => "learner",
+        StateRole::Follower => "follower",
+    }
 }
 
 impl Running {
-    /// 收到 SIGTERM/SIGINT 之后：删掉 pid 文件（M1 没有别的需要收尾的状态；M3 起先 transfer_leader）。
+    /// 收到 SIGTERM/SIGINT 之后：停元数据引擎（补一次 Immediate 提交，已应用的写全部落盘）、删掉 pid 文件。
+    /// 实现注记（M3）：多节点时先 transfer_leader 给 matched 最大的 voter（最多等 3 s，3.4.1.9）在 M8。
     pub fn stop(&self) {
+        self.meta.shutdown();
         let _ = std::fs::remove_file(&self.pid_file);
         log::info("server", format_args!("node{} 退出", self.node_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_role_names_follow_7_1() {
+        let r = |role, ready| RoleInfo { role, term: 2, leader_id: 1, ready };
+        assert_eq!(role_name(&r(StateRole::Leader, true), false), "leader");
+        assert_eq!(
+            role_name(&r(StateRole::Leader, false), false),
+            "candidate",
+            "已当选、还没就绪的 leader 不算 leader"
+        );
+        assert_eq!(role_name(&r(StateRole::Candidate, false), false), "candidate");
+        assert_eq!(role_name(&r(StateRole::PreCandidate, false), false), "candidate");
+        assert_eq!(role_name(&r(StateRole::Follower, false), false), "follower");
+        assert_eq!(role_name(&r(StateRole::Follower, false), true), "learner");
     }
 }

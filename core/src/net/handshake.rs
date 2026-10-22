@@ -18,13 +18,14 @@ use crate::base::types::Role;
 use crate::base::{ErrCode, rand};
 use crate::hooks::pipeline::Pipeline;
 use crate::hooks::traits::{AuthnInput, Conn, ConnIdentity, KeyLookup};
-use crate::init::SERVER_KEY;
 use crate::net::conn::{ConnHandle, recv_checked};
 use crate::proto::frame::{
     ErrorBody, FLAG_ERROR, FrameHeader, FrameKind, InFrame, MSG_AUTH, MSG_CHALLENGE, MSG_HELLO, MSG_WELCOME, OutFrame,
     PROTO_MAJOR,
 };
-use crate::proto::handshake::{Auth, Challenge, Hello, ProofInput, Welcome, auth_proof, verify_server_proof};
+use crate::proto::handshake::{
+    Auth, Challenge, Hello, ProofInput, SERVER_KEY, Welcome, auth_proof, verify_server_proof,
+};
 use crate::proto::{decode_body, encode_body};
 
 /// 本端支持的协议 feature 位（3.3.2；随功能实现逐个加入：M1 还一个都没有）。

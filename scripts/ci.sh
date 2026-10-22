@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CI（design.md 9.7 末尾）：格式 → 编码约定 → clippy（警告即错误）→ 单元测试与金样 → raft 模拟 → 行数对账 → profile 测试。
-# 还没有的步骤（raft 模拟 M3 起、profile M6 起）先打印 SKIP，到了对应里程碑再接上。
+# 还没有的步骤（profile M6 起）先打印 SKIP，到了对应里程碑再接上（raft 模拟从 M3 起跑单节点部分）。
 # 用法：scripts/ci.sh          全部步骤；任何一步失败立即停止并返回非 0。
 #       scripts/ci.sh rules    只做编码约定的机械检查（scripts/accept.sh M0 也调用它）。
 set -euo pipefail
@@ -106,7 +106,8 @@ step "4/7 单元测试、fail point 用例与金样：cargo test"
 cargo test --release --workspace
 
 step "5/7 确定性 raft 模拟（1000 个种子，内存后端）"
-echo "SKIP（原因：M3 起才有 raft，见 design.md 9.2）"
+# M3：单节点部分（design.md 9.2）；普通 cargo test 只跑 200 个种子，这里按"每次提交 1000 个"跑。多节点部分在 M8 加入
+WMFS_SIM_SEEDS=1000 cargo test --release -p wmfs-testkit --test raft_sim
 
 step "6/7 行数对账：scripts/loc.sh"
 scripts/loc.sh

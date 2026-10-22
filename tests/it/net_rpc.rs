@@ -1,13 +1,13 @@
 //! RPC 组件测试（传输一致性）：同一套用例跑 tcp（127.0.0.1:0）、mem 与 rdma 三种传输。
 //! 覆盖 roadmap M1 的验收标准：ping 1000 次、4 MiB bulk 往返 200 次 CRC 全对（另有一次 bulk 里夹着长度为 0 的段）、
 //! 错误密钥被拒、client key 申请 server 角色被拒、角色权限表，以及 RpcClient 的 start / call_cb / stream / 超时、
-//! Responder 被丢弃时回 EIO、池满回 BUSY。
+//! Responder 被丢弃时回 EIO、池满回 BUSY；以及 M3 的单飞建连（ADR-0031 第 11 条：16 个线程同时第一次调用只建 1 条连接）。
 //! rdma 的那一份需要 RDMA 设备（本机按决定不做实机测试）：`#[ignore = "需要 RDMA 设备"]`，scripts/accept.sh M2 里显示 SKIP；
 //! 有设备时 `cargo test -p wmfs-testkit --test net_rpc -- --ignored` 真跑（流不走 rdma，3.3.3，那一项只在 tcp/mem 上跑）。
 //! 发出的 bulk 与 recv_into 一律从客户端自己的池里取（rdma 只注册了它，harness 的 `client_pool`）。
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use wmfs_core::api::metrics;
@@ -283,4 +283,33 @@ fn version_feature_role_and_cluster_negotiation() {
     let mut raw = TcpStream::connect(&s.addr).unwrap();
     raw_send(&mut raw, FrameKind::Request, MSG_PING, 1, &encode_body(&PingBody { payload: vec![] })).unwrap();
     assert_eq!(raw_recv(&mut raw).err(), Some(ErrCode::ECONNRESET));
+}
+
+/// ADR-0031 第 11 条（M3 的 core 修复）：16 个线程同时对同一对端做第一次 call，只有一个线程建连、其余等它——
+/// 服务端只看到 1 条连接（tcp 与 mem 各一次），16 个调用全部成功；建连失败时（握手被拒）16 个调用拿到同一个错误，
+/// 服务端也只看到 1 次连接尝试。客户端的每次建连先等 250 ms：16 个线程一定都在建连进行中到达（否则调度晚到的线程
+/// 在失败的建连结束之后会合法地再建一次，结果取决于时机）。
+#[test]
+fn first_calls_from_16_threads_share_one_connection() {
+    for scheme in ["tcp", "mem"] {
+        for (k, want) in [(key(2), Ok(())), (KeyFile { key_id: 2, secret: [0; 32] }, Err(ErrCode::AUTH_FAILED))] {
+            let (s, accepted) = counting(scheme, &format!("rpc-single-flight-{}", want.is_ok()));
+            let c = slow_client(scheme, k, Role::Client, Duration::from_millis(250));
+            let go = Arc::new(Barrier::new(16));
+            let threads: Vec<_> = (0..16u8)
+                .map(|i| {
+                    let (c, ep, go) = (c.clone(), s.ep.clone(), go.clone());
+                    std::thread::spawn(move || {
+                        go.wait();
+                        c.call(&ep, Family::Control, frame(MSG_PING, &[i]), T).and_then(check_reply).map(|_| ())
+                    })
+                })
+                .collect();
+            for t in threads {
+                assert_eq!(t.join().unwrap(), want, "{scheme}：16 个调用的结果都一样");
+            }
+            let n = accepted.load(Ordering::SeqCst);
+            assert_eq!(n, 1, "{scheme}（{want:?}）：16 个线程同时第一次调用，服务端只看到 1 条连接");
+        }
+    }
 }

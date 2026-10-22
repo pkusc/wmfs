@@ -36,7 +36,12 @@ pub fn init(a: InitArgs) -> i32 {
         mgmt_port: a.mgmt_port,
         mem: PoolConfig::server(),
         failpoints_api: false,
+        debug_ops: false,
         host_id: None,
+        plugins: match registry::init_plugin_list() {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        },
     };
     if let Err(e) = init_node(&o) {
         return fail(e);

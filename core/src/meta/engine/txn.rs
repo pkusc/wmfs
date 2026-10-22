@@ -4,7 +4,7 @@
 //! 持久性 = raft 多数派 fsync。authz、quota_admission、placement 三个钩子都在闭包**内部**、对着同一个视图调用，
 //! 判定与修改之间没有 TOCTOU 窗口。执行器闭包里只允许按已知 key 点查（没有 scan），不得做网络 IO、不得睡眠。
 //!
-//! 接口骨架（M0）：签名以这里为准，实现在 M3。
+//! 接口骨架（M0）：签名以这里为准；实现（M3）在同目录的 engine.rs、executor.rs、view.rs、read_gate.rs、dedup.rs。
 
 use crate::base::ErrCode;
 use crate::base::types::ReqCtx;
@@ -46,10 +46,14 @@ pub trait MetaEngine: Send + Sync {
     fn status(&self) -> EngineStatus;
 }
 
-/// 内部调用者用：bounded(1) 包一层
-#[allow(unused_variables)] // 骨架：函数体在 M3 实现，实现后删除这一行
+/// 内部调用者用：bounded(1) 包一层（阻塞到批次有了确定结果）。
 pub fn txn_blocking(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp) -> Result<MetaReply, ErrCode> {
-    unimplemented!("M3：txn_blocking")
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let done = Box::new(move |r| {
+        let _ = tx.try_send(r);
+    });
+    eng.txn(TxnRequest { ctx, op, done, exclusive: false });
+    rx.recv().unwrap_or(Err(ErrCode::NOT_LEADER))
 }
 
 /// 闭包能用到的一切。插件拿不到 redb 本身。

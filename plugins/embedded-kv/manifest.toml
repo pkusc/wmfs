@@ -1,0 +1,14 @@
+# embedded-kv 元数据引擎的 manifest（design.md 3.7.1、4.10）：与 core/src/meta/engine/engine.rs 里的 MANIFEST 逐字段相等
+# （core 的单元测试检查）。代码在 core（元数据 Raft 是契约层），这个目录只放 manifest 与文档（design.md 2.1）。
+name = "embedded-kv"
+version = "0.1.0"
+hooks = ["meta_engine"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = []
+budget_ns = 0
+fail_points = ["plugin.embedded-kv.meta_engine"]
+
+[config_schema]
+# 没有部署参数：数据库固定在 <data_dir>/meta/meta.redb；raft 参数（选举超时、批次上限……）是契约的一部分（3.4.1.1），不进配置

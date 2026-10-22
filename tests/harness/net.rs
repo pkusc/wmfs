@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use plugin_mem_transport::MemTransport;
@@ -16,10 +17,11 @@ use wmfs_core::api::types::KeyFile;
 use wmfs_core::base::ErrCode;
 use wmfs_core::base::config::{NetConfig, PluginTable};
 use wmfs_core::base::types::Role;
-use wmfs_core::buf::{Buf, FrozenBuf, Lane, MemPool, PoolConfig};
+use wmfs_core::buf::{Buf, FrozenBuf, Lane, MemPool, PoolConfig, RegionInfo};
+use wmfs_core::hooks::manifest::Manifest;
 use wmfs_core::hooks::pipeline::Pipeline;
 use wmfs_core::hooks::registry::PluginSet;
-use wmfs_core::hooks::traits::Transport;
+use wmfs_core::hooks::traits::{Conn, Transport};
 use wmfs_core::init::InitKeys;
 use wmfs_core::net::client::{Endpoint, RpcClient};
 use wmfs_core::net::server::{RpcServer, ServerId};
@@ -97,6 +99,61 @@ pub fn rdma() -> Option<TestServer> {
     let cfg: PluginTable = format!("listen = \"{ip}:0\"\nmax_qps = {RDMA_MAX_QPS}").parse().unwrap();
     let net = NetConfig::default();
     Some(start(Arc::new(RdmaTransport::new(&cfg, net.write_timeout_ms).unwrap()), &net, rdma_pool()))
+}
+
+/// 包一层的传输（单飞建连的测试用）：服务端一侧数一数 accept 了几条连接；客户端一侧每次建连先等 `connect_delay`。
+pub struct Counting {
+    inner: Arc<dyn Transport>,
+    accepted: Arc<AtomicUsize>,
+    connect_delay: Duration,
+}
+
+impl Transport for Counting {
+    fn manifest(&self) -> &'static Manifest {
+        self.inner.manifest()
+    }
+    fn scheme(&self) -> &'static str {
+        self.inner.scheme()
+    }
+    fn register_region(&self, r: &RegionInfo) -> Result<(), ErrCode> {
+        self.inner.register_region(r)
+    }
+    fn listen(
+        &self,
+        pool: MemPool,
+        on_conn: Arc<dyn Fn(Box<dyn Conn>) + Send + Sync>,
+    ) -> Result<Option<String>, ErrCode> {
+        let n = self.accepted.clone();
+        self.inner.listen(
+            pool,
+            Arc::new(move |c| {
+                n.fetch_add(1, Ordering::SeqCst);
+                on_conn(c)
+            }),
+        )
+    }
+    fn connect(&self, addr: &str, pool: MemPool, timeout: Duration) -> Result<Box<dyn Conn>, ErrCode> {
+        std::thread::sleep(self.connect_delay);
+        self.inner.connect(addr, pool, timeout)
+    }
+}
+
+/// 同 [`tcp`] / [`mem`]，另交出服务端 accept 的连接数。
+pub fn counting(scheme: &str, name: &str) -> (TestServer, Arc<AtomicUsize>) {
+    let inner: Arc<dyn Transport> = match scheme {
+        "tcp" => Arc::new(TcpTransport::new(&"listen = \"127.0.0.1:0\"".parse().unwrap(), 5000).unwrap()),
+        _ => Arc::new(MemTransport::listening(name)),
+    };
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let t = Arc::new(Counting { inner, accepted: accepted.clone(), connect_delay: Duration::ZERO });
+    (start(t, &NetConfig::default(), pool()), accepted)
+}
+
+/// 同 [`client`]，但每次建连先等 `delay`：同时发起第一次调用的线程一定都在建连进行中到达（单飞建连的测试用）。
+pub fn slow_client(scheme: &str, key: KeyFile, role: Role, delay: Duration) -> Arc<RpcClient> {
+    let t: Arc<dyn Transport> =
+        Arc::new(Counting { inner: transport(scheme), accepted: Arc::default(), connect_delay: delay });
+    RpcClient::new_with_role(pool(), vec![t], key, role, net(scheme)).unwrap()
 }
 
 fn start(t: Arc<dyn Transport>, net: &NetConfig, pool: MemPool) -> TestServer {

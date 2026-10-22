@@ -39,7 +39,7 @@
 1. 注释用中文，标识符用英文；每个文件 ≤ 400 行，超过就拆；每个模块文件顶部一段中文"这个模块做什么"。
 2. 除 `#[derive(...)]` 外不写宏（不写 `macro_rules!`、不写过程宏）；可以调用标准库与依赖库已有的宏（`format!`、`vec!`、`include_str!`、`assert!`、`slog::o!`）。构造 raft 的 logger 用 `slog::Logger::root(SlogBridge, slog::o!())`（`slog::OwnedKV` 的字段是 `#[doc(hidden)]`，不是稳定 API）。
 3. 不写复杂泛型：跨模块接口一律用 trait 对象（`Arc<dyn T>` / `Box<dyn T>`），trait 必须对象安全；生命周期参数只出现在短期借用视图上。
-4. `unsafe` 只允许出现在：`core/src/buf/pool.rs`（mmap、切片）、`core/src/base/sys.rs`（libc 封装：`statvfs`、`copy_file_range`、`getrandom`、`fsync` 目录、`send_signal(pid, sig)`（实现注记（M0）：pid ≤ 0 一律 `EINVAL`——`kill(0, ..)`/`kill(-1, ..)` 会作用于整个进程组/全部进程）、`block_signals_and_wait(&[SIGTERM, SIGINT])`（启动时所有线程屏蔽这些信号，由 main 线程 `sigwait`）（实现注记（M0）：拆成 `block_signals(&[..])`（main 在创建任何线程之前调用，之后的线程继承屏蔽）与 `wait_signals(&[..])`（main 最后阻塞等待）两个函数——只在创建线程之后屏蔽的话，信号可能投递到别的线程并按默认动作杀掉进程）、`set_keepalive(&TcpStream)`、`memlock_limit()`）、`core/src/hooks/cabi.rs`（libloading 与 FFI 调用）、`plugins/rdma/`（sideway 的 `reg_mr` 等 unsafe 接口）。每处写 `// SAFETY:` 中文说明。其他 crate（cli、plugins/tcp、testkit）只调用 `sys.rs` 的安全封装；**不引入任何信号处理 crate**（ctrlc、signal-hook 等）。
+4. `unsafe` 只允许出现在：`core/src/buf/pool.rs`（mmap、切片）、`core/src/base/sys.rs`（libc 封装：`statvfs`、`copy_file_range`、`getrandom`、`fsync` 目录、`send_signal(pid, sig)`（实现注记（M0）：pid ≤ 0 一律 `EINVAL`——`kill(0, ..)`/`kill(-1, ..)` 会作用于整个进程组/全部进程）、`block_signals_and_wait(&[SIGTERM, SIGINT])`（启动时所有线程屏蔽这些信号，由 main 线程 `sigwait`）（实现注记（M0）：拆成 `block_signals(&[..])`（main 在创建任何线程之前调用，之后的线程继承屏蔽）与 `wait_signals(&[..])`（main 最后阻塞等待）两个函数——只在创建线程之后屏蔽的话，信号可能投递到别的线程并按默认动作杀掉进程）、`set_keepalive(&TcpStream)`、`memlock_limit()`；实现注记（M3）：另有 `euid_egid()`（`geteuid/getegid`，init 把根目录的属主设为运行它的用户，3.4.3））、`core/src/hooks/cabi.rs`（libloading 与 FFI 调用）、`plugins/rdma/`（sideway 的 `reg_mr` 等 unsafe 接口）。每处写 `// SAFETY:` 中文说明。其他 crate（cli、plugins/tcp、testkit）只调用 `sys.rs` 的安全封装；**不引入任何信号处理 crate**（ctrlc、signal-hook 等）。
 5. 错误统一用 `ErrCode`（3.3.7）；网络与磁盘结果不得 `unwrap()`；`panic!` 只用于"不可能发生"的不变量破坏，并在消息里写清楚是哪条不变量。**例外（fail-stop）**：raft 线程与执行器线程上的 redb 错误（`begin_write/commit/读表` 失败）一律"写一条错误日志 + `std::process::abort()`"——状态机写一半时继续运行比崩溃更危险；重启后由 raft 日志恢复。伪代码里的 `or_abort(...)` 就是这个意思。（实现注记（M0）：解析和校验**用户输入**的函数——尺寸与时长、node.toml、key 文件、fail point 配置，M7 起的属性值——返回 `Result<T, String>`，内容是给人看的中文原因，因为 `ErrCode` 说不清"哪个键写错了"，而且 wmfs-api 用不了 core 的 `ErrCode`；系统、磁盘、网络与协议错误一律用 `ErrCode`；经 RPC 或管理 API 返回时由调用方映射成 `EINVAL` + message。）（实现注记（M1）：只被 CLI 调用、错误直接打印给人看的启动装配与 init 函数——`server::start`、`init_node`、`read_master`、`NodeFile::read`、`MgmtServer::bind`——也返回 `Result<T, String>`，其中的系统、磁盘、网络错误一律在消息里带上文件路径或地址；它们的调用方只是把消息打印出来。）
 6. 所有时间来自 `core::base::clock`：`mono_ms()`（单调，租约与超时）与 `wall_ms()`（墙钟，mtime 与 cap 过期）；fail point 可以注入偏移与速率（3.11）。（实现注记（M1）：例外是 wmfs-mgr——它不依赖 core，`ApiClient` 的签名时间戳用标准库的 `SystemTime`，所以 `clock.wall.skew_ms` 对 CLI 与 mgr 的签名时间不起作用；其他代码一律用 `core::base::clock`。）
 7. 所有随机数来自 `core::base::rand::fill(&mut [u8])`（`libc::getrandom`）；不引入 rand crate。（实现注记（M0）：wmfs-api 不依赖 core，所以 fail point 的 `pct()` 用标准库 `RandomState` 播种的每线程 xorshift，只决定"这次触发不触发"，不用于任何安全用途；其他代码一律用 `core::base::rand`。）
@@ -278,6 +278,7 @@ wmfs/
 > 实现注记（M1）：M1 结束时非测试代码约 7,000 行（M1 新增约 2,950 行，预算 2,540，超出约 16%：主要是 core/net——服务端、客户端、连接包装、握手、重试一次写完——与 cli 的 `dev`/`ping`/`failpoint`）。按 roadmap §0 第 7 条重估了四个模块：**core/net 800 → 1,000**（已写完约 900，余下 leader_hint、OneWay 服务、call_cb 后台建连）；**examples/plugin-mem-transport 150 → 180**（已写完）；**plugins 4,980 → 4,810**（tcp 300 → 200、shared-key 150 → 80，都已写完）；**dashboard 920 → 880**（ApiClient 160 → 120，已写完）。重估后 Σ max(当前, 估算) ≈ 29,670（上限 30,000）。`scripts/loc.sh` 用重估后的数字。
 > 实现注记（M1，审查修复后）：修 M1 审查发现（超限帧只让一个请求失败、握手前不发保活、流被丢弃回 EIO、回复缺 bulk 按 BUSY、本地失败交给 rpc-timer、热路径指标句柄、计数器预注册等）后非测试代码约 7,310 行，又重估两个模块：**core/net 1,000 → 1,120**（已写约 1,060，余下 leader_hint、OneWay 服务、call_cb 后台建连约 60）；**examples/plugin-mem-transport 180 → 195**（已写完：加了帧上限与收帧计时）。重估后 Σ max ≈ 29,800（上限 30,000）。
 > 实现注记（M2）：rdma 插件实际约 1,520 行非测试代码（估算 920，超出约 600）：审查要求补上的推迟打开设备与注册、按本端 IPv4 自动选设备与 GID（gid.rs）、按帧计的信用控制、建连线程与 5 s 超时、设备能力核对、"QP 销毁之后缓冲才回池"的拆除顺序、两侧分开的访问位都在里面；M2 审查修复又把 QP 状态迁移的属性拆成可单测的纯函数（qp_attr.rs）、把设备部分从 verbs.rs 拆到 device.rs、日志带上 errno、链路 DOWN 与"没有设备"分开报（约 +30 行）。另有 cli 约 90 行（doctor 的 RDMA 一项、声明式的 `dev up --rdma`）。`scripts/loc.sh` 里 plugins 的估算 4,810 → 5,380，首发总量约 30,380。人类于 2026-10-21 把上限从 30,000 放宽到约 36,000、功能不砍，所以不动用"简化储备"。
+> 实现注记（M3）：M3 新增约 2,150 行非测试代码（含审查修复，预算 2,300）：core/meta/raft 约 850（storage.rs、driver.rs 与它的子模块 driver/apply.rs、types.rs——driver.rs 超过 400 行，把 raft 线程的输入输出类型与 raft 参数拆进 types.rs、把"应用与发布"拆进 driver/apply.rs；peers.rs、snapshot.rs、membership.rs 在 M8）、core/meta/engine 约 600（另有 M0 的 txn.rs）、core/meta 的 service.rs 与 sessions.rs 约 135、core 的 init（含 `init/initial_kv.rs`）与 server 约 190、core/net 的单飞建连约 65（含审查后补的"拿着登记表的锁再查一次连接表"与建连线程 panic 时的收尾）、cli 约 310（`debug kv`、`dev wait`）、hooks 与 mgmt 约 20。按 roadmap §0 第 7 条重估两个模块：**core/net 1,120 → 1,180**（余下 leader_hint、OneWay 服务、call_cb 后台建连约 60）、**core/meta/engine 720 → 760**（余下 M4 的 changelog 接入、M8 的 leader 提示）。重估后 Σ max(当前, 估算) ≈ 30,475（上限 36,000）。`scripts/loc.sh` 把 `core/src/init/` 记在"core"名下（以前这类子目录会被漏数）。
 
 体量控制：每个里程碑结束时 `scripts/loc.sh` 与 roadmap 的预算表对账，并**按模块重新估算剩余工作**（core/data、cli/fuse、core/client 最容易超）。上限原为 30k，人类于 2026-10-21 放宽到约 36k（功能不砍，30k 只当提醒线）；预计总量超过 36k 时停下来与人类商量（可从 roadmap"简化储备"里选），不悄悄扩大范围。
 
@@ -903,6 +904,8 @@ pub struct LockOut { pub start: u64, pub end: u64, pub write: bool, pub pid: u32
 
 "R*"：会话心跳走只读路径（必须先过 ReadIndex，确认自己仍是 leader 才续租），并更新 leader 内存里的 `last_seen` 与打开文件集合（3.5.6）。
 
+实现注记（M3）：服务端在 `core/src/meta/service.rs`。`DebugPut`/`DebugGet`：不是 admin key、或 node.toml 没有 `debug_ops = true`（`wmfs dev` 打开，`wmfs init` 默认关闭）→ `EACCES`；其余 MetaOp 在实现它们的里程碑之前回 `FEATURE_UNSUPPORTED`（不断开）。修改型请求交给执行器（`MetaEngine::txn`，投递后立即返回，队列满回 `BUSY`），只读请求交给 8 个 `meta-read` 线程（队列 1024，满了回 `BUSY`）。指标 `wmfs_meta_ops_total{op,code}`。M3 还没有会话（M4），`wmfs debug kv` 用 seq = 0，不进去重表。
+
 #### 3.3.5 客户端 ↔ 数据：`DataOp` 与能力令牌
 
 > 实现注记（M0）：本节类型自 M0 起以 `core/src/proto/data.rs` 与 `core/src/proto/cap.rs` 为唯一真源；下面的代码块仅供阅读，若不一致以源码为准。
@@ -1066,6 +1069,8 @@ let node = raft::RawNode::new(&cfg, storage, &logger)?;
 
 ##### 3.4.1.2 `raft::Storage` 的 redb 实现
 
+> 实现注记（M3）：`RedbStorage` 在 `core/src/meta/raft/storage.rs`（init 的初始状态由同一文件的 `bootstrap` 写）。最近条目的缓存另有 64 MiB 的字节上限（单条最大约 1.2 MiB，只按 4096 条算可能占到 GB 级内存）；`snapshot()` 在 M8 之前回 `SnapshotTemporarilyUnavailable`（单节点没有需要快照的对端；`install_snapshot` 与 pins 也在 M8）；写方法里的 redb 错误先写一行带原因的日志再回 `EIO`，由 driver `or_abort`；读方法（缓存没命中时读盘）上的 redb 错误直接 fail-stop。合约测试在 `storage/tests.rs`（照 raft-rs `MemStorage` 的测试改写，跑在 redb 的内存后端上）。
+
 ```rust
 pub struct RedbStorage {
     db: Arc<redb::Database>,
@@ -1221,6 +1226,8 @@ fn apply_entries(&mut self, node: &mut RawNode<RedbStorage>, tx: &redb::WriteTra
 
 `after_apply` 还负责：若本批写入了 `0x0E` 前缀（changelog），唤醒长轮询等待者（`Condvar`，携带最大 seq）；若写入了影响集群图的键，标记集群图缓存失效。
 
+> 实现注记（M3）：`Driver` 在 `core/src/meta/raft/driver.rs`（应用与发布在子模块 `driver/apply.rs`；`RaftInput`、`ProposeOutcome`、`Published`、`DriverOpts`、`config` 在 `types.rs`，driver 原样转出；伪代码 raft_loop 里"输入之后的 pump + on_ready + publish_role"是 `Driver::process_ready`）。与上面伪代码的差别，都是等价或更保守的写法：① 第一个写事务只在有东西要写时才开（已提交条目、新条目、硬状态任一非空）——空事务等于没写，于是只有 read state 或消息的 Ready 不产生提交，也不会因此每秒多一次补 Immediate；② 时间一律按 tick 计（1 tick = 100 ms：读闸门的 500 ms / 2 s、规则 M2 的"每 1 s"），确定性模拟不依赖真实时间；③ 要发给对端的消息攒进 outbox，M3 没有对端，驱动循环把它们计入 `wmfs_raft_msg_dropped_total`（M8 的 raft-send 线程从 outbox 取）；④ Ready 里出现快照 = 不变量破坏（M8 之前不可能），panic；⑤ raft 线程与执行器线程上的任何 panic（不变量破坏）都写日志（含 panic 的原因）并 abort（`engine.rs` 的 `fail_stop_thread`）：不能让 raft 线程悄悄死掉、节点却还在应答；⑥ 插件清单与已提交的 GLOBAL `plugins` 不一致时只"不就绪"并写一条列出差异的错误日志，M8 起再按 3.7.2 退出（退出码 3）；⑦ 收到 Shutdown（SIGTERM）时补一次 Immediate 提交、在途提议判 Lost 再退出，transfer_leader 在 M8。fail point：`raft.persist.before_commit`、`raft.persist.after_commit`（第一个写事务提交前 / 后）、`raft.apply.before`（应用已提交条目前）。
+
 ##### 3.4.1.4 串行执行器：单飞批次 + 写集复制
 
 一个批次在 raft 里提交的几毫秒内（本机实测 redb Immediate 提交约 2.6 ms），新到的请求排队，下一批一次带走——负载越高批越大，吞吐靠自然攒批。**同一时刻 raft 里最多只有一个批次在途**，所以构建下一批时上一批已经应用，执行器直接读"已提交状态"，覆盖层只活一个批次，失去 leader 时没有跨批状态要清理。
@@ -1296,6 +1303,8 @@ fn run_one(view: &mut BatchView, env: &OpEnv, ctx: &ReqCtx, op: TxnOp) -> Result
 5. 改变集群拓扑的内部操作（链、target、节点、存储类）`exclusive = true`：**它必须是本批的最后一个操作**，之后的请求进下一批（代码里就是"执行完它就结束本批"）。create 或截断到 0 时若 `gen_chains` 生成了新链（`view.topology_changed()`），也在执行完后结束本批。原因：placement 读的是批次开始时的集群图快照（`OpCtx.map`），这条规则保证同一批次里没有人在拓扑变了之后还按旧快照做决定。
 6. 内部操作（cluster-mgr、后台任务）`seq = 0`，不进去重表；它们都写成带前提条件的 CAS（"链版本仍是 v 才改""change_id 与 epoch 都没变才切换 layout"），重复执行无害，失败就在下一轮重新评估。
 
+> 实现注记（M3）：执行器在 `core/src/meta/engine/executor.rs`（边取边执行是 `fill`，单个请求是 `run_one`，批次结局到回复的映射是 `settle`），覆盖层在 `view.rs`，去重在 `dedup.rs`，`sessions::is_active` 在 `core/src/meta/sessions.rs`（M4 再加会话的其余部分）。`view.topology_changed()` = 本批写过 CHAIN 键（0x12）：gen_chains 生成新链一定写 CHAIN 记录，覆盖层据此判断，命名空间代码不用另外打标记。执行器的输入队列 1024 个请求，满了回 `BUSY`；fail point `meta.exec.before_propose` 配 `return(码)` 时本批每个请求都得到这个码（批次没有提议、一个 op 也没有应用）；`changelog::record` 在 M4 接入（M3 的 DebugPut 按 ADR-0029 本来就不写 changelog）。批次指标：`wmfs_meta_batch_ops`、`wmfs_meta_batch_bytes`、`wmfs_meta_commit_seconds`（提议到应用）。
+
 ##### 3.4.1.5 `state_version` 与 `expect_version`
 
 `state_version` = 最近一个**改变了 KV 的**批次条目的 raft index（存在 `raft_state["applied"]`，与 KV 同事务更新；空条目与 conf change 不改变它；快照安装时取快照里的值）。执行器在构建批次的读事务里读到 `base_version`，写进 `WriteBatch.expect_version`；**每个副本** apply 时比较：相等才应用并令 `state_version = entry.index`；不等则整批跳过（所有副本看到同样的日志、做同样的判断，所以是确定性的）。
@@ -1325,6 +1334,8 @@ struct Waiter { done: Sender<Result<(), ErrCode>>, arrived: Instant }
 5. follower 不服务读，回 `NOT_LEADER{hint}`（首发不做 follower read）。
 6. 单节点集群：raft-rs 对单成员组立即产生 ReadState，无额外开销（已在 spike 验证）。
 
+> 实现注记（M3）：读闸门在 `core/src/meta/engine/read_gate.rs`，由 raft 线程的 Driver 持有；500 ms / 2 s 按 5 / 20 个 tick 计。`MetaEngine::read` 等 ReadIndex 最多 3 s（超时 `RETRY`），放行后开 redb 读事务回调（`view.rs` 的 `ReadView`：点查 + 有上限的范围扫描；meta-read 线程上的 redb 读错误回 `EIO`，不 abort）。指标 `wmfs_meta_read_gate_seconds`。
+
 ##### 3.4.1.7 快照：导出、带外传输、安装
 
 - **导出**（leader，开销很小，可在 raft 线程上做）：`Storage::snapshot(request_index, to)`：若已有 pin 满足 `pin.index ≥ request_index` 且 `pin.index ≥ snap_index`（未被日志压缩越过），复用；否则开一个 redb 读事务（MVCC，不阻塞写），读出 `applied(index, term, state_version)` 与 `conf_state`（它们与 KV 同事务更新，所以与读事务里的 KV 一致），新建 `Arc<PinnedSnap { index, term, state_version, txn: ReadTransaction, created }>` 放进 `pins`（最多保留 2 个，10 min 过期；`ReadTransaction` 是 `Send + Sync`，已编译验证；`pins` 是 `Arc<Mutex<…>>`，snap-serve 线程持有同一个 Arc，按 index 取出对应的 pin 只读遍历）。返回 `Snapshot { metadata: {index, term, conf_state}, data: postcard(SnapDesc { index, term, source_node }) }`——**快照内容不进 raft 消息**。
@@ -1339,6 +1350,7 @@ struct Waiter { done: Sender<Result<(), ErrCode>>, arrived: Instant }
 ##### 3.4.1.9 成员变更
 
 - **init**：`wmfs init` 直接写一个"index = 1、term = 1、voters = [1]"的初始状态：`snap_meta = (1, 1)`、`hard_state = {term: 1, vote: 0, commit: 1}`、`conf_state = {voters: [1]}`、`applied = (1, 1, state_version = 1)`、初始 KV（3.4.3）——与 raft-rs `five_mem_node` 示例一致：之后加入的节点一律先通过快照追上，保证所有节点初始状态相同。启动时若 `voters == [自己]`，调用一次 `node.campaign()` 尽快成为 leader。
+  实现注记（M3）：启动时 campaign 的条件就是 `voters == [自己]`（learner 不影响：它们不投票）；空 ConfState 或多个 voter 时不自己 campaign（坑 P14 的回归用例）。
 - **join**：新节点以**空存储、空 ConfState** 启动 `RawNode`（不可提升、不会自己 campaign，坑 P14），用 `Joined` 回复里的集群图找到 leader 与其他成员的地址。leader 先在一个批次里写 `NodeRecV1`，再由 cluster-mgr 提议 `ConfChangeV2 { AddLearnerNode(id) }`。leader 发现 learner 缺少已压缩的日志 → 发快照。
 - **提升**：cluster-mgr 每秒读 raft 线程发布的 `RaftStatus` 检查：`voters < 3` 且 `voters + 已追上的 learner ≥ 3`（追上 = 该 learner 的 `matched + 1000 ≥ commit`；raft 线程发布时取自 `node.raft.prs().get(id).matched`）→ 提议**一个包含多个 `AddNode` 的 ConfChangeV2**（raft-rs 对多变更自动进入 joint consensus），1 voter 一步变 3 voter，不经过"2 voter、任一宕机即不可用"的中间态。2 节点集群保持 1 voter + 1 learner，`wmfs status` 警告"元数据没有高可用"。
 - **leave-joint**：raft-rs 在 leader 应用 joint 配置时自动追加空的 `ConfChangeV2` 退出 joint（`Raft::commit_apply`），**我们不在 Ready 处理中途再提议**。兜底（坑 P13，源码 TODO 承认"leader 中途下台可能永远不退出"）：cluster-mgr 发现发布的 `conf_state.voters_outgoing`（raft 线程取自 `node.raft.prs().conf().to_conf_state()`）非空超过 5 s 且没有在途 conf change → 经 `RaftInput::ConfChange` 提议空 `ConfChangeV2::default()`（在 raft 线程的输入阶段 propose）。
@@ -1542,6 +1554,7 @@ wmfs join <任一节点 rpc 地址> --cluster-key <cluster.key 文件> --data-di
 `cluster.key` 需要管理员自己复制到新机器（scp）；**不通过网络传输秘密**（首发无 TLS）。`wmfs dev` 在单机上就是同一个文件。
 
 > 实现注记（M1）：M1 的 `wmfs init` 只做第 1、2、4、5 步里"目录、密钥与 node.toml"的部分（`--data-dir`、`--addr`、`--rpc-port`、`--mgmt-port`、`--no-start`）：写 NODE、cluster.key、node.toml、keys/admin.key、keys/client.key，然后前台运行 server；元数据初始状态（第 3 步）M3 起、TARGET 超级块与 `--target` M5 起、`--profile`/`--owner` 随用到它们的里程碑加入。复制到 `~/.config/wmfs/` 时，那里已有**内容不同**的同名文件就不覆盖（可能属于另一个集群），并提示用 `--key-file`。写文件的顺序是 cluster.key → node.toml → keys/* → **NODE 最后**（都用 `atomic_write`）：NODE 是 init 的提交点，"NODE 存在 = init 已完成"（`wmfs dev` 靠它判断节点是否已初始化）；init 中途失败或被杀时目录里没有 NODE，删掉目录重来即可。
+> 实现注记（M3）：init 在写 NODE 之前写 `meta/meta.redb` 的 index = 1 初始状态（第 3 步；初始 KV 由 `core/src/init/initial_kv.rs` 生成，金样 `tests/golden/init_kv.golden`，连同 `raft_state` 的五个值）。规格没写的初值按最小方案：根的 `parent = 0`（"无"，与"id 0 表示无"一致）、`name` 为空；目录的 `nlink = 2 + 子目录数`、`size = 直接子项数`、`change_id = 1`；时间戳都取 init 的时刻；default 类 `weight = 1`、其余 QoS 字段 0、`priority = 1`、`failure_domain = 1`、`locality = 0`；NodeRecV1(1) 的 `addrs` 取 node.toml 的监听地址（`--addr:--rpc-port`）、`features` 为空、`host_id` 没给时取 machine_id（`/etc/machine-id`）、`hostname` 取 `/proc/sys/kernel/hostname`；根目录与 `/home`、`/scratch` 的属主 = 运行 init 的用户（本进程的有效 uid/gid，`sys::euid_egid()`；数据目录可以是别的用户事先建好的空目录，所以不取它的属主）；读不到 `/etc/machine-id` 或 hostname 时写一行警告、该项留空。`meta.redb` 写好之后先 fsync `meta/` 目录（新建文件的目录项落盘），再写 NODE。GLOBAL `plugins` = 本节点按 node.toml 装出来的插件清单（CLI 用注册表算好传给 init）。M3 只写 default profile（`--profile`/`--owner` 随用到它们的里程碑加入），还没有 `--target`（n = 0，`next_target = 1`）。`wmfs dev` 的节点打开 `debug_ops`。`meta.redb` 的权限与 NODE、密钥文件一样是 0600；启动时没有它（M3 之前的 init 建的目录）就拒绝启动并提示 `wmfs dev down --purge`（server 绝不自己新建元数据库，坑 P14）。节点地址之后改变（例如 `wmfs dev up --rdma`）时 NodeRecV1 不会自动更新——集群图（M4）与 join（M8）用到它时再处理。
 
 #### 3.4.4 租约与客户端驱逐【ADR-0023】
 
@@ -1892,6 +1905,7 @@ fail_points = ["plugin.quota.quota_admission"]
 启动时 `PluginSet::validate()`（core）检查：altitude 在区间内且同钩子内唯一；transform 落在其类别子区间；唯一型钩子恰好一个；`abi_version` 匹配（不匹配拒绝启动，不尝试适配，理念文档 4.3.6）；热路径插件（含 transport、chunk_store）`budget_ns > 0`；`fail_points` 非空；配置键都在 `config_schema` 里（不认识的键 = 错误）。`node.toml` 只能启停插件：`[plugins] disable = ["path-caps"]` 与 `[plugin.<name>]` 配置表，**不能改顺序**。插件配置只允许部署参数；行为策略必须走目录属性。
 
 > 实现注记（M1）：`PluginSet` 在 `core/src/hooks/registry.rs`；`validate(&cfg.plugin)` 返回给人看的中文错误（`Result<(), String>`），同时检查 `[plugin.<name>]` 只能给已注册的插件、只能写它 `config_schema` 里有的键，以及 `fail_points` 里必须声明 `plugin.<名字>.<钩子>`。M1 的 `PluginSet` 里只有 transport 与 authn 两种钩子（只有它们的 add 方法），`validate` 也只校验这两种用得到的规则：每个插件的 manifest（abi_version、钩子声明、altitude 区间、传输一定是 hot_path、热路径插件给出 budget_ns、fail point 声明、config_schema），同一钩子内不重名、altitude 不相同，不同的插件不同名（同一个插件可以挂在多个钩子上：manifest 内容相同即视为同一个插件，`Manifest` 因此加了 `PartialEq`），传输的 scheme 唯一。其余钩子特有的规则随各自的 add 方法一起加入：唯一型钩子（chunk_store、meta_engine）"恰好一个"（M3、M5），transform 的类别子区间与 qos"只允许一个活跃"（M5、M13）。`[plugins] disable` 里不认识的名字不报错（例如 minimal profile 的 `quota`、`mclock` 在实现之前）。`manifest.toml` 与代码常量的逐字段比对是 `core::hooks::manifest::check_manifest_toml`，各插件的单元测试调用它。
+> 实现注记（M3）：meta_engine 的实现（embedded-kv）在 core（元数据 Raft 是契约），注册表登记它的 manifest：`PluginSet::meta_engine(&wmfs_core::meta::engine::engine::MANIFEST)`（`plugins/embedded-kv/` 只放 manifest.toml 与 docs.md）。`validate` 查"最多一个"（只做传输的进程——`wmfs ping`、组件测试——不需要元数据引擎），`server::start` 查"恰好一个且是 embedded-kv"（被 `[plugins] disable` 禁掉就拒绝启动）。
 
 **插件集合全集群一致（集群插件清单）**：authz、quota、placement 在 leader 上执行，qos、transform 在数据节点上执行——如果各节点启用的插件不同，leader 一换、或者请求落到另一个数据节点，已设置的授权、配额、QoS 策略就会被静默跳过（违反原则 7）。所以：
 
@@ -2310,6 +2324,7 @@ pub fn fail_point_hit(name: &str) -> bool;          // 只问"这次是否触发
 ```
 
   首批：`raft.persist.before_commit`、`raft.persist.after_commit`、`raft.apply.before`、`meta.exec.before_propose`、`meta.reply.drop`（吞掉一次元数据回复，演示重试 + 去重）、`snapshot.fetch.midway`、`chunk.pending.eio`、`chunk.pending.torn`（只写一半 pending 文件然后 abort）、`chunk.commit.before_rename`、`chunk.read.eio`、`chunk.read.corrupt`、`chunk.sync.eio`、`chain.forward.drop`、`chain.forward.delay`、`chain.head.crash_after_pending`、`chain.ack.drop`、`sync.fetch.midway`、`net.drop.to.<node>` / `net.drop.from.<node>`（不用 iptables 就能模拟网络分区）、`net.delay`、`clock.mono.skew_ms`、`clock.mono.rate_ppm`、`clock.wall.skew_ms`、`client.flush.before_commit`、`client.heartbeat.stop`、`bg.step.crash_after_effect`，以及每个插件自动拥有的 `plugin.<name>.<hook>`。
+  实现注记（M3）：已埋好并各有测试：`raft.persist.before_commit`、`raft.persist.after_commit`、`raft.apply.before`（abort 用子进程测，`tests/it/failpoint_raft_abort.rs`；panic 用来验证坑 P2 的先后，`failpoint_raft_order.rs`）、`meta.exec.before_propose`、`plugin.embedded-kv.meta_engine`（`failpoint_meta.rs`）。`meta.reply.drop` 随 M4 的去重演示加入。
 - **时钟可注入**：`clock::mono_ms()` / `clock::wall_ms()` 是所有租约、超时与时间戳的唯一来源，fail point 可注入偏移与速率，用于租约安全性测试。（实现注记（M0）：运行中 set/clear 也安全——`rate_ppm` 只作用于设置之后的时间（以设置时刻的读数为基点），清除后多走或少走的部分保留；`skew_ms` 变大 = 立刻前跳，变小（含清除）= 停走直到真实时间追上；`mono_ms()` **永不倒退**，第一次读数是 1000 而不是 0。见 `core/src/base/clock.rs`。）数据节点用心跳回复里的 leader 墙钟估算偏差，导出 `wmfs_clock_skew_seconds`，超过 1 s 告警（cap 过期判断容忍 5 min）。
 
 
@@ -2317,6 +2332,7 @@ pub fn fail_point_hit(name: &str) -> bool;          // 只问"这次是否触发
 
 > 实现注记（M0）：本节类型自 M0 起以下面注释里写的各文件（`core/src/base/types.rs`、`core/src/net/{client,server,conn}.rs`、`core/src/client/{meta_client,data_client}.rs`、`core/src/hooks/pipeline.rs`、`core/src/meta/attrs.rs`；小类型：`RegionInfo` → `core/src/buf/pool.rs`，`KeyFile` → `api/src/types.rs`，`NetConfig` → `core/src/base/config.rs`，`RoleInfo`/`EngineStatus` → `core/src/meta/engine/txn.rs`，`QueueStat`/`StoreStat` → `core/src/hooks/traits.rs`，`FileFacts` → `core/src/hooks/policy.rs`，`TierRule`/`AuditSpec`/`QuotaDecl` → `core/src/meta/attrs.rs`；`ApiClient`/`ApiError` → `dashboard/src/api.rs`，`HttpIn`/`HttpOut`/`Router` → `dashboard/src/host.rs`）为唯一真源；下面的代码块仅供阅读，若不一致以源码为准。
 > 实现注记（M1）：在骨架之外新增（只加不改）：`RpcClient::new_with_role(pool, transports, key, role, net)` 与 `client::default_role(key_id)`（见 3.3.2 注记）、`client::check_reply(InFrame)`（ERROR 帧 → 错误码；`call` 本身把服务端的 ERROR 帧原样返回，需要 `leader_hint`/`extra` 的调用方用 `InFrame::error()`）、`Responder::into_stream() -> StreamTx`（`StreamTx::send(body, bulk, last)`，SnapshotFetch 用）、`RpcServer`/`ServerId`/`Service`（服务端装配与按 msg_type 注册的服务）、`ErrorBody::new`、`frame::msg_name`。`call_cb` 在还没有连接时会在调用线程上建连（M9 的 repl 线程用它之前改成后台建连）。core 把 wmfs-api 原样转出为 `wmfs_core::api`，独立 crate 的插件只依赖 wmfs-core。另：① `call`/`start`/`call_cb`/`stream` 在本地的任何失败（选路失败、建连或握手失败、入队失败、请求帧超过传输上限）都先记进在途表，由 `rpc-timer` 在 100 ms 内以该错误码结束——于是 `call_cb` 的回调恰好一次、而且只在连接读线程或 `rpc-timer` 线程上执行，从不在调用方线程上（M9 的 repl 线程可以放心用）；`RpcClient` 被丢弃时还没结束的调用以 `ECONNRESET` 结束。② `StreamTx::send(&mut self, body, bulk, last)`、`StreamTx::error(code)`（以错误码结束流）；`StreamTx` 没发最后一帧就被丢弃时与 `Responder` 一样自动回 `EIO` 并计数 `wmfs_req_dropped_total`（客户端的流立即结束，不用等 10 min 的流超时）。请求在流结束时才计入 `wmfs_rpc_requests_total`。③ `Role::name()/from_name()`（"admin"/"client"/"server"，指标标签与 `wmfs ping --role` 用）、`init::SERVER_KEY = 0`、`MemPool::stats() -> Vec<ClassStats>`、`base::config::PluginTable`、`wmfs_api::hex::{hex, unhex}`（全仓库唯一的 hex 编解码）、`wmfs_api::auth::AuthHeader`（`parse_auth_header` 的结果）。
+> 实现注记（M3）：只增不改（ADR-0030 第 9 条）：`meta::raft::driver::{Driver, DriverOpts, RaftInput, ProposeOutcome, Published, config}`（Driver 是"输入一步、处理一次 Ready"的结构体：`handle_input`/`tick`/`process_ready`/`take_outbox`/`run`，`applied()` 返回 `Applied`）、`meta::raft::{or_abort, redb_eio}`、`meta::raft::storage::{RedbStorage, bootstrap, read_applied, read_global, put_state, KV, RAFT_LOG, RAFT_STATE}`、`meta::engine::engine::{EmbeddedEngine, EngineOpts, OpEnv, KvKeys, MANIFEST}`（`EmbeddedEngine::{open, start, local_get, node_addrs, keys, shutdown}`；`meta::engine::{EmbeddedEngine, EngineOpts, KvKeys, MANIFEST}` 是同一组的短路径）、`meta::engine::{view::{BatchView, ReadView}, read_gate::ReadGate, dedup}`、`meta::service::MetaService::start(Arc<dyn MetaEngine>, debug_ops)`、`meta::sessions::is_active`、`PluginSet::{meta_engine, meta_engine_manifest}`、`mgmt::{MgmtCtx.role, RoleFn}`、`init::{InitOpts.debug_ops, InitOpts.plugins, InitialKv, initial_kv, HOME_INO, SCRATCH_INO}`、`base::sys::euid_egid`；key 号常量 `SERVER_KEY`/`ADMIN_KEY`/`CLIENT_KEY` 移到 `proto::handshake`（协议常量，3.3.2），`init::` 下原样转出；`txn_blocking` 实现了。`RpcClient` 的建连改成按 `(scheme, 地址)` 单飞（ADR-0031 第 11 条）：多个线程同时对同一对端发第一次调用时只有一个线程建连，其余等它的结果（成功就共享这条连接，失败就都拿到同一个错误，再各自按 3.3.8 重试）。登记"正在建连"时（拿着建连登记表的锁）再查一次连接表，第一次查完之后别人恰好建好的连接不会被重复建；建连的线程无论怎样离开（包括传输插件 panic）都交出结果、摘掉登记，等待者不会白等到期限。
 
 下面这些类型被 core/net、core/data、core/client、core/meta、cli/fuse、wmfs-mgr 同时使用，签名以这里为准（M0 的接口骨架原样落成文件）。
 
@@ -2651,6 +2667,7 @@ when = "idle>30d"          # 等价于在绑定该类的目录上隐式设置 ti
 - **认证**：`Authorization: WMFS-HMAC key=<id>,ts=<unix_ms>,sig=<hex>`，`sig = HMAC-SHA256(secret(key), METHOD ‖ "\n" ‖ path_and_query ‖ "\n" ‖ ts ‖ "\n" ‖ hex(sha256(body)))`，`|now − ts| ≤ 300 s`。写需要 admin 角色，读需要任一已认证 key；`/metrics` 与 `/api/v1/health` 免认证。错误统一为 `{"error": "<code>", "message": "<中文说明>"}`。**诚实说明**：服务端不记录见过的签名，所以 5 分钟窗口内被截获的写请求可以原样重放；超过 5 分钟就不行。首发只在可信网络中使用（ADR-0009）。
 - **本机注意**：环境里设置了 `http_proxy`。所有内部 HTTP 客户端必须 `ureq::Agent::config_builder().proxy(None).build().into()`；演示命令里的 curl 一律加 `--noproxy '*'`（roadmap 的每终端准备步骤也设置了 `no_proxy`）。
 - 实现注记（M1）：框架在 `core/src/mgmt/`（`http.rs`：tiny_http 监听与 4 个处理线程、路由；`auth.rs`：签名校验）；要签名的文本与请求头格式在 `wmfs-api` 的 `auth.rs`（服务端与 ApiClient 共用），hex 一律小写，两边各有同一组输入的签名金样。错误回复的 `error` 取错误码名的小写（`auth_failed`、`eacces`、`einval`、`enoent`、`not_leader`……）。`GET /api/v1/health` 的结构是 `wmfs_api::types::Health`：`{ok, version, cluster_id, node: {node_id, addrs, mgmt_addr}, meta_role, leader, audit_lag}`（M1：`meta_role = "none"`，`leader`、`audit_lag` 为 null）。fail point 接口另加了 **`GET /api/v1/failpoints`**（`wmfs failpoint list` 要用；读，任一已认证 key），GET/POST/DELETE 都回本节点当前的全部 fail point（`FailpointList`）；`failpoints_api = false` 时整组接口回 404。清除一个没设置过的名字回 `404 enoent`（拼错名字不会被静默忽略）；fail point 名字只能由字母、数字和 `.` `_` `-` 组成（环境变量、API 与 CLI 同一条规则，于是放进 `?name=` 不用转义）。**请求体**：先看请求头里声明的长度——超过 1 MiB 的请求既不读、也不回、也不交还给 tiny_http（整个"忘掉"，这条连接一直挂着）：tiny_http 0.12 丢弃没读完的 body 时会按剩余长度**一次分配内存**，`Content-Length` 写成几十 TB 就能让整个进程因分配失败而退出（读到一半对端断开也一样）。剩余风险（写进这里，不另做）：声明了 body 却不发的连接会一直占着一个处理线程——tiny_http 没有读超时，回复之后丢弃请求时也要把 body 读完，所以"读 body 之前先验签"挡不住它；首发只在可信网络中使用（ADR-0009）。
+- 实现注记（M3）：health 的 `meta_role`：`"leader"` = **就绪**的 leader（已当选、本任期的空条目已应用、插件清单一致，可以服务请求——`wmfs dev wait leader` 等的就是它）；`"candidate"` = 正在选举，或已当选但还没就绪（新增的取值）；`"follower"`、`"learner"`。`leader` = 当前 leader 的地址（是自己就用本节点实际监听的地址，否则取已应用的 NodeRecV1；还不知道时为 null）。
 
 | 方法 路径 | 作用 |
 |---|---|
@@ -2696,6 +2713,7 @@ when = "idle>30d"          # 等价于在绑定该类的目录上隐式设置 ti
 - **`wmfs dev wait <条件>`**（替代演示里的固定 `sleep`；条件满足立即返回 0，超时返回 1 并打印当前状态）：`leader`（有就绪的元数据 leader）、`chains-serving`（所有链长度达到期望且全部 Serving）、`task-idle <kind>`（该任务这一轮做完且积压为 0）、`session-evicted <挂载点>`、`alert <名字> firing|resolved`（查 mgr 的 `GET /alerts`）、`audit-caught-up`（`audit-log` 游标追上最新 changelog）。
 - **`wmfs dev down --purge` 的顺序**（被冻住或崩溃的挂载点上 `fusermount3 -u` 会 EBUSY 或卡住）：对所有开发客户端进程依次 `SIGCONT` → `SIGTERM` → 3 s 后仍在则 `SIGKILL` → 对每个开发挂载点 `fusermount3 -uz`（lazy 卸载）→ 停服务端 → 最后删除开发目录。`wmfs doctor` 发现残留的 `fuse.wmfs` 挂载时给出这条命令。
 - 实现注记（M1）：① `wmfs dev` 基础版只有 `up/down/env/status/kill/start/logs`，`up` 只支持 `--nodes 1`（多节点要 `wmfs join`，M8）；`--dir` 对所有 `dev` 子命令都有效，默认取环境变量 `WMFS_DEV_DIR`、否则 `~/wmfs-dev`，`wmfs dev env` 也导出 `WMFS_DEV_DIR`；节点在自己的进程组里后台运行，stdout/stderr 追加到 `<节点>/logs/server.log`；`up`/`start` 等到该节点的 health 有响应（且是本集群）才返回，进程退出或 30 s 超时则打印日志路径、非 0 退出；只对 pid 文件里、命令行确实是"`wmfs server --data-dir <该节点>`"的进程发信号；`down --purge` 只删除默认的 `~/wmfs-dev` 或带 `.wmfs-dev` 标记文件的目录（防止 `--dir` 写错删掉别的目录）；"就绪" = health 有响应**并且** pid 文件里就是刚起的那个进程（server 在管理 API 开始应答之前写 pid 文件），所以 `up` 之后紧接着的 `status`/`down` 一定找得到它；`down` 先发 SIGCONT（被冻住的节点也能处理 SIGTERM）、5 s 后仍在才 SIGKILL，并替被 SIGKILL 的进程删掉 pid 文件；开发目录一律换成规范的绝对路径（`./devC`、`/tmp//devC/`、符号链接都认得出是同一个）；起不来时把日志的最后一行也打印出来。② `wmfs failpoint <node>` 的 `<node>` 是节点号：依次问 `WMFS_CLUSTER`（或 `--cluster`）里每个地址的 health 找到它；也可以直接写管理地址。③ `wmfs ping` 另有 `--role admin|client|server` 与 `--json`。④ `wmfs debug gen-key` 生成的是 key 2（默认 client 的号）+ 随机秘密：号对、秘密不对，演示的是"证明不对"被拒。
+- 实现注记（M3）：① `wmfs dev wait <条件…> [--timeout 秒]`（默认 120）：M3 只有 `leader`（某个节点的 health 报告 `meta_role = "leader"`），每 100 ms 问一遍开发目录里的每个节点；不认识的条件直接报错。② `wmfs debug kv put <键> <值>`、`get <键>`（不存在 → 退出码 1）、`bench [--n 100000]`（64 路并发、值 32 字节，都是常量），都有 `--json`（put：`{ok}`；get：`{key, found, value}`；bench：`{n, concurrency, ok, retries, elapsed_ms, ops_per_sec, batches, avg_batch}`）；先问 `--cluster`/`WMFS_CLUSTER` 的 health 找到 leader 的 rpc 地址（最多 30 s；自称 `candidate` 的节点再等一会儿，免得第一个请求碰上 `NOT_READY`），按 3.3.8 重试（总期限 30 s）；键值按 UTF-8 文本处理。bench 写 `bench-<8 位序号>`，平均批大小取 leader `/metrics` 里 `wmfs_meta_batch_ops` 直方图的 `_sum`/`_count` 增量（压测期间 `wmfs_raft_term` 变了 = leader 重启或换过、计数器重新开始，就把 `batches`/`avg_batch` 报为 0 并说明"不可用"）；可重试的失败按 3.3.8 退避，但故障时一起失败的那一批在途请求只退避一次（只有上次加大退避之后才发出的请求失败了才再加倍），退避期间不发新请求。`dev wait` 的 `--timeout` 换算成毫秒时饱和，不回绕。
 
 ### 7.3 `/metrics`（节选，前缀 `wmfs_`）
 
@@ -2814,6 +2832,8 @@ open 流程：`Open(ino, flags)`（只读请求，不写 raft）→ 得到最新
 
 同一进程里起 3–5 个 `RawNode<RedbStorage>` + 驱动器（driver 设计成"输入一步、处理一次 Ready"的结构体方法，测试直接调用，不起线程），消息走内存总线，可随机丢弃、延迟、重排、分区；tick 由测试驱动（不依赖真实时间）。**存储用测试专用的 redb 后端** `MemCrashBackend`（testkit，约 80 行，实现 redb 2.6 的 `StorageBackend`，用 `Builder::create_with_backend` 打开）：写入先放在"易失层"，只有 `sync_data` 之后才算落盘；随机"崩溃"= 丢掉易失层、只用已落盘的字节重建节点——这才真正模拟了掉电（`kill -9` 不丢页缓存，fsync 写错了也照样"不丢"，测不出来），而且不碰真实磁盘、不做真实 fsync，1000 个种子几分钟就能跑完。检查：① 所有存活副本在静止后 KV 哈希相同；② 每个被确认的写在任何崩溃序列后都还在；③ 单 key 读写历史的线性一致性（≤ 200 个操作的小历史用 Wing-Gong 回溯检查）；④ `expect_version` 作废的批次从未被部分应用；⑤ 附录 A 每个坑一个回归用例（含"单节点 propose → kill -9 → 重启"、快照安装、joint 退出兜底）。每次提交跑 1000 个随机种子，夜间跑 10 万个。
 
+> 实现注记（M3）：单节点部分在 `tests/it/raft_sim.rs`，附录 A 的回归用例在 `raft_pitfalls.rs`（单节点之外的情形由测试手写对端的 raft 消息），压缩在 `raft_compact.rs`；`MemCrashBackend` 在 `tests/harness/mem_crash.rs`。除"崩溃 = 丢掉易失层"外还有 `freeze_after(k)`：在之后第 k 次 sync 处掉电、进程照常往下跑——重启后的 KV 必须等于"确认历史"里的某个状态，且不早于掉电点之前的最后一个确认（确认时的 sync 计数 ≤ 掉电点 ⇒ 它的条目已落盘），于是"在任意一次 fsync 处掉电"都被覆盖。普通 `cargo test` 跑 200 个种子（约 10 s，全工作区的测试别太慢），`scripts/ci.sh` 与 `scripts/accept.sh M3` 按"每次提交 1000 个"跑（约 1 分钟）。
+
 ### 9.3 CRAQ 组件测试（`tests/`，单进程）
 
 在一个进程里起 3 个数据服务，通过 `plugin-mem-transport` 或回环 TCP 互连，集群图由测试直接下发（不需要元数据服务）。target 用测试专用的内存版 `MemTargetStore`（testkit，实现 `TargetStore` 这个插件边界）：文件内容、rename、目录项都先进"易失层"，`commit_pending(sync)`/`install`/`sync` 与目录 fsync 才让它们落盘，崩溃时丢掉易失层——用来验证 R1–R6 的 fdatasync 与目录 fsync 顺序。另有一组同样的用例跑在真实的 local-fs 上（只验证功能，不验证掉电）。注入：转发丢弃/延迟、链变更、重复转发、NeedFull、head 写完 pending 后崩溃、唯一幸存者重启（incarnation）、整链重启、同步期间并发写。不变式检查器：静止后所有 Serving 副本对每个 chunk 的已提交版本与内容哈希相同；读历史无回退。
@@ -2913,7 +2933,7 @@ CI（`scripts/ci.sh`）：`cargo fmt --check` → `cargo clippy --all-targets --
 | 19 | 5.2 `compress`、`encrypt` 生效方式"新数据 + 协调器"，`checksum`、`locality`"新数据" | 变换参数与放置属于 layout：属性改动对**新文件与截断到 0 的文件**立即生效；已有文件的新写入沿用旧 layout，直到协调器迁移（写打开的文件被跳过、单独计数、24 h 告警）；checksum、locality 不迁移 | 按块切换 layout 需要块级元数据与混合解码，复杂度高；截断到 0 重建 layout 覆盖了最常见的"覆盖写" | 0021 chunk 文件格式 v1（附带的偏离） | 需确认 |
 | 20 | 理念文档 4.3.1 只要求 manifest；首发另加"集群插件清单" | 不是偏离，是对原则 7 的落实：各节点会影响策略的插件集合必须一致，否则退出 | 否则 leader 切换会静默跳过授权/配额/QoS 策略 | 0025 | 随 0025 |
 
-另有 11 条**不是偏离、但属于契约层首次定义**的设计 ADR（理念文档 10.1："这是契约吗？是 → 先写 ADR，等人类批准"），除 0026 外全部在 M0 开工前（批次 0）一次确认：0018 线上协议 v1、0019 元数据引擎与执行模型、0020 元数据 KV 布局 v1、0021 chunk 文件格式 v1 与数据侧崩溃一致性、0022 缓冲池与零拷贝所有权、0023 租约 / 能力令牌 / 两阶段驱逐、0024 CRAQ 链式复制（成员、版本、incarnation、重同步）、0025 钩子清单与插件 ABI 规则、0027 后台任务框架与可观测基座、0028 命名空间语义与 cto 缓存失效协议 v1。0026 目录属性与递归用量 / 配额 quantum 模型在 M7 开工前确认（它的实现从 M7 开始；其中"配额允许短暂超限"是要你决定的产品取舍）。实现中补齐的技术缺口（2026-10-21 起，主管按本文开头的例外条款决定）：0029 changelog 操作码表 v1、0030 M1 补齐的握手与管理 API 细节、0031 M2 补齐的 RDMA 插件细节。
+另有 11 条**不是偏离、但属于契约层首次定义**的设计 ADR（理念文档 10.1："这是契约吗？是 → 先写 ADR，等人类批准"），除 0026 外全部在 M0 开工前（批次 0）一次确认：0018 线上协议 v1、0019 元数据引擎与执行模型、0020 元数据 KV 布局 v1、0021 chunk 文件格式 v1 与数据侧崩溃一致性、0022 缓冲池与零拷贝所有权、0023 租约 / 能力令牌 / 两阶段驱逐、0024 CRAQ 链式复制（成员、版本、incarnation、重同步）、0025 钩子清单与插件 ABI 规则、0027 后台任务框架与可观测基座、0028 命名空间语义与 cto 缓存失效协议 v1。0026 目录属性与递归用量 / 配额 quantum 模型在 M7 开工前确认（它的实现从 M7 开始；其中"配额允许短暂超限"是要你决定的产品取舍）。实现中补齐的技术缺口（2026-10-21 起，主管按本文开头的例外条款决定）：0029 changelog 操作码表 v1、0030 M1 补齐的握手与管理 API 细节、0031 M2 补齐的 RDMA 插件细节、0032 M3 补齐的元数据引擎细节。
 
 ---
 
@@ -2937,6 +2957,8 @@ CI（`scripts/ci.sh`）：`cargo fmt --check` → `cargo clippy --all-targets --
 | 14 | 无 TLS、服务端之间的请求带 rkey、管理 API 5 分钟内可重放 | 不可信网络上不安全 | 文档明确"仅可信网络"（ADR-0009）；客户端永远拿不到服务端 rkey |
 | 15 | 持久化格式不可逆 | 返工代价极高 | 第一天就带版本号与 feature flags；全部格式在 M0 前确认并由 M0 落成可编译的骨架与金样；金样测试防止无意修改 |
 | 16 | 改了集群插件清单后忘了用新配置重启 | 节点因插件集合不一致而退出（宁可停，不静默跳过策略） | 错误日志列出差异与修复命令；`wmfs server --adopt-local-plugins` 作为逃生口（3.7.2） |
+
+> 实现注记（M3，风险 1）：本机实测 `wmfs debug kv bench --n 100000`（64 路并发）约 12.6 s、约 7,900 条/秒、平均每批 32 个操作（闭环客户端下两批在 64 个在途请求之间轮流，每批约一半），每批约 4 ms（含一次 Immediate fsync）。
 
 ---
 
@@ -2967,6 +2989,8 @@ CI（`scripts/ci.sh`）：`cargo fmt --check` → `cargo clippy --all-targets --
 | P21 | 已有未应用 conf change 时，新的 conf change 被改写成空的 EntryNormal | 按 (index, term) 跟踪时把它判为 `Applied{ok:false}`，下一轮重试 |
 | P22 | v1 `EntryConfChange` 与 V2 的 protobuf 字段不同，不能按 V2 解析 | wmfs 只提议 V2；遇 v1 条目 panic 并写明原因 |
 | P23 | `is_empty_snap` 已弃用（会产生警告，破坏"零警告"） | 用 `rd.snapshot().is_empty()` |
+
+> 实现注记（M3）：回归用例（`tests/it/` 下，单节点之外的情形由测试手写对端的 raft 消息）：P1 → 结构保证（step/propose/read_index/campaign 只在 Ready 处理之外调用——`Driver::handle_input`、`tick`、`process_ready` 开头的读闸门 pump、`open` 里的 campaign；`on_ready`（`ready()` 到 `advance()` 之间）从不调用）+ `raft_sim`（随机交错输入与 Ready）；P2 → `failpoint_raft_order`（提交前 panic：follower 的回复没发出、leader 的 MsgAppend 已发出）+ `raft_pitfalls::p2_p3…`；P3 → `raft_pitfalls::p2_p3…`（旧提交与新条目同一个 Immediate 事务落盘）；P4/P5/P21 → `raft_pitfalls::p4_p5_p21…`（joint → 自动 leave-joint 被应用、ConfState 与条目同事务、第二个 conf change 被改写成空条目 → `Applied{ok:false}`）；P6 → `raft_pitfalls::p6…`（未就绪不发、2 s 回 RETRY、500 ms 用新 ctx 重发）+ 读闸门单测；P7/P16/P18 → `raft_pitfalls::p7_p16_p18…`；P8 → `raft_compact`（20 万条后压缩、重启不 fatal）；P9/P20 → `raft_pitfalls::p9_p20…` + `raft_sim`（每步检查可见状态 applied ≤ hs.commit，每次掉电重启都不 fatal）；P10 → `raft_pitfalls::p10…`；P12 → `RedbStorage` 合约测试（max_size 至少一条；900 KiB 的 3 节点用例在 M8）；P14 → `raft_pitfalls::p14…` 与 init 拒绝非空目录；P15 → `raft_pitfalls::p15…`；P19 → `raft_pitfalls::p19…`（另有 3.4.1.4 规则 3 的提议前检查：插件清单不一致的 leader 当选了也不提议，`raft_pitfalls::proposals_to_a_leader_whose_plugins_differ…`）；P22 → `raft_pitfalls::p22…`（should_panic）；P23 → 零警告构建；另有 3.4.1.3 ① 的"不再是 leader → 在途提议 Lost、读者 NOT_LEADER"（`raft_pitfalls::stepping_down…`）。P11（report_snapshot）、P13（joint 无人退出的兜底）、P17（快照 + 已提交条目）在 M8 随快照与 cluster-mgr 实现。
 
 ## 附录 B：本机核对过的 API 与环境事实
 

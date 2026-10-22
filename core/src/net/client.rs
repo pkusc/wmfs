@@ -13,7 +13,9 @@
 //!
 //! 实现注记（M1）：① Hello 里要声明本端角色，而密钥文件里没有角色：[`RpcClient::new`] 按 init 的约定推断
 //! （key 0 = server、key 1 = admin、其余 = client），别的 key 用 [`RpcClient::new_with_role`] 明确给出；
-//! ② `call_cb` 在还没有连接时会在调用线程上建连（M9 的 repl 线程用它之前改成后台建连）；③ 一次调用的任何本地失败
+//! ② `call_cb` 在还没有连接时会在调用线程上建连（M9 的 repl 线程用它之前改成后台建连）——实现注记（M3，ADR-0031 第 11 条）：
+//! 建连按 `(scheme, 地址)` 单飞，多个线程同时对同一对端发第一次调用时只有一个线程建连，其余等它的结果（成功就共享这条连接，
+//! 失败就都拿到同一个错误，再各自按 3.3.8 重试）；③ 一次调用的任何本地失败
 //! （选路失败、建连或握手失败、入队失败、请求帧超过传输上限）都先记进在途表，由 rpc-timer 在 100 ms 内结束——
 //! 于是回调只在连接读线程或 rpc-timer 线程上执行（3.12），从不在调用方线程上；④ 期限 = 现在 + timeout + 1 ms
 //! （`mono_ms` 只精确到毫秒，不加 1 的话调用可能比 timeout 早不到 1 ms 结束）。
@@ -34,9 +36,9 @@ use crate::buf::MemPool;
 use crate::hooks::manifest::Hook;
 use crate::hooks::pipeline::HookCall;
 use crate::hooks::traits::Transport;
-use crate::init::{ADMIN_KEY, SERVER_KEY};
 use crate::net::conn::{self, ConnHandle};
 use crate::proto::frame::{FLAG_LAST_CHUNK, FrameKind, InFrame, OutFrame};
+use crate::proto::handshake::{ADMIN_KEY, SERVER_KEY};
 
 mod link;
 
@@ -90,6 +92,7 @@ pub struct RpcClient {
     role: Role,
     net: NetConfig,
     conns: Mutex<HashMap<(String, String), ConnHandle>>,
+    dialing: Mutex<HashMap<(String, String), Arc<link::Dial>>>, // 正在建连的 (scheme, 地址)：同一对端只让一个线程建连
     inflight: Mutex<HashMap<u64, Pending>>,
     next_req: AtomicU64,
     inflight_gauge: Arc<Gauge>,
@@ -149,6 +152,7 @@ impl RpcClient {
             role,
             net,
             conns: Mutex::new(HashMap::new()),
+            dialing: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             next_req: AtomicU64::new(1),
             inflight_gauge: metrics::gauge("wmfs_rpc_inflight", "客户端在途请求数", &[]),
@@ -246,6 +250,9 @@ impl RpcClient {
 
     fn conns(&self) -> MutexGuard<'_, HashMap<(String, String), ConnHandle>> {
         self.conns.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn dialing(&self) -> MutexGuard<'_, HashMap<(String, String), Arc<link::Dial>>> {
+        self.dialing.lock().unwrap_or_else(|e| e.into_inner())
     }
     fn track(&self) -> MutexGuard<'_, HashMap<u64, Pending>> {
         self.inflight.lock().unwrap_or_else(|e| e.into_inner())

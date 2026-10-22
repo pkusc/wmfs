@@ -17,6 +17,10 @@
 #   check      "中文说明" 命令 参数…                 命令退出码为 0 即通过
 #   check_json "中文说明" 'jq 表达式' 命令 参数…     命令的 stdout 是 JSON，`jq -e 表达式` 为真即通过
 #   skip       "中文说明" "原因"                      本机做不到的检查（不算通过，也不算失败）
+# 各里程碑共用的检查命令（交给 check 运行）：
+#   build_no_warnings                                cargo build --release --workspace 成功且零警告
+#   one_test <cargo test 参数…> <完整测试名>          只跑这一个测试（-- --exact），并确认它真的跑了
+#   tests_at_least <N> <cargo test 参数…>            通过，且至少跑了 N 个测试
 # 每条检查的完整输出写在日志目录里的 NN.log（NN = 检查序号）。
 set -u
 # 这两个变量会改变测试的行为：WMFS_GOLDEN_UPDATE=1 让金样测试"重写金样并直接通过"（假通过），
@@ -78,6 +82,43 @@ json_expect() {
 skip() {
     N=$((N + 1))
     echo "SKIP $1（原因：$2）"
+}
+
+# cargo build；cargo 与 rustc 的警告都打印在 stderr 上，有一行以 warning 开头就算失败。
+build_no_warnings() {
+    local err rc
+    err="$(mktemp)"
+    cargo build --release --workspace 2>"$err"
+    rc=$?
+    cat "$err"
+    if grep -q '^warning' "$err"; then
+        echo "有编译警告（见上面）"
+        rc=1
+    fi
+    rm -f "$err"
+    return "$rc"
+}
+
+# one_test <cargo test 参数…> <完整测试名>：只跑这一个测试，并确认它真的跑了（名字写错时 cargo 也退出 0）。
+one_test() {
+    local out
+    out="$(cargo test "$@" -- --exact 2>&1)"
+    printf '%s\n' "$out"
+    printf '%s' "$out" | grep -q 'test result: ok. 1 passed'
+}
+
+# tests_at_least <N> <cargo test 的参数…>：通过，且至少跑了 N 个测试（按名字过滤一个都没匹配上时 cargo 也退出 0）。
+tests_at_least() {
+    local want="$1" out n
+    shift
+    out="$(cargo test "$@" 2>&1)" || {
+        printf '%s\n' "$out"
+        return 1
+    }
+    printf '%s\n' "$out"
+    n=$(printf '%s' "$out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | awk '{s += $1} END {print s + 0}')
+    echo "跑了 $n 个测试（至少要 $want 个）"
+    [ "$n" -ge "$want" ]
 }
 
 # 跑一个里程碑（在子 shell 里，失败时 check 用 exit 结束它）。

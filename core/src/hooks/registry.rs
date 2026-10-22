@@ -7,6 +7,9 @@
 //! 实现注记（M1）：M1 的集合里只有 transport 与 authn 两种钩子（只有它们的 `add` 方法），`validate` 也只校验这两种用得到的
 //! 规则。其余钩子特有的规则随各自的 `add` 方法一起加入：唯一型钩子（chunk_store、meta_engine）"恰好一个"（M3、M5）、
 //! transform 的类别子区间（checksum 700–729、compress 730–759、encrypt 760–789）与 qos "只允许一个活跃"（M5、M13）。
+//! 实现注记（M3）：meta_engine 的实现（embedded-kv）在 core 里（元数据 Raft 是契约），注册表登记的是它的 manifest
+//! （[`PluginSet::meta_engine`]），服务端装配时据此建引擎。`validate` 查"最多一个"（只做传输的进程——`wmfs ping`、
+//! 组件测试——不需要元数据引擎），服务端装配（`server::start`）再查"恰好一个"。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,6 +25,7 @@ pub struct PluginSet {
     disable: Vec<String>,
     transports: Vec<Arc<dyn Transport>>,
     authn: Vec<Arc<dyn AuthnPlugin>>,
+    meta_engines: Vec<&'static Manifest>,
 }
 
 impl PluginSet {
@@ -48,6 +52,18 @@ impl PluginSet {
         }
     }
 
+    /// 唯一型钩子 meta_engine：登记实现的 manifest（实现在 core，见文件头的实现注记）。
+    pub fn meta_engine(&mut self, m: &'static Manifest) {
+        if self.enabled(m) {
+            self.meta_engines.push(m);
+        }
+    }
+
+    /// 启用的 meta_engine（`validate` 之后最多一个）。
+    pub fn meta_engine_manifest(&self) -> Option<&'static Manifest> {
+        self.meta_engines.first().copied()
+    }
+
     pub fn transports(&self) -> &[Arc<dyn Transport>] {
         &self.transports
     }
@@ -59,7 +75,8 @@ impl PluginSet {
     /// 全部 (钩子, manifest)。
     fn all(&self) -> Vec<(Hook, &'static Manifest)> {
         let t = self.transports.iter().map(|p| (Hook::Transport, p.manifest()));
-        t.chain(self.authn.iter().map(|p| (Hook::Authn, p.manifest()))).collect()
+        let a = self.authn.iter().map(|p| (Hook::Authn, p.manifest()));
+        t.chain(a).chain(self.meta_engines.iter().map(|m| (Hook::MetaEngine, *m))).collect()
     }
 
     /// 启动时校验（3.7.2）：每个插件的 manifest（[`check_one`]）；同一钩子内不重名、altitude 不相同；不同的插件不同名；
@@ -90,6 +107,10 @@ impl PluginSet {
                     ));
                 }
             }
+        }
+        if self.meta_engines.len() > 1 {
+            let names: Vec<&str> = self.meta_engines.iter().map(|m| m.name).collect();
+            return Err(format!("meta_engine 是唯一型钩子，却启用了 {} 个：{names:?}", names.len()));
         }
         for (i, t) in self.transports.iter().enumerate() {
             if self.transports[..i].iter().any(|o| o.scheme() == t.scheme()) {

@@ -165,6 +165,12 @@ pub fn set_keepalive(s: &TcpStream) -> Result<(), ErrCode> {
     if r != 0 { Err(last_err()) } else { Ok(()) }
 }
 
+/// 本进程的有效 uid 与 gid（`wmfs init` 把根目录的属主设为运行它的用户，design.md 3.4.3）。
+pub fn euid_egid() -> (u32, u32) {
+    // SAFETY: geteuid/getegid 不接收参数、不读写任何内存，POSIX 规定它们总是成功。
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
 /// RLIMIT_MEMLOCK 的软限制（字节）；`Ok(None)` = 不限。RDMA 要把整个内存池注册（锁定）进网卡（design.md 3.6.1）。
 pub fn memlock_limit() -> Result<Option<u64>, ErrCode> {
     let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -216,6 +222,17 @@ mod tests {
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "不留临时文件");
         assert!(atomic_write(&dir.join("no/such/dir/x"), b"x").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn euid_egid_is_the_owner_of_files_we_create() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::base::test_dir("sys-euid");
+        let f = dir.join("mine");
+        std::fs::write(&f, b"x").unwrap();
+        let (uid, _gid) = euid_egid();
+        assert_eq!(std::fs::metadata(&f).unwrap().uid(), uid, "新建文件的属主就是本进程的有效 uid");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

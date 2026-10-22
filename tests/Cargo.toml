@@ -14,6 +14,10 @@ wmfs-core.workspace = true
 wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma"] }
 plugin-mem-transport.workspace = true
 crc32c.workspace = true
+redb.workspace = true
+raft.workspace = true
+protobuf.workspace = true
+crossbeam-channel.workspace = true
 
 # 组件测试（design.md 9.3 的思路：单进程，经 mem 或回环 TCP 互连）。端口一律 127.0.0.1:0，由系统分配。
 [[test]]
@@ -43,6 +47,39 @@ path = "it/conn_idle.rs"
 [[test]]
 name = "reconnect"
 path = "it/reconnect.rs"
+
+# M3：元数据 Raft（design.md 9.2：确定性模拟用模拟掉电的内存后端；附录 A 每个坑一个回归用例）。
+[[test]]
+name = "raft_sim"
+path = "it/raft_sim.rs"
+
+[[test]]
+name = "raft_pitfalls"
+path = "it/raft_pitfalls.rs"
+
+[[test]]
+name = "raft_compact"
+path = "it/raft_compact.rs"
+
+[[test]]
+name = "failpoint_raft_abort"
+path = "it/failpoint_raft_abort.rs"
+
+[[test]]
+name = "failpoint_raft_order"
+path = "it/failpoint_raft_order.rs"
+
+[[test]]
+name = "failpoint_meta"
+path = "it/failpoint_meta.rs"
+
+[[test]]
+name = "meta_engine"
+path = "it/meta_engine.rs"
+
+[[test]]
+name = "meta_service"
+path = "it/meta_service.rs"
 
 [lints]
 workspace = true

@@ -12,7 +12,7 @@ M1_RPC=tcp://127.0.0.1:19100
 M1_HTTP=http://127.0.0.1:19180
 
 accept_m1() {
-    check "cargo build --release 成功且零警告" m1_build
+    check "cargo build --release 成功且零警告" build_no_warnings
     check "金样逐字节一致（帧头、握手消息、密钥派生与证明、管理 API 签名、changelog 操作码表）" \
         cargo test --release -p wmfs-core golden
     check "mem 传输插件（独立 crate，只依赖 wmfs-core）的测试通过" cargo test --release -p plugin-mem-transport
@@ -57,21 +57,6 @@ accept_m1() {
     check "/metrics（免认证）有 wmfs_rpc_requests_total；连接层计数器一启动就在（值可以是 0）" m1_metrics
     check "wmfs dev down 停掉全部开发节点" wmfs dev down
     check_json "dev status --json：node1 已停止" '.nodes[0].running == false' wmfs dev status --json
-}
-
-# cargo build；cargo 与 rustc 的警告都打印在 stderr 上，有一行以 warning 开头就算失败。
-m1_build() {
-    local err
-    err="$(mktemp)"
-    cargo build --release --workspace 2>"$err"
-    local rc=$?
-    cat "$err"
-    if grep -q '^warning' "$err"; then
-        echo "有编译警告（见上面）"
-        rc=1
-    fi
-    rm -f "$err"
-    return "$rc"
 }
 
 # m1_expect_error 期望的错误码 命令…：命令必须失败（退出码非 0），且 --json 输出里 .error 是期望的错误码、一次都没成功

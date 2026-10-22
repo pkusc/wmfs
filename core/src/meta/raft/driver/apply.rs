@@ -1,0 +1,192 @@
+//! Driver 的"应用与发布"一侧（design.md 3.4.1.3 的 apply_entries/after_apply/publish_role、3.4.1.5、3.4.1.8、3.7.2）：
+//! 按顺序应用已提交条目、认领在途提议、日志压缩、发布角色与状态、比对集群插件清单。是 `driver.rs` 的子模块，
+//! 可以直接用 Driver 的私有字段。
+
+use protobuf::Message as _;
+use raft::eraftpb::{ConfChangeV2, Entry, EntryType};
+use redb::{Durability, WriteTransaction};
+use wmfs_api::failpoint::fail_point;
+
+use raft::StateRole;
+
+use super::{COMPACT_EVERY, COMPACT_KEEP, Driver, ProposeOutcome};
+use crate::base::log;
+use crate::meta::engine::txn::{EngineStatus, RoleInfo};
+use crate::meta::raft::or_abort;
+use crate::meta::raft::storage::{self, KV};
+use crate::meta::raft::types::lock;
+use crate::meta::schema::keys;
+use crate::meta::schema::raft_state::KEY_APPLIED;
+use crate::meta::schema::records::{KvOp, PluginListV1, WriteBatchV1, decode_v1};
+
+/// 一条已应用的条目：在途提议按 (index, term) 认领它。
+pub(super) struct AppliedEntry {
+    index: u64,
+    term: u64,
+    ok: bool,
+}
+
+impl Driver {
+    /// 在写事务 `tx` 里按顺序应用已提交条目（3.4.1.3），最后写 `applied`（与 KV 同事务）。
+    pub(super) fn apply_entries(&mut self, tx: &WriteTransaction, ents: Vec<Entry>) -> Vec<AppliedEntry> {
+        if ents.is_empty() {
+            return Vec::new();
+        }
+        let _ = fail_point("raft.apply.before");
+        let mut out = Vec::with_capacity(ents.len());
+        for e in ents {
+            let ok = match e.get_entry_type() {
+                // 新 leader 的空条目，或被 raft-rs 改写成空条目的 conf change（坑 P4 的反面、P21）
+                EntryType::EntryNormal if e.data.is_empty() => false,
+                EntryType::EntryNormal => self.apply_batch(tx, &e),
+                EntryType::EntryConfChangeV2 => {
+                    self.apply_conf_change(tx, &e);
+                    true
+                }
+                EntryType::EntryConfChange => {
+                    panic!("wmfs 只提议 ConfChangeV2，日志里出现了 v1 EntryConfChange（index {}，坑 P22）", e.index)
+                }
+            };
+            (self.applied.index, self.applied.term) = (e.index, e.term);
+            out.push(AppliedEntry { index: e.index, term: e.term, ok });
+        }
+        or_abort(storage::put_state(tx, KEY_APPLIED, &self.applied.encode()), "写 applied"); // 与 KV 同事务
+        out
+    }
+
+    /// 一个批次：`expect_version == state_version` 才应用并令 `state_version = index`；不等则整批跳过
+    /// （所有副本看到同样的日志、做同样的判断，所以是确定性的，3.4.1.5）。follower 只做"按顺序应用 ops"，没有业务逻辑。
+    fn apply_batch(&mut self, tx: &WriteTransaction, e: &Entry) -> bool {
+        let wb = WriteBatchV1::decode(&e.data)
+            .unwrap_or_else(|c| panic!("不变量破坏：已提交的 raft 条目 {} 无法解码为 WriteBatchV1（{c}）", e.index));
+        if wb.expect_version != self.applied.state_version {
+            self.metrics.stale.inc();
+            let (want, have) = (wb.expect_version, self.applied.state_version);
+            log::warn("raft", format_args!("批次 {} 作废：expect_version {want} ≠ state_version {have}", e.index));
+            return false;
+        }
+        let plugins_key = keys::global(keys::G_PLUGINS);
+        let mut plugins_changed = None;
+        {
+            let mut kv = or_abort(tx.open_table(KV), "打开 kv");
+            for op in &wb.ops {
+                match op {
+                    KvOp::Put { key, value } => {
+                        or_abort(kv.insert(key.as_slice(), value.as_slice()), "写 kv");
+                        if *key == plugins_key {
+                            plugins_changed = Some(decode_v1::<PluginListV1>(value).ok());
+                        }
+                    }
+                    KvOp::Delete { key } => {
+                        or_abort(kv.remove(key.as_slice()), "删 kv");
+                        if *key == plugins_key {
+                            plugins_changed = Some(None);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(c) = plugins_changed {
+            self.check_plugins(c.as_ref()); // 集群插件清单变了：重新比对（3.7.2）
+        }
+        self.applied.state_version = e.index;
+        true
+    }
+
+    /// conf change：空 data = raft-rs 自动发起的 leave-joint，必须应用（坑 P4）；新的 ConfState 与条目同事务落盘（坑 P5）。
+    fn apply_conf_change(&mut self, tx: &WriteTransaction, e: &Entry) {
+        let mut cc = ConfChangeV2::default();
+        if !e.data.is_empty() {
+            cc.merge_from_bytes(&e.data)
+                .unwrap_or_else(|err| panic!("不变量破坏：conf change {} 损坏：{err}", e.index));
+        }
+        let cs = self
+            .node
+            .apply_conf_change(&cc)
+            .unwrap_or_else(|err| panic!("不变量破坏：已提交的 conf change {} 无法应用：{err}", e.index));
+        or_abort(self.node.mut_store().set_conf_state(tx, &cs), "写 conf_state");
+        log::info(
+            "raft",
+            format_args!("应用成员变更（index {}）：voters {:?}，learners {:?}", e.index, cs.voters, cs.learners),
+        );
+    }
+
+    /// 写事务提交之后：在途提议按 (index, term) 认领已应用的条目——队首 index < 条目 → Lost；相等且 term 相同 →
+    /// Applied{ok}；term 不同 → Lost（条目被新 leader 覆盖）。
+    pub(super) fn after_apply(&mut self, applied: &[AppliedEntry]) {
+        for a in applied {
+            while self.pending.front().is_some_and(|p| p.index <= a.index) {
+                let Some(p) = self.pending.pop_front() else { break };
+                let ok = p.index == a.index && p.term == a.term;
+                let _ = p.done.send(if ok { ProposeOutcome::Applied { ok: a.ok } } else { ProposeOutcome::Lost });
+            }
+        }
+        // M4 起：写入了 changelog（0x0E）就唤醒长轮询等待者；写入了影响集群图的键就让集群图缓存失效
+    }
+
+    /// 日志压缩（3.4.1.8，3.2.6 的写入规则 M3）：每应用 10 000 条检查一次，压缩点 C = durable_applied − 10 000（给慢 follower 留余量）。
+    /// 因为落盘的 hs.commit ≥ 落盘的 applied ≥ C，重启时 raft-rs 的 `hs.commit ≥ first_index − 1` 检查恒成立（坑 P8）。
+    /// 单独一个 None 事务：崩溃时丢了它也无妨（日志里只是多留了一些条目）。
+    pub(super) fn maybe_compact(&mut self) {
+        if self.applied.index < self.next_compact {
+            return;
+        }
+        self.next_compact = self.applied.index + COMPACT_EVERY;
+        let upto = self.durable_applied.saturating_sub(COMPACT_KEEP);
+        if upto <= self.node.store().snap_index() {
+            return;
+        }
+        let mut tx = or_abort(self.db.begin_write(), "begin_write");
+        or_abort(self.node.mut_store().compact(&tx, upto), "压缩日志");
+        tx.set_durability(Durability::None);
+        or_abort(tx.commit(), "提交");
+        self.note_commit(false);
+        log::info("raft", format_args!("日志压缩到 {upto}（applied {}）", self.applied.index));
+    }
+
+    /// 发布角色（`RoleInfo`，ready 见 3.4.1.4 规则 3）与状态（`EngineStatus`）并更新 raft 指标：其他线程只读这份快照，
+    /// 绝不碰 RawNode（3.4.1.3 的 publish_role）。
+    pub(super) fn publish(&mut self) {
+        let r = &self.node.raft;
+        let leader = r.state == StateRole::Leader;
+        let role = RoleInfo { role: r.state, term: r.term, leader_id: r.leader_id as u32, ready: self.is_ready() };
+        let cs = r.prs().conf().to_conf_state();
+        let ids = |v: &[u64]| v.iter().map(|x| *x as u32).collect::<Vec<u32>>();
+        let progress = if leader { r.prs().iter().map(|(id, p)| (*id as u32, p.matched)).collect() } else { vec![] };
+        let commit = r.raft_log.committed;
+        let status = EngineStatus {
+            applied: self.applied.index,
+            commit,
+            voters: ids(&cs.voters),
+            learners: ids(&cs.learners),
+            progress,
+        };
+        self.metrics.term.set(r.term as f64);
+        self.metrics.leader.set(if leader { 1.0 } else { 0.0 });
+        self.metrics.commit.set(commit as f64);
+        self.metrics.applied.set(self.applied.index as f64);
+        *lock(&self.published.role) = role;
+        *lock(&self.published.status) = status;
+    }
+
+    /// 已提交的 GLOBAL plugins 与本节点的清单比对（3.7.2）。不一致 → 不就绪（执行器不建批次、读闸门不发 ReadIndex），
+    /// 写一条错误日志列出差异。实现注记（M3）：M8 起不一致时进程退出（退出码 3）。
+    pub(super) fn check_plugins(&mut self, committed: Option<&PluginListV1>) {
+        self.plugins_ok = committed == Some(&self.plugins);
+        if self.plugins_ok {
+            return;
+        }
+        let Some(theirs) = committed else {
+            log::error("raft", "已应用的状态里没有 GLOBAL plugins（集群插件清单）——不当就绪 leader（3.7.2）");
+            return;
+        };
+        let missing: Vec<&String> = theirs.plugins.iter().filter(|p| !self.plugins.plugins.contains(p)).collect();
+        let extra: Vec<&String> = self.plugins.plugins.iter().filter(|p| !theirs.plugins.contains(p)).collect();
+        log::error(
+            "raft",
+            format_args!(
+                "本节点的插件集合与集群插件清单不一致：缺少 {missing:?}，多出 {extra:?}——不当就绪 leader（3.7.2）"
+            ),
+        );
+    }
+}

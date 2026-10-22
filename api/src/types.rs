@@ -30,9 +30,11 @@ pub struct Health {
     pub version: String,    // 与 `wmfs --version` 相同，例如 "0.1.0 (proto 1, core-abi 1, c-abi 1)"
     pub cluster_id: String, // 32 位小写 hex
     pub node: NodeAddrs,
-    pub meta_role: String, // 元数据角色："none"（M1 还没有元数据）、"leader"、"follower"、"learner"
+    // 元数据角色："none"（M1 还没有元数据）；M3 起："leader"（**就绪**的 leader：已当选、本任期的空条目已应用、插件清单一致，
+    // 可以服务请求）、"candidate"（正在选举，或已当选但还没就绪）、"follower"、"learner"（7.1 的 M3 注记）
+    pub meta_role: String,
     pub leader: Option<NodeAddrs>, // 元数据 leader 的地址（M3 起；不知道时为 null）
-    pub audit_lag: Option<u64>, // 审计消费者落后的 changelog 条数（M12 起；没有审计消费者时为 null）
+    pub audit_lag: Option<u64>,    // 审计消费者落后的 changelog 条数（M12 起；没有审计消费者时为 null）
 }
 
 /// 一个 fail point：`POST /api/v1/failpoints` 的请求，也是列表里的一项（3.11）。

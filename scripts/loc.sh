@@ -44,8 +44,11 @@ LIMIT=36000
 # examples/plugin-mem-transport 180 → 195（已写完：加了帧上限与收帧计时）。
 # M2：rdma 实际约 1,490 行（估算 920），plugins 4810 → 5380。人类于 2026-10-21 把上限从 30,000 放宽到 36,000、功能不砍，
 # 所以不动用"简化储备"（design.md 2.2 的 M2 注记）。
-MODULES="wmfs-api:900 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1120 core/hooks:1060
-core/meta/raft:1570 core/meta/engine:720 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
+# M3（design.md 2.2 的 M3 注记）：core/net 1120 → 1180（单飞建连约 +65：审查后补了"拿着登记表的锁再查一次连接表"与
+# 建连线程 panic 时的收尾；余下 leader_hint、OneWay 服务、call_cb 后台建连约 60）、
+# core/meta/engine 720 → 760（已写约 660：执行器、覆盖层、读闸门、引擎、去重；余下 M4 的 changelog 接入、M8 的 leader 提示约 100）。
+MODULES="wmfs-api:900 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1180 core/hooks:1060
+core/meta/raft:1570 core/meta/engine:760 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
 core/data:3000 core/client:1800 core/bg:850 core/mgmt:790 core:540 plugins:5380 cli:2950 dashboard:880
 examples/plugin-mem-transport:195"
 
@@ -59,6 +62,7 @@ module_of() {
             echo "core/meta/${r%%/*}"
             ;;
         core/src/meta/*) echo "core/meta" ;;
+        core/src/init/*) echo "core" ;; # init.rs 的子模块（init/initial_kv.rs）与 init.rs、server.rs 同属"core"（design.md 2.2）
         core/src/*/*)
             local r="${1#core/src/}"
             echo "core/${r%%/*}"

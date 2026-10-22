@@ -173,6 +173,7 @@ wmfs debug kv bench --n 100000                      # 预期：约 10–20 秒�
 wmfs dev kill 1 && wmfs dev start 1 && wmfs dev wait leader   # kill -9 后重新启动，等它重新当上 leader
 wmfs debug kv get hello                             # 预期：仍是 world
 curl --noproxy '*' -s 127.0.0.1:19180/metrics | grep -E 'wmfs_raft_applied_index|wmfs_meta_batch_stale_total'
+wmfs dev down
 scripts/accept.sh M3
 ```
 

@@ -19,7 +19,7 @@ M2_NO_DEVICE="本机按决定不做 RDMA 实机测试"
 
 accept_m2() {
     check "cargo build --release 成功且零警告（rdma 在默认 feature 里；第三方依赖的「将来不兼容」提示由 .cargo/config.toml 关掉）" \
-        m2_build
+        build_no_warnings
     check "不需要设备的 rdma 单元测试至少 $M2_MIN_UNIT_TESTS 个（cargo test … rdma -- --list）" m2_unit_tests_present
     check "cargo test --release -p wmfs-plugins --features rdma rdma：描述符表、信用控制、RdmaSetup 金样、握手前禁止单边操作、收帧状态机、120 KiB 上限、接收槽校验、C-10 的 QP 属性、选 GID、推迟注册、拆除顺序、假网卡上的整套 RPC" \
         cargo test --release -p wmfs-plugins --features rdma rdma
@@ -30,9 +30,9 @@ accept_m2() {
     check "断开重连（tcp 与 mem）：fail point 让一次发送失败 = 连接作废，重连重试后成功" \
         cargo test --release -p wmfs-testkit --test reconnect
     check "断开重连（rdma，假网卡上的 core 全套）：fail point plugin.rdma.transport 让一次发送失败 = 连接作废，重连建出新 QP 后成功" \
-        m2_one_test rdma::tests::stack::rdma_stack_failpoint_breaks_the_connection_and_retry_reconnects
+        one_test --release -p wmfs-plugins --features rdma rdma::tests::stack::rdma_stack_failpoint_breaks_the_connection_and_retry_reconnects
     check "需要设备的 rdma 组件测试都标了 #[ignore]（正好这 6 个）" m2_device_tests_ignored
-    check "core/ 自 m2-base 以来零改动（git diff，另查未跟踪的新文件：git diff 看不到它们）" m2_core_untouched
+    check "M2 没有改动 core/（git diff m2-base..m2；还没打 tag m2 时比较工作区并另查未跟踪的新文件）" m2_core_untouched
     check "core/src 里除注释外搜不到 rdma（roadmap 的命令）" m2_core_no_rdma
     check "编码约定（scripts/ci.sh rules；其中 core/src 的 rdma 检查更严：先去掉每行 // 之后的注释再找）" scripts/ci.sh rules
     check_json "wmfs doctor --json 的 RDMA 一项：没有可用设备时 ! 且写明「本机不做 RDMA 实机测试」，有设备时 ✓" \
@@ -80,29 +80,6 @@ m2_device_checks() {
     check "需要设备的 rdma 组件测试" cargo test --release -p wmfs-testkit --test net_rpc --test reconnect -- --ignored
 }
 
-# cargo build；cargo 与 rustc 的警告都打印在 stderr 上，有一行以 warning 开头就算失败。
-m2_build() {
-    local err rc
-    err="$(mktemp)"
-    cargo build --release --workspace 2>"$err"
-    rc=$?
-    cat "$err"
-    if grep -q '^warning' "$err"; then
-        echo "有编译警告（见上面）"
-        rc=1
-    fi
-    rm -f "$err"
-    return "$rc"
-}
-
-# 按完整名字只跑一个 rdma 单元测试，并确认它真的跑了（名字写错时 cargo 也退出 0）。
-m2_one_test() {
-    local out
-    out="$(cargo test --release -p wmfs-plugins --features rdma "$1" -- --exact 2>&1)"
-    printf '%s\n' "$out"
-    printf '%s' "$out" | grep -q 'test result: ok. 1 passed'
-}
-
 m2_unit_tests_present() {
     local n
     n=$(cargo test --release -p wmfs-plugins --features rdma rdma -- --list 2>/dev/null | grep -c ': test$')
@@ -121,12 +98,19 @@ m2_device_tests_ignored() {
     [ "$got" = "$want" ]
 }
 
-# git diff 看不到未跟踪的新文件（cargo 会自动编译 core/tests/*.rs、core/build.rs 这类新文件），所以另外查一遍。
+# M2 自己的改动里 core/ 零改动（design.md 2.1："git diff --stat m2-base..m2 -- core/ 为空"）。打了 tag m2 之后比较两个 tag：
+# M3 起 core/ 又可以改了，回归（accept.sh all）不能因为后面里程碑的改动而失败。还没有 tag m2（M2 正在做）时比较工作区，
+# 并另查未跟踪的新文件（git diff 看不到它们，而 cargo 会自动编译 core/tests/*.rs、core/build.rs 这类新文件）。
 m2_core_untouched() {
     git rev-parse -q --verify m2-base >/dev/null || {
         echo "没有 tag m2-base"
         return 1
     }
+    if git rev-parse -q --verify m2 >/dev/null; then
+        git diff --stat m2-base m2 -- core/
+        git diff --quiet m2-base m2 -- core/ && echo "M2（m2-base..m2）没有改动 core/"
+        return
+    fi
     git diff --stat m2-base -- core/
     if git diff --quiet m2-base -- core/ && [ -z "$(git ls-files --others --exclude-standard -- core/)" ]; then
         echo "core/ 没有任何改动"

@@ -67,6 +67,12 @@ pub struct PingBody {
 
 // ---- 密钥派生与证明（3.3.2）----
 
+/// key 0 固定是服务端之间用的（角色 Server，不在 KEYMETA 里）。
+pub const SERVER_KEY: u32 = 0;
+/// init 生成的两把 key（3.2.7：key 1 = admin，key 2 = 默认 client）。
+pub const ADMIN_KEY: u32 = 1;
+pub const CLIENT_KEY: u32 = 2;
+
 /// HMAC-SHA256(key, parts 依次拼接)。
 pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     mac(key, parts).finalize().into_bytes().into()

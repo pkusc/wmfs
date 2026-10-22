@@ -1,9 +1,11 @@
 //! wmfs：唯一的二进制（design.md 1.1、7.2，ADR-0006）。
 //!
-//! M1 的子命令：`doctor`、`init`（只生成目录、密钥与 node.toml）、`server`、`ping`、`failpoint set/clear/list`、
-//! `dev up/down/env/status/kill/start/logs`（基础版）、`debug gen-key`。其余子命令随里程碑加入。
+//! M1 的子命令：`doctor`、`init`、`server`、`ping`、`failpoint set/clear/list`、`dev up/down/env/status/kill/start/logs`
+//! （基础版）、`debug gen-key`；M3 加了 `dev wait`（leader）与 `debug kv put/get/bench`，`init` 写元数据的初始状态。
+//! 其余子命令随里程碑加入。
 //! 插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
+mod debug;
 mod dev;
 mod doctor;
 mod failpoint;
@@ -37,7 +39,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// 初始化一个新的单节点集群（M1：只生成目录、密钥与 node.toml），然后在前台运行它
+    /// 初始化一个新的单节点集群（目录、密钥、node.toml、元数据的初始状态），然后在前台运行它
     Init(node::InitArgs),
     /// 在前台运行一个已初始化的节点（SIGTERM / Ctrl-C 退出）
     Server {
@@ -75,6 +77,11 @@ enum DebugCmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// 读写元数据 KV 的调试键空间（服务端要开 debug_ops，只接受 admin key）
+    Kv {
+        #[command(subcommand)]
+        cmd: debug::KvCmd,
+    },
 }
 
 fn main() {
@@ -92,6 +99,7 @@ fn main() {
         Cmd::Failpoint { cmd } => failpoint::run(cmd),
         Cmd::Dev { cmd, dir } => dev::run(cmd, dir),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
+        Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),
     };
     std::process::exit(code);
 }

@@ -1,7 +1,7 @@
 //! 管理 API 的 HTTP 服务（design.md 7.1）：tiny_http 监听、4 个处理线程 `mgmt-http-<i>`、路由与端点。
 //!
-//! M1 的端点：`GET /metrics`（免认证）、`GET /api/v1/health`（免认证，带本节点地址）、`/api/v1/failpoints`
-//! （仅 node.toml 里 `failpoints_api = true` 时存在：`GET` 列出（任一已认证 key）、`POST {name, action}` 设置、
+//! M1 的端点：`GET /metrics`（免认证）、`GET /api/v1/health`（免认证，带本节点地址；M3 起带元数据角色与 leader 地址）、
+//! `/api/v1/failpoints`（仅 node.toml 里 `failpoints_api = true` 时存在：`GET` 列出（任一已认证 key）、`POST {name, action}` 设置、
 //! `DELETE ?name=` 清除（写需要 admin；清除没设置过的名字回 404））。实现注记（M1）：规格只写了 POST 与 DELETE，
 //! `wmfs failpoint list` 另需要 `GET /api/v1/failpoints`；三个都回本节点当前的全部 fail point（`FailpointList`）。
 //!
@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use wmfs_api::failpoint;
 use wmfs_api::metrics;
-use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health};
+use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health, NodeAddrs};
 
 use crate::base::{ErrCode, log};
 use crate::hooks::traits::KeyLookup;
@@ -25,9 +25,13 @@ use crate::mgmt::auth;
 const MAX_BODY: usize = 1 << 20;
 const THREADS: usize = 4;
 
+/// health 里随时变化的部分：本节点的元数据角色与 leader 的地址（M3 起由元数据引擎给出）。
+pub type RoleFn = Arc<dyn Fn() -> (String, Option<NodeAddrs>) + Send + Sync>;
+
 /// 各端点要用的本节点信息。
 pub struct MgmtCtx {
-    pub health: Health,
+    pub health: Health, // 不变的部分（版本、cluster_id、本节点地址）
+    pub role: Option<RoleFn>,
     pub keys: Arc<dyn KeyLookup + Send + Sync>,
     pub failpoints_api: bool,
 }
@@ -112,7 +116,13 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
             metrics::render_prometheus(&mut s);
             Reply { status: 200, content_type: "text/plain; version=0.0.4", body: s.into_bytes() }
         }
-        ("GET", "/api/v1/health") => json(200, &ctx.health),
+        ("GET", "/api/v1/health") => {
+            let mut h = ctx.health.clone();
+            if let Some(f) = &ctx.role {
+                (h.meta_role, h.leader) = f();
+            }
+            json(200, &h)
+        }
         (_, "/api/v1/failpoints") => failpoints(ctx, method, url, auth, body),
         _ => err(404, "enoent", format!("没有这个接口：{method} {path}")),
     }
@@ -187,7 +197,8 @@ mod tests {
             node: wmfs_api::types::NodeAddrs { node_id: 7, ..Default::default() },
             ..Default::default()
         };
-        m.start(Arc::new(MgmtCtx { health, keys: Arc::new(InitKeys::new(MASTER, 0)), failpoints_api })).unwrap();
+        let keys = Arc::new(InitKeys::new(MASTER, 0));
+        m.start(Arc::new(MgmtCtx { health, role: None, keys, failpoints_api })).unwrap();
         addr
     }
 

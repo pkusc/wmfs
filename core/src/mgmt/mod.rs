@@ -9,4 +9,4 @@
 pub mod auth;
 pub mod http;
 
-pub use http::{MgmtCtx, MgmtServer};
+pub use http::{MgmtCtx, MgmtServer, RoleFn};

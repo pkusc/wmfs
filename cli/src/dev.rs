@@ -7,6 +7,7 @@
 //! 节点在自己的进程组里后台运行（终端里按 Ctrl-C 不会带走它），stdout/stderr 追加到 `<节点>/logs/server.log`。
 //! 安全：只对 pid 文件里、且命令行确实是"wmfs server --data-dir <这个节点>"的进程发信号；`down --purge` 只删除
 //! 默认的 `~/wmfs-dev` 或带 `.wmfs-dev` 标记的目录。实现注记（M1）：多节点要 `wmfs join`（M8），所以 M1 的 `up` 只支持 `--nodes 1`。
+//! M3：开发节点打开 `debug_ops`（`wmfs debug kv`）；`wmfs dev wait <条件>`（[`wait`]，M3 只有 leader）。
 
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
@@ -23,6 +24,8 @@ use wmfs_core::init::{InitOpts, NodeFile, init_node};
 use wmfs_mgr::api::ApiClient;
 
 use crate::{fail, home, out};
+
+mod wait;
 
 #[derive(clap::Subcommand)]
 pub enum DevCmd {
@@ -53,6 +56,15 @@ pub enum DevCmd {
     Start { n: u32 },
     /// 打印第 n 个节点的日志
     Logs { n: u32 },
+    /// 等某个条件成立（满足立即返回 0；超时返回 1 并打印当前状态）。M3 只有 leader（有就绪的元数据 leader）
+    Wait {
+        /// 条件（及其参数），例如 leader
+        #[arg(required = true, num_args = 1..)]
+        what: Vec<String>,
+        /// 最多等多少秒
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
 }
 
 const MARKER: &str = ".wmfs-dev";
@@ -78,6 +90,7 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
         DevCmd::Logs { n } => std::fs::read_to_string(log_path(&d, n))
             .map(|t| vec![t])
             .map_err(|e| format!("读 {} 失败：{e}", log_path(&d, n).display())),
+        DevCmd::Wait { what, timeout } => wait::wait(&d, &what, timeout),
     };
     match r {
         Ok(lines) => out(lines.iter().map(|l| l.trim_end_matches('\n')).collect::<Vec<_>>().join("\n")),
@@ -151,6 +164,7 @@ fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>) -> Result<Vec<String>, Strin
         if !nd.join("NODE").exists() {
             let (rpc_port, mgmt_port) = ports(n);
             let host_id = Some(format!("host-{n}"));
+            let plugins = crate::registry::init_plugin_list()?;
             let o = InitOpts {
                 data_dir: nd,
                 addr: "127.0.0.1".into(),
@@ -158,7 +172,9 @@ fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>) -> Result<Vec<String>, Strin
                 mgmt_port,
                 mem: PoolConfig::dev_server(),
                 failpoints_api: true,
+                debug_ops: true, // wmfs debug kv（M3 演示）
                 host_id,
+                plugins,
             };
             init_node(&o)?;
         }
@@ -358,36 +374,4 @@ fn status(d: &Path, json: bool) -> Result<Vec<String>, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dev_ports_follow_the_19n00_scheme() {
-        assert_eq!(super::ports(1), (19100, 19180));
-        assert_eq!(super::ports(3), (19300, 19380));
-    }
-
-    #[test]
-    fn up_rdma_is_declarative() {
-        let nd = std::env::temp_dir().join(format!("wmfs-dev-rdma-{}-{}", std::process::id(), clock::mono_ms()));
-        std::fs::create_dir_all(&nd).unwrap();
-        let cfg = NodeConfig { mem: PoolConfig::dev_server(), ..NodeConfig::default() };
-        std::fs::write(nd.join("node.toml"), cfg.to_toml()).unwrap();
-        let read = || NodeConfig::parse(&std::fs::read_to_string(nd.join("node.toml")).unwrap()).unwrap();
-        let ip = Some("10.77.0.1".parse().unwrap());
-        assert!(set_rdma(&nd, 2, ip).unwrap(), "--rdma：改写了 node.toml");
-        let got = read();
-        let r = got.plugin_cfg("rdma");
-        assert_eq!(r.get("listen").and_then(|v| v.as_str()), Some("10.77.0.1:19201"), "引导端口 19n01");
-        assert_eq!(r.get("max_qps").and_then(|v| v.as_integer()), Some(32), "dev 的 S 档只够 32 个 QP");
-        assert_eq!((got.net.control_scheme.as_str(), got.net.data_scheme.as_str()), ("tcp", "rdma"));
-        crate::registry::build_plugins(&got).unwrap(); // 插件按它的 config_schema 认这些键
-        assert!(!set_rdma(&nd, 2, ip).unwrap(), "同样的参数再 up 一次：不变");
-        assert!(set_rdma(&nd, 2, None).unwrap(), "不带 --rdma：改回只用 tcp");
-        let got = read();
-        assert!(!got.plugin.contains_key("rdma") && got.net.data_scheme == "tcp", "{got:?}");
-        assert_eq!(got, cfg, "与初始化时的 node.toml 一样");
-        assert!(!set_rdma(&nd, 2, None).unwrap());
-        std::fs::remove_dir_all(&nd).unwrap();
-    }
-}
+mod tests;

@@ -819,6 +819,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "2.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d64e07496d293ad8ed401c4d193d5b9f0f97671fbd5bf21d691a0c7d2c53dc8"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1273,7 +1282,9 @@ dependencies = [
  "hmac",
  "libc",
  "postcard",
+ "protobuf",
  "raft",
+ "redb",
  "serde",
  "serde_json",
  "sha2",
@@ -1311,7 +1322,11 @@ name = "wmfs-testkit"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "crossbeam-channel",
  "plugin-mem-transport",
+ "protobuf",
+ "raft",
+ "redb",
  "wmfs-core",
  "wmfs-plugins",
 ]

@@ -1,7 +1,7 @@
 //! RpcClient 的连接管理（design.md 3.12、3.3.8）：建连与握手、每条连接的读线程（按 req_id 把回复交给等待者）、
 //! 连接断开时结束它上面的在途调用，以及 `rpc-timer` 线程。是 `client.rs` 的子模块，可以直接用 RpcClient 的私有字段。
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
 use crossbeam_channel::{Sender, bounded};
@@ -13,13 +13,89 @@ use crate::net::conn::{self, ConnHandle, ConnOpts, OnUnsent, recv_checked};
 use crate::net::handshake::{self, ClientSide};
 use crate::proto::frame::{FLAG_LAST_CHUNK, FrameKind, InFrame};
 
+/// 一次正在进行的建连（单飞）：建连的线程做完把结果放进 `result` 并唤醒等待者。
+#[derive(Default)]
+pub(super) struct Dial {
+    result: Mutex<Option<Result<ConnHandle, ErrCode>>>,
+    cv: Condvar,
+}
+
+impl Dial {
+    /// 建连的线程交出结果并唤醒全部等待者（只有第一次交出的算数）。
+    fn publish(&self, r: Result<ConnHandle, ErrCode>) {
+        let mut g = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(r);
+        }
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// 等建连的线程给出结果，最多等到 `deadline`（超时 `ETIMEDOUT`）。
+    fn wait(&self, deadline: u64) -> Result<ConnHandle, ErrCode> {
+        let left = Duration::from_millis(deadline.saturating_sub(clock::mono_ms()));
+        let g = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        let (g, _) = self.cv.wait_timeout_while(g, left, |r| r.is_none()).unwrap_or_else(|e| e.into_inner());
+        g.clone().unwrap_or(Err(ErrCode::ETIMEDOUT))
+    }
+}
+
+/// 建连的线程离开 `connection` 时（正常返回，或传输插件 panic 时的栈展开）一定交出结果、摘掉 dialing 里的项：
+/// 否则之后到这个对端的调用都会白等到各自的期限。正常路径上结果已经交出过，这里的 `ECONNRESET` 不起作用。
+struct DialGuard<'a> {
+    rpc: &'a RpcClient,
+    key: &'a (String, String),
+    dial: Arc<Dial>,
+}
+
+impl Drop for DialGuard<'_> {
+    fn drop(&mut self) {
+        self.dial.publish(Err(ErrCode::ECONNRESET));
+        self.rpc.dialing().remove(self.key);
+    }
+}
+
 impl RpcClient {
     /// 取（必要时新建）到 `scheme://addr` 的连接；建连与握手在 `deadline` 之前完成。
+    /// 建连按 `(scheme, 地址)` 单飞（ADR-0031 第 11 条）：同一对端同时只有一个线程建连，其余线程等它的结果——成功就共享
+    /// 这条连接；失败就都拿到同一个错误（之后各自按 3.3.8 重试）。等待也以各自的 `deadline` 为限（超时 `ETIMEDOUT`）。
     pub(super) fn connection(&self, scheme: &str, addr: &str, deadline: u64) -> Result<ConnHandle, ErrCode> {
         let key = (scheme.to_string(), addr.to_string());
-        if let Some(h) = self.conns().get(&key).filter(|h| !h.is_closed()) {
-            return Ok(h.clone());
+        if let Some(h) = self.live_conn(&key) {
+            return Ok(h);
         }
+        let (dial, mine) = {
+            let mut m = self.dialing();
+            // 拿着 dialing 锁再查一次连接表：建连的线程先登记连接、再交出结果、最后才摘掉 dialing 里的项，所以这里两边都
+            // 查不到 = 确实没人在建（第一次查完之后别人恰好建好的连接在这里查得到）。加锁顺序只有 dialing → conns 一种。
+            if let Some(h) = self.live_conn(&key) {
+                return Ok(h);
+            }
+            match m.get(&key) {
+                Some(d) => (d.clone(), false),
+                None => {
+                    let d = Arc::new(Dial::default());
+                    m.insert(key.clone(), d.clone());
+                    (d, true)
+                }
+            }
+        }; // dialing 锁在这里放开：等待别人的结果时不拿着它
+        if !mine {
+            return dial.wait(deadline); // 别人在建：等它的结果
+        }
+        let guard = DialGuard { rpc: self, key: &key, dial };
+        let r = self.dial(scheme, addr, &key, deadline);
+        guard.dial.publish(r.clone());
+        r // guard 在这里被丢弃：摘掉 dialing 里的项
+    }
+
+    /// 连接表里到 `key` 的、还没断的连接。
+    fn live_conn(&self, key: &(String, String)) -> Option<ConnHandle> {
+        self.conns().get(key).filter(|h| !h.is_closed()).cloned()
+    }
+
+    /// 真正建连：传输插件 `connect` → 起读/写线程 → 等读线程完成握手 → 登记进连接表。
+    fn dial(&self, scheme: &str, addr: &str, key: &(String, String), deadline: u64) -> Result<ConnHandle, ErrCode> {
         let Some((t, hook)) = self.transports.iter().find(|(t, _)| t.scheme() == scheme) else {
             log::warn("rpc", format_args!("本进程没有 {scheme} 传输插件，连不了 {scheme}://{addr}"));
             return Err(ErrCode::FEATURE_UNSUPPORTED);
@@ -49,12 +125,14 @@ impl RpcClient {
             h.close();
             return Err(e);
         }
+        // 单飞 + 拿着 dialing 锁再查一次（见 connection）保证同一对端只有一个线程建连；下面是第二道保险：
+        // 表里已经有一条还没断的连接，就关掉自己这条、用先登记的那条（不让任何一条连接从表里消失却不被关闭）
         let mut conns = self.conns();
-        if let Some(o) = conns.get(&key).filter(|o| !o.is_closed()) {
-            h.close(); // 两个线程同时建连：用先登记的那条
+        if let Some(o) = conns.get(key).filter(|o| !o.is_closed()) {
+            h.close();
             return Ok(o.clone());
         }
-        conns.insert(key, h.clone());
+        conns.insert(key.clone(), h.clone());
         Ok(h)
     }
 

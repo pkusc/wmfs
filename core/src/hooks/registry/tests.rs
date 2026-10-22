@@ -152,3 +152,18 @@ listen = { type = "addr", default = "0.0.0.0:9300", doc = "监听地址" }
     assert!(check_manifest_toml(m, &text.replace("0.0.0.0", "1.1.1.1")).is_err(), "配置默认值不一致");
     assert!(check_manifest_toml(m, &format!("{text}\nextra = 1")).is_err(), "多出的字段");
 }
+
+#[test]
+fn meta_engine_is_a_unique_hook_outside_the_cluster_list() {
+    use crate::meta::engine::engine::MANIFEST as KV;
+    let mut s = PluginSet::new(&[]);
+    s.meta_engine(&KV);
+    s.validate(&no_cfg()).unwrap();
+    assert_eq!(s.meta_engine_manifest().map(|m| m.name), Some("embedded-kv"));
+    assert!(s.plugin_list().plugins.is_empty(), "meta_engine 不进集群插件清单（3.7.2 第 1 条）");
+    s.meta_engine(&KV);
+    assert!(s.validate(&no_cfg()).is_err(), "唯一型钩子：最多一个");
+    let mut d = PluginSet::new(&["embedded-kv".into()]);
+    d.meta_engine(&KV);
+    assert!(d.meta_engine_manifest().is_none(), "node.toml 禁用了它：服务端装配时会拒绝启动");
+}
