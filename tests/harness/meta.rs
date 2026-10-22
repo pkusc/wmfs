@@ -25,8 +25,10 @@ use wmfs_core::meta::raft::driver::{Driver, DriverOpts, ProposeOutcome, RaftInpu
 use wmfs_core::meta::raft::storage::{self, KV, RAFT_STATE, read_applied};
 use wmfs_core::meta::schema::keys;
 use wmfs_core::meta::schema::raft_state::{Applied, KEY_HARD_STATE, KEY_SNAP_META, SnapMeta};
-use wmfs_core::meta::schema::records::{KvOp, PluginListV1, WriteBatchV1};
+use wmfs_core::meta::schema::records::{KvOp, PluginListV1, TargetRecV1, WriteBatchV1};
 use wmfs_core::proto::meta::MetaReply;
+use wmfs_plugins::label_match::LabelMatch;
+use wmfs_plugins::posix_mode::PosixMode;
 
 use super::mem_crash::MemCrashBackend;
 
@@ -47,7 +49,26 @@ pub fn sample_init() -> InitialKv {
         machine_id: "0123456789abcdef0123456789abcdef".into(),
         hostname: "spark".into(),
         plugins: plugins(),
+        targets: vec![TargetRecV1 {
+            node: 1,
+            path: "/data/wmfs/targets/1".into(),
+            labels: vec!["nvme".into()],
+            phys_devs: vec![],
+            capacity: 20 << 30,
+            boot_id: 0,
+            state: 1,
+            last_up_ms: 1_792_454_400_123,
+            read_only: false,
+        }],
     }
+}
+
+/// 命名空间测试用的管线：posix-mode（authz）+ label-match（placement），与 `wmfs server` 默认装的一样。
+pub fn ns_pipeline() -> Pipeline {
+    let mut set = PluginSet::new(&[]);
+    set.authz(Arc::new(PosixMode::new()));
+    set.placement(Arc::new(LabelMatch::new()));
+    Pipeline::new(set)
 }
 
 /// 测试里只留 WARN 及以上的日志（没设 `WMFS_LOG` 时）。
@@ -229,7 +250,7 @@ pub fn engine(b: &MemCrashBackend, plugins: PluginListV1) -> Arc<EmbeddedEngine>
 pub fn start_engine(b: &MemCrashBackend, plugins: PluginListV1) -> Arc<EmbeddedEngine> {
     quiet_logs();
     let db = Database::builder().create_with_backend(b.clone()).expect("在内存后端上打开 redb");
-    let pipeline = Arc::new(Pipeline::new(PluginSet::new(&[])));
+    let pipeline = Arc::new(ns_pipeline());
     EmbeddedEngine::start(db, EngineOpts { node_id: 1, plugins, pipeline }).expect("启动元数据引擎")
 }
 

@@ -1,14 +1,16 @@
 //! wmfs：唯一的二进制（design.md 1.1、7.2，ADR-0006）。
 //!
 //! M1 的子命令：`doctor`、`init`、`server`、`ping`、`failpoint set/clear/list`、`dev up/down/env/status/kill/start/logs`
-//! （基础版）、`debug gen-key`；M3 加了 `dev wait`（leader）与 `debug kv put/get/bench`，`init` 写元数据的初始状态。
-//! 其余子命令随里程碑加入。
+//! （基础版）、`debug gen-key`；M3 加了 `dev wait`（leader）与 `debug kv put/get/bench`，`init` 写元数据的初始状态；
+//! M4 加了 `fs`（元数据命令与 `--as-uid`）、`init --target`。其余子命令随里程碑加入。
 //! 插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod debug;
 mod dev;
 mod doctor;
 mod failpoint;
+mod fs;
+mod leader;
 mod node;
 mod ping;
 mod registry;
@@ -62,6 +64,8 @@ enum Cmd {
         #[arg(long, global = true)]
         dir: Option<PathBuf>,
     },
+    /// 不经 FUSE 的调试客户端：直接发元数据请求（ls、stat、mkdir、rmdir、rm、mv、ln、touch）
+    Fs(fs::FsArgs),
     /// 调试工具
     Debug {
         #[command(subcommand)]
@@ -98,6 +102,7 @@ fn main() {
         Cmd::Ping(a) => ping::run(a),
         Cmd::Failpoint { cmd } => failpoint::run(cmd),
         Cmd::Dev { cmd, dir } => dev::run(cmd, dir),
+        Cmd::Fs(a) => fs::run(a),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),
     };
@@ -186,7 +191,7 @@ mod tests {
     #[test]
     fn registry_builds_the_default_plugin_set() {
         let s = super::registry::build_plugins(&Default::default()).unwrap();
-        assert_eq!(s.plugin_list().plugins, vec!["authn:shared-key"]);
+        assert_eq!(s.plugin_list().plugins, vec!["authn:shared-key", "authz:posix-mode", "placement:label-match"]);
         let t = super::registry::client_transports().unwrap();
         assert_eq!(
             t.iter().map(|t| t.scheme()).collect::<Vec<_>>(),

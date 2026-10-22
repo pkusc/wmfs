@@ -5,6 +5,8 @@
 //! 边取边执行（`fill`）：每执行完一个请求就看一次结束条件——独占操作 / 刚生成了新链 / 256 个 / 写集 ≥ 768 KiB——
 //! 到了就不再从队列取，没取的请求留给下一批。回复在批次有了确定结果之后才发出（规则 2，`settle`）：`Applied{ok: true}` →
 //! 各自的结果；批次作废或没进日志 → `RETRY`（客户端用同一个 seq 重试）；结果不确定 → `NOT_LEADER`（去重表兜底）。
+//! 每个批次开始时从批次的读事务里取一份集群图快照（`OpCtx.map`，按 map_epoch 缓存）：placement 读它，所以生成了新链的
+//! 操作之后本批结束（规则 5），下一批的快照里就有新链。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,7 +18,7 @@ use wmfs_api::failpoint::fail_point;
 use super::dedup;
 use super::engine::{EngineShared, OpEnv};
 use super::txn::{TxnOp, TxnRequest};
-use super::view::BatchView;
+use super::view::{BatchView, ReadView};
 use crate::base::ErrCode;
 use crate::base::types::ReqCtx;
 use crate::meta::raft::driver::ProposeOutcome;
@@ -24,6 +26,7 @@ use crate::meta::raft::{or_abort, storage};
 use crate::meta::schema::records::WriteBatchV1;
 use crate::meta::sessions;
 use crate::proto::meta::{DEDUP_WINDOW, MetaReply};
+use crate::proto::peer::ClusterMap;
 
 /// 批次上限（3.4.1.4）：≤ 256 个操作；写集编码字节数一旦 ≥ 768 KiB 就结束本批。
 const MAX_BATCH_OPS: usize = 256;
@@ -52,8 +55,9 @@ pub(crate) fn run(rx: Receiver<TxnRequest>, shared: Arc<EngineShared>) {
         }
         let rtx = or_abort(shared.db.begin_read(), "begin_read"); // redb 出错 = 写日志并 abort（0.2 第 5 条）
         let base_version = or_abort(storage::read_applied(&rtx), "读 applied").state_version;
+        let map = or_abort(ReadView::new(&rtx).and_then(|v| shared.map_for(&v)), "读集群图");
         let mut view = BatchView::new(&rtx);
-        let (results, trace_ids) = fill(&mut view, first, &rx, &shared.env);
+        let (results, trace_ids) = fill(&mut view, first, &rx, &shared.env, &map);
         if view.is_empty() {
             // 只可能全是"已提交的事实"：去重命中、会话已驱逐、内部 CAS 前提不成立
             results.into_iter().for_each(|e| (e.done)(e.result));
@@ -87,7 +91,13 @@ fn settle(outcome: ProposeOutcome, result: Result<MetaReply, ErrCode>) -> Result
 }
 
 /// 边取边执行：从 `first` 开始，每执行完一个请求看一次结束条件，到了就不再从 `rx` 取。返回各请求的结果与 trace_id。
-fn fill(view: &mut BatchView, first: TxnRequest, rx: &Receiver<TxnRequest>, env: &OpEnv) -> (Vec<Executed>, Vec<u64>) {
+fn fill(
+    view: &mut BatchView,
+    first: TxnRequest,
+    rx: &Receiver<TxnRequest>,
+    env: &OpEnv,
+    map: &ClusterMap,
+) -> (Vec<Executed>, Vec<u64>) {
     let (mut out, mut traces) = (Vec::new(), Vec::new());
     let mut next = Some(first);
     while let Some(req) = next.take() {
@@ -95,7 +105,7 @@ fn fill(view: &mut BatchView, first: TxnRequest, rx: &Receiver<TxnRequest>, env:
         if req.ctx.trace_id != 0 {
             traces.push(req.ctx.trace_id);
         }
-        let result = run_one(view, env, &req.ctx, req.op);
+        let result = run_one(view, env, map, &req.ctx, req.op);
         out.push(Executed { done: req.done, result });
         if end_here || view.topology_changed() || out.len() >= MAX_BATCH_OPS || view.encoded_len() >= MAX_BATCH_BYTES {
             break;
@@ -105,19 +115,18 @@ fn fill(view: &mut BatchView, first: TxnRequest, rx: &Receiver<TxnRequest>, env:
     (out, traces)
 }
 
-/// 执行一个请求（3.4.1.4 run_one）：会话已驱逐 → `SESSION_EVICTED`；去重命中 → 原结果；否则在操作层里执行闭包，
-/// 失败就整体丢弃它的写入；最终结果（成功或 POSIX errno）写进去重表，并点删 seq − 256 的旧记录（规则 4）。
-fn run_one(view: &mut BatchView, env: &OpEnv, ctx: &ReqCtx, op: TxnOp) -> Result<MetaReply, ErrCode> {
+/// 执行一个请求（3.4.1.4 run_one）：会话已驱逐 → `SESSION_EVICTED`；会话是别的 key 打开的 → `EACCES`（实现注记（M4），
+/// `sessions::usable`）；去重命中 → 原结果；否则在操作层里执行闭包，失败就整体丢弃它的写入；最终结果（成功或 POSIX errno）
+/// 写进去重表，并点删 seq − 256 的旧记录（规则 4）。
+fn run_one(view: &mut BatchView, env: &OpEnv, map: &ClusterMap, ctx: &ReqCtx, op: TxnOp) -> Result<MetaReply, ErrCode> {
     if ctx.seq != 0 {
-        if !sessions::is_active(view, ctx.session) {
-            return Err(ErrCode::SESSION_EVICTED); // 驱逐是单调的事实
-        }
+        sessions::usable(view, ctx.session, ctx.who.conn.key_id)?; // 驱逐是单调的事实；会话不能借给别的 key
         if let Some(r) = dedup::get(view, ctx.session, ctx.seq) {
             return r; // 重试：返回原结果
         }
     }
     view.begin_op();
-    let res = op(view, &env.op_ctx(ctx)); // 内部调用 authz / quota / placement 钩子（M4 起）
+    let res = op(view, &env.op_ctx(ctx, map)); // 内部调用 authz / quota / placement 钩子
     if res.is_err() {
         view.rollback_op();
     }
@@ -130,7 +139,8 @@ fn run_one(view: &mut BatchView, env: &OpEnv, ctx: &ReqCtx, op: TxnOp) -> Result
     // 与伪代码"成功 commit_op、失败 rollback_op"等价：失败时操作层已经清空，这里并入批次的只有去重记录
     // （3.4.1.4 规则 2：错误也写去重表）
     view.commit_op();
-    // M4 起：changelog::record(view, env, ctx, &res)——成功的修改都写；被拒绝的只在 audited 时写
+    // changelog（3.4.1.4 的 changelog::record）：成功的修改由各操作在自己的闭包末尾写（meta/changelog.rs 的实现注记）；
+    // 被拒绝的修改只在 audited 时写——audit 属性在 M12，到时在这里补上
     res
 }
 

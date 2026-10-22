@@ -11,7 +11,7 @@ use redb::{Database, ReadableTable};
 use wmfs_core::api::hex::hex;
 use wmfs_core::init::{InitialKv, initial_kv};
 use wmfs_core::meta::raft::storage::{self, RAFT_STATE};
-use wmfs_core::meta::schema::records::PluginListV1;
+use wmfs_core::meta::schema::records::{PluginListV1, TargetRecV1};
 
 /// 固定输入。与 testkit 的 `tests/harness/meta.rs` 的 `sample_init()` 保持一致（core 用不了 testkit），改一处要改两处。
 fn input() -> InitialKv {
@@ -25,6 +25,17 @@ fn input() -> InitialKv {
         machine_id: "0123456789abcdef0123456789abcdef".into(),
         hostname: "spark".into(),
         plugins: PluginListV1 { plugins: vec!["authn:shared-key".into()] },
+        targets: vec![TargetRecV1 {
+            node: 1,
+            path: "/data/wmfs/targets/1".into(),
+            labels: vec!["nvme".into()],
+            phys_devs: vec![],
+            capacity: 20 << 30,
+            boot_id: 0,
+            state: 1,
+            last_up_ms: 1_792_454_400_123,
+            read_only: false,
+        }],
     }
 }
 

@@ -1,5 +1,5 @@
 //! MetaCall 消息族的服务端（design.md 3.3.3、3.3.4）经真实的 RPC（tcp，127.0.0.1:0）：调试键空间的 DebugPut/DebugGet、
-//! 只给 admin key 且要 `debug_ops`、还没实现的操作回 FEATURE_UNSUPPORTED；握手认证用已应用的 KEYMETA（M3 的 KeyLookup
+//! 只给 admin key 且要 `debug_ops`、还没实现的操作回 FEATURE_UNSUPPORTED（M4 起命名空间操作已实现，用 StatFs 举例，它在 M5）；握手认证用已应用的 KEYMETA（M3 的 KeyLookup
 //! 切换：撤销一把 key 之后新连接被拒）。元数据引擎跑在模拟掉电的内存后端上。
 
 use std::sync::Arc;
@@ -84,8 +84,7 @@ fn debug_ops_need_an_admin_key_and_the_debug_ops_switch() {
     let (_rpc, ep, eng) = server(true);
     assert_eq!(meta(&ep, key(2), Role::Client, put("k", "v")), Err(ErrCode::EACCES), "client key 不能用调试操作");
     assert_eq!(meta(&ep, key(2), Role::Client, get("k")), Err(ErrCode::EACCES));
-    let gat = MetaOp::GetAttr { ino: 1 };
-    assert_eq!(meta(&ep, key(1), Role::Admin, gat), Err(ErrCode::FEATURE_UNSUPPORTED), "命名空间操作 M4 起才有");
+    assert_eq!(meta(&ep, key(1), Role::Admin, MetaOp::StatFs), Err(ErrCode::FEATURE_UNSUPPORTED), "StatFs 在 M5");
     eng.shutdown();
     let (_rpc, ep, eng) = server(false);
     assert_eq!(meta(&ep, key(1), Role::Admin, put("k", "v")), Err(ErrCode::EACCES), "服务端没开 debug_ops");

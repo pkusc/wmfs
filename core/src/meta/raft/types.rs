@@ -2,13 +2,13 @@
 //! [`ProposeOutcome`]、raft 线程发布的只读快照 [`Published`]、打开 Driver 的参数 [`DriverOpts`]，以及 raft 参数 [`config`]。
 //! `driver` 模块原样转出它们。
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 use crossbeam_channel::Sender;
 use raft::eraftpb::{ConfChangeV2, Message};
 use raft::{Config, ReadOnlyOption, StateRole};
 
-use crate::base::ErrCode;
+use crate::base::{ErrCode, lock};
 use crate::meta::engine::txn::{EngineStatus, RoleInfo};
 use crate::meta::schema::records::PluginListV1;
 
@@ -49,10 +49,6 @@ impl Published {
     pub fn status(&self) -> EngineStatus {
         lock(&self.status).clone()
     }
-}
-
-pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// 打开 Driver 的参数。

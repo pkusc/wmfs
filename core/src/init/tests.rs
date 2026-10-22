@@ -1,10 +1,11 @@
-//! init 的单元测试：写出的文件、拒绝非空目录、元数据库的 index = 1 初始状态（3.4.1.9、3.4.3）。
+//! init 的单元测试：写出的文件、拒绝非空目录、元数据库的 index = 1 初始状态（3.4.1.9、3.4.3）、`--target` 的解析与
+//! 重复/嵌套的 target、init 的集群警告。
 
 use super::*;
 use crate::meta::raft::storage::{KV, RedbStorage, read_applied};
 use crate::meta::schema::keys;
 use crate::meta::schema::raft_state::Applied;
-use crate::meta::schema::records::{InodeV1, NodeRecV1, decode_v1};
+use crate::meta::schema::records::{InodeV1, NodeRecV1, TargetRecV1, decode_v1};
 
 fn opts(d: &Path) -> InitOpts {
     InitOpts {
@@ -17,6 +18,7 @@ fn opts(d: &Path) -> InitOpts {
         debug_ops: true,
         host_id: Some("host-1".into()),
         plugins: PluginListV1 { plugins: vec!["authn:shared-key".into()] },
+        targets: vec![TargetConfig { capacity: "20G".into(), ..parse_target("/data/t1:nvme,fast").unwrap() }],
     }
 }
 
@@ -70,5 +72,42 @@ fn init_writes_the_index_1_metadata_state() {
     assert!(get(keys::keymeta(0)).is_none() && get(keys::keymeta(3)).is_none());
     let next_ino: u64 = decode_v1(&get(keys::global(keys::G_NEXT_INO)).unwrap()).unwrap();
     assert_eq!(next_ino, 18);
+    // M4：--target 写 TargetRecV1（id 1..=n）与 node.toml 的 [[target]]
+    let t: TargetRecV1 = decode_v1(&get(keys::target(1)).unwrap()).unwrap();
+    assert_eq!(
+        (t.node, t.path.as_str(), t.labels.clone(), t.capacity, t.state),
+        (1, "/data/t1", vec!["nvme".to_string(), "fast".to_string()], 20 << 30, 1)
+    );
+    assert!(get(keys::target(2)).is_none());
+    let next_target: u32 = decode_v1(&get(keys::global(keys::G_NEXT_TARGET)).unwrap()).unwrap();
+    assert_eq!(next_target, 2);
+    let cfg = NodeConfig::parse(&std::fs::read_to_string(o.data_dir.join("node.toml")).unwrap()).unwrap();
+    assert_eq!(cfg.targets, o.targets);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn targets_on_the_command_line_and_the_initial_warnings() {
+    let t = parse_target("/x/y:nvme,hdd-2").unwrap();
+    assert_eq!((t.path.as_str(), t.labels.clone()), ("/x/y", vec!["nvme".to_string(), "hdd-2".to_string()]));
+    assert_eq!(t.capacity, "0", "--target 的容量不限");
+    assert!(parse_target("rel/dir").unwrap().path.starts_with('/'), "换成绝对路径");
+    assert!(parse_target(":nvme").is_err(), "缺路径");
+    assert!(parse_target("/x:NVMe").is_err(), "标签只能是小写字母、数字与 -");
+    let d = crate::base::test_dir("init-warn");
+    let mut o = opts(&d);
+    let twice =
+        |a: &str, b: &str| InitOpts { targets: vec![parse_target(a).unwrap(), parse_target(b).unwrap()], ..opts(&d) };
+    assert!(init_node(&twice("/x", "/x/")).unwrap_err().contains("给了两次"), "同一个路径给两次");
+    assert!(init_node(&twice("/x/t1", "/x")).unwrap_err().contains("一个在另一个里面"), "互相嵌套");
+    assert!(!o.data_dir.exists(), "拒绝时什么也没写");
+    assert!(init_node(&twice("/x/t1", "/x/t10")).is_ok(), "/x/t10 不在 /x/t1 里面（按路径的各段比较）");
+    let w = initial_warnings(&o);
+    assert_eq!(
+        w,
+        vec!["default 类声明 3 副本，只有 1 个故障域：新文件实际为 1 副本（加入节点后自动补齐）".to_string()]
+    );
+    o.targets.clear();
+    assert!(initial_warnings(&o)[0].contains("没有可用的 target"), "没有 target：新文件建不出来");
     std::fs::remove_dir_all(&d).unwrap();
 }

@@ -19,16 +19,18 @@ fn a_client_that_never_reads_is_disconnected_and_others_are_unaffected() {
     let timeouts = || metrics::counter("wmfs_conn_write_timeout_total", "", &[]).get();
     let before = timeouts();
     let s = tcp();
-    // 假客户端：握手成功后发 200 个各带 256 KiB body 的 Ping，然后一个字节也不读
+    // 假客户端：握手成功后发 200 个各带 256 KiB body 的 Ping，然后一个字节也不读。
+    // 计时从发第一个 Ping 之前开始：服务端写回复（以及 5 s 的写超时）在发送的过程中就开始了，debug 构建里这 50 MiB
+    // 要发 1 s 多，从发完才计时会把这段算漏
     let mut bad = TcpStream::connect(&s.addr).unwrap();
     raw_handshake(&mut bad, &key(2), Role::Client).unwrap();
     let big = encode_body(&PingBody { payload: vec![0xEE; 256 << 10] });
+    let t0 = Instant::now();
     for i in 0..200 {
         raw_send(&mut bad, FrameKind::Request, MSG_PING, 10 + i, &big).unwrap();
     }
     // 好客户端：同时每 50 ms ping 一次，一直到服务端断开坏客户端为止（最多 30 s）
     let good = s.client(key(1), Role::Admin);
-    let t0 = Instant::now();
     let (mut ok, mut worst) = (0, Duration::ZERO);
     while timeouts() == before {
         assert!(t0.elapsed() < Duration::from_secs(30), "30 s 内服务端应该因写超时断开坏客户端");

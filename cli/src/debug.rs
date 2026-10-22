@@ -1,8 +1,8 @@
 //! `wmfs debug kv put|get|bench`（design.md 7.2、3.2.7 的调试键空间 0x2F）：经 MetaCall 的 `DebugPut` / `DebugGet` 读写
 //! 元数据 KV。服务端 node.toml 要有 `debug_ops = true`（`wmfs dev` 默认打开），且只接受 admin key。
 //!
-//! 先问 `--cluster` / `WMFS_CLUSTER` 里的管理地址的 `/api/v1/health` 找到元数据 leader 的 rpc 地址（最多找 30 s），再用
-//! `RpcClient` 发请求；可重试的错误（leader 还没就绪、连接断开……）按 3.3.8 退避重试，总期限 30 s。
+//! 先问 `--cluster` / `WMFS_CLUSTER` 里的管理地址的 `/api/v1/health` 找到元数据 leader 的 rpc 地址（最多找 30 s，`leader.rs`），
+//! 再用 `RpcClient` 发请求；可重试的错误（leader 还没就绪、连接断开……）按 3.3.8 退避重试，总期限 30 s。
 //! `bench`：用 `RpcClient::start` 保持 64 路并发写 `bench-<序号>`（值 32 字节），打印写入速率与平均批大小——后者取 leader 的
 //! `/metrics` 里 `wmfs_meta_batch_ops` 直方图在压测前后的 `_sum`/`_count` 增量（单飞批次在负载高时自然攒批，3.4.1.4）；
 //! 压测期间 leader 换过（term 变了，计数器从 0 重新开始）就不报批大小。可重试的失败按 3.3.8 退避：故障时一起失败的
@@ -14,10 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use wmfs_core::api::types::{Health, KeyFile, NodeAddrs};
-use wmfs_core::base::config::NetConfig;
 use wmfs_core::base::{ErrCode, clock};
-use wmfs_core::buf::{MemPool, PoolConfig};
 use wmfs_core::net::client::{Endpoint, Family, PendingCall, RpcClient, check_reply};
 use wmfs_core::net::retry::{BACKOFF_MAX_MS, BACKOFF_START_MS, retry, retryable};
 use wmfs_core::proto::frame::{FrameHeader, FrameKind, InFrame, MSG_META_CALL, OutFrame};
@@ -25,7 +22,7 @@ use wmfs_core::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
 use wmfs_core::proto::{decode_body, encode_body};
 use wmfs_mgr::api::ApiClient;
 
-use crate::{cluster_addrs, fail, load_key, out, registry};
+use crate::{cluster_addrs, fail, leader, load_key, out};
 
 #[derive(clap::Subcommand)]
 pub enum KvCmd {
@@ -117,35 +114,9 @@ pub fn run(cmd: KvCmd) -> i32 {
 
 fn connect(c: &KvArgs) -> Result<Kv, String> {
     let key = load_key(&c.key_file)?;
-    let leader = find_leader(&cluster_addrs(&c.cluster)?, &key)?;
-    let pool = MemPool::new(&PoolConfig::small()).map_err(|e| format!("内存池创建失败：{e}"))?;
-    let rpc = RpcClient::new(pool, registry::client_transports()?, key.clone(), NetConfig::default())
-        .map_err(|e| format!("建 RPC 客户端失败：{e}"))?;
-    let api = ApiClient::new(vec![leader.mgmt_addr.clone()], key);
-    Ok(Kv { rpc, ep: Endpoint { node: leader.node_id, addrs: leader.addrs }, api })
-}
-
-/// 依次问每个管理地址的 health，直到有人说出 leader（最多 30 s：刚启动的节点要先选出 leader）。自称 `candidate`
-/// （已当选、还没应用本任期的空条目）的节点再等一会儿：免得第一个请求碰上 NOT_READY、打出一串重试日志。
-fn find_leader(addrs: &[String], key: &KeyFile) -> Result<NodeAddrs, String> {
-    let deadline = clock::mono_ms() + OP_TIMEOUT.as_millis() as u64;
-    loop {
-        let mut last = String::new();
-        for a in addrs {
-            match ApiClient::new(vec![a.clone()], key.clone()).get::<Health>("/api/v1/health") {
-                Ok(Health { leader: Some(l), meta_role, .. }) if meta_role != "candidate" => return Ok(l),
-                Ok(h) => last = format!("{a} 的元数据角色是 {}，还不知道 leader", h.meta_role),
-                Err(e) => last = format!("{a}：{e}"),
-            }
-        }
-        if clock::mono_ms() > deadline {
-            return Err(format!(
-                "{} s 内没有找到元数据 leader（{last}）；可以先 wmfs dev wait leader",
-                OP_TIMEOUT.as_secs()
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let l = leader::connect(&cluster_addrs(&c.cluster)?, key.clone())?;
+    let api = ApiClient::new(vec![l.addrs.mgmt_addr.clone()], key);
+    Ok(Kv { rpc: l.rpc, ep: l.ep, api })
 }
 
 fn frame(op: MetaOp) -> OutFrame {

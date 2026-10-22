@@ -11,7 +11,7 @@ path = "lib.rs"
 
 [dependencies]
 wmfs-core.workspace = true
-wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma"] }
+wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "label-match"] }
 plugin-mem-transport.workspace = true
 crc32c.workspace = true
 redb.workspace = true
@@ -80,6 +80,35 @@ path = "it/meta_engine.rs"
 [[test]]
 name = "meta_service"
 path = "it/meta_service.rs"
+
+# M4：命名空间与会话（design.md 9.1 的 POSIX 元数据语义、9.4 的 meta.reply.drop）。
+[[test]]
+name = "meta_ns"
+path = "it/meta_ns.rs"
+
+[[test]]
+name = "meta_ns_rename"
+path = "it/meta_ns_rename.rs"
+
+[[test]]
+name = "meta_ns_attr"
+path = "it/meta_ns_attr.rs"
+
+[[test]]
+name = "meta_ns_random"
+path = "it/meta_ns_random.rs"
+
+[[test]]
+name = "meta_ns_engine"
+path = "it/meta_ns_engine.rs"
+
+[[test]]
+name = "failpoint_reply_drop"
+path = "it/failpoint_reply_drop.rs"
+
+[[test]]
+name = "failpoint_ns_plugins"
+path = "it/failpoint_ns_plugins.rs"
 
 [lints]
 workspace = true

@@ -1,0 +1,13 @@
+# label-match 放置插件的 manifest（design.md 3.7.1、4.6）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "label-match"
+version = "0.1.0"
+hooks = ["placement"]
+altitude = 510
+hot_path = true
+abi_version = 1
+attrs = ["class", "replicas", "stripe", "locality"]
+budget_ns = 50000
+fail_points = ["plugin.label-match.placement"]
+
+[config_schema]
+# 没有部署参数：存储类、副本数、条带数、locality 都是目录属性（M7 起可设置）

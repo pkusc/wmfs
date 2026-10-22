@@ -6,7 +6,7 @@ use wmfs_core::api::types::KeyFile;
 use wmfs_core::base::config::NodeConfig;
 use wmfs_core::base::{ErrCode, rand, sys};
 use wmfs_core::buf::PoolConfig;
-use wmfs_core::init::{CLIENT_KEY, InitOpts, NodeFile, init_node};
+use wmfs_core::init::{CLIENT_KEY, InitOpts, NodeFile, init_node, initial_warnings, parse_target};
 
 use crate::{fail, home, out, registry};
 
@@ -22,6 +22,9 @@ pub struct InitArgs {
     rpc_port: u16,
     #[arg(long, default_value_t = 9380)]
     mgmt_port: u16,
+    /// 一个 target（一块盘或一个目录）：PATH[:标签,标签]，可以给多次；不给就没有地方放文件数据（新建文件报 ENOSPC）
+    #[arg(long, value_name = "PATH[:label,label]")]
+    target: Vec<String>,
     /// 只初始化，不在前台运行 server
     #[arg(long)]
     pub no_start: bool,
@@ -29,6 +32,10 @@ pub struct InitArgs {
 
 /// `wmfs init`：建数据目录、生成集群主密钥与 key 文件（并复制到 ~/.config/wmfs/）、写 node.toml，然后前台运行 server。
 pub fn init(a: InitArgs) -> i32 {
+    let targets = match a.target.iter().map(|t| parse_target(t)).collect::<Result<Vec<_>, _>>() {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
     let o = InitOpts {
         data_dir: a.data_dir.clone(),
         addr: a.addr,
@@ -42,6 +49,7 @@ pub fn init(a: InitArgs) -> i32 {
             Ok(p) => p,
             Err(e) => return fail(e),
         },
+        targets,
     };
     if let Err(e) = init_node(&o) {
         return fail(e);
@@ -52,6 +60,8 @@ pub fn init(a: InitArgs) -> i32 {
     for name in ["admin.key", "client.key"] {
         lines.push(copy_key(&d.join("keys").join(name), &home().join(".config/wmfs").join(name)));
     }
+    // 声明在当前集群无法满足时大声警告（3.4.3 第 4 步、ADR-0016）
+    lines.extend(initial_warnings(&o).iter().map(|w| format!("警告：{w}")));
     let code = out(lines.join("\n"));
     if code != 0 || a.no_start {
         return code;

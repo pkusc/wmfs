@@ -5,7 +5,11 @@
 //! "确认自己仍是 leader 并提交成功"之后才发出。集群类错误码（≥ 1000）表示"没有执行，请重试"，不写去重表。
 //! 客户端保证每个会话在途的修改型请求 ≤ 256 个、seq 逐个递增，所以写入 seq 的结果时删除 seq − 256 的结果是安全的（规则 4）。
 
-use crate::base::ErrCode;
+use std::sync::{Arc, OnceLock};
+
+use wmfs_api::metrics::{self, Counter};
+
+use crate::base::{ErrCode, log};
 use crate::meta::engine::txn::{KvRead, KvTxn};
 use crate::meta::schema::keys;
 use crate::meta::schema::records::{DedupV1, decode_v1, encode_v1};
@@ -25,7 +29,20 @@ pub fn get(v: &dyn KvRead, session: u64, seq: u64) -> Option<Result<MetaReply, E
         Ok(DedupV1 { code, .. }) => Err(ErrCode(code)),
         Err(_) => Err(ErrCode::INTERNAL),
     };
+    hits().inc();
+    log::info("meta", format_args!("去重命中：session {session:x} 的 seq {seq} 是重试，返回第一次执行的结果"));
     Some(r)
+}
+
+/// 引擎启动时注册去重的指标：新起的节点的 /metrics 里就有 `wmfs_meta_dedup_hits_total 0`，不用等第一次命中。
+pub(crate) fn register_metrics() {
+    hits();
+}
+
+/// `wmfs_meta_dedup_hits_total`：去重表命中（重试拿到了原结果）的次数。
+fn hits() -> &'static Counter {
+    static C: OnceLock<Arc<Counter>> = OnceLock::new();
+    C.get_or_init(|| metrics::counter("wmfs_meta_dedup_hits_total", "去重表命中的次数（重试拿到了原结果）", &[]))
 }
 
 /// 这个结果要不要写进去重表：成功，或 POSIX errno。

@@ -10,11 +10,10 @@ use wmfs_api::failpoint::fail_point;
 use raft::StateRole;
 
 use super::{COMPACT_EVERY, COMPACT_KEEP, Driver, ProposeOutcome};
-use crate::base::log;
+use crate::base::{lock, log};
 use crate::meta::engine::txn::{EngineStatus, RoleInfo};
 use crate::meta::raft::or_abort;
 use crate::meta::raft::storage::{self, KV};
-use crate::meta::raft::types::lock;
 use crate::meta::schema::keys;
 use crate::meta::schema::raft_state::KEY_APPLIED;
 use crate::meta::schema::records::{KvOp, PluginListV1, WriteBatchV1, decode_v1};
@@ -121,7 +120,9 @@ impl Driver {
                 let _ = p.done.send(if ok { ProposeOutcome::Applied { ok: a.ok } } else { ProposeOutcome::Lost });
             }
         }
-        // M4 起：写入了 changelog（0x0E）就唤醒长轮询等待者；写入了影响集群图的键就让集群图缓存失效
+        // 集群图缓存按 GLOBAL map_epoch 失效（改变集群图的批次都在同一批次里 map_epoch += 1，读者每次比对它，
+        // meta/cluster/map.rs），这里不用另外通知。实现注记（M4）：changelog 的长轮询（GET /api/v1/changelog）在 M7，
+        // 到时在这里"写入了 changelog（0x0E）就唤醒长轮询等待者"
     }
 
     /// 日志压缩（3.4.1.8，3.2.6 的写入规则 M3）：每应用 10 000 条检查一次，压缩点 C = durable_applied − 10 000（给慢 follower 留余量）。
@@ -185,7 +186,9 @@ impl Driver {
         log::error(
             "raft",
             format_args!(
-                "本节点的插件集合与集群插件清单不一致：缺少 {missing:?}，多出 {extra:?}——不当就绪 leader（3.7.2）"
+                "本节点的插件集合与集群插件清单不一致：缺少 {missing:?}，多出 {extra:?}——不当就绪 leader（3.7.2）。\
+                 修复：开发集群多半是旧里程碑建的（新里程碑多了插件），wmfs dev down --purge 之后重新 wmfs dev up；\
+                 正式集群让全部节点启用同一组插件后重启"
             ),
         );
     }

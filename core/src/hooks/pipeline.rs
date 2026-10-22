@@ -5,7 +5,7 @@
 //! transport 的包装在 core 的连接写线程里（`net/conn.rs`，包在 `Conn::send` 外层：触发 = 这条连接作废）；收帧那一半由
 //! 传输插件自己计时（读到帧头之后开始，读完 body + bulk 时调用 [`HookCall::exit`]，不过 fail point，3.7.4）。
 //!
-//! 实现：M1 有 authn、plugin_list 与 transport 的包装；其余钩子随各自的里程碑实现（函数体里写着里程碑号）。
+//! 实现：M1 有 authn、plugin_list 与 transport 的包装；M4 有 authz 与 placement；其余钩子随各自的里程碑实现（函数体里写着里程碑号）。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,8 +18,9 @@ use crate::hooks::manifest::{Hook, Manifest};
 use crate::hooks::policy::PolicyEvaluator;
 use crate::hooks::registry::PluginSet;
 use crate::hooks::traits::{
-    AuthnInput, AuthnPlugin, AuthnResult, AuthzInput, ChainView, CodecPlugin, ConnIdentity, KeyLookup, PlacementInput,
-    QosPlugin, QuotaDecision, QuotaInput, TransformKind, TransformPlugin, Transport,
+    AuthnInput, AuthnPlugin, AuthnResult, AuthzInput, AuthzPlugin, ChainView, CodecPlugin, ConnIdentity, Decision,
+    KeyLookup, PlacementInput, PlacementPlugin, QosPlugin, QuotaDecision, QuotaInput, TransformKind, TransformPlugin,
+    Transport,
 };
 use crate::meta::schema::records::PluginListV1;
 
@@ -73,13 +74,18 @@ impl HookCall {
 pub struct Pipeline {
     set: PluginSet,
     authn: Vec<(Arc<dyn AuthnPlugin>, HookCall)>, // altitude 升序；每个插件配好自己的调用包装
+    authz: Vec<(Arc<dyn AuthzPlugin>, HookCall)>,
+    placement: Vec<(Arc<dyn PlacementPlugin>, HookCall)>,
 }
 
 impl Pipeline {
     /// 由校验过的插件集合建管线（`PluginSet::validate` 之后）。
     pub fn new(set: PluginSet) -> Pipeline {
         let authn = set.authn_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Authn))).collect();
-        Pipeline { set, authn }
+        let authz = set.authz_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Authz))).collect();
+        let placement =
+            set.placement_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Placement))).collect();
+        Pipeline { set, authn, authz, placement }
     }
 
     pub fn transports(&self) -> &[Arc<dyn Transport>] {
@@ -107,17 +113,36 @@ impl Pipeline {
         Err(ErrCode::AUTH_FAILED) // 全部弃权 → 拒绝
     }
 
-    /// 串行；任一 Deny → Err；全部 Abstain → EACCES
-    pub fn authz(&self, _input: &AuthzInput) -> Result<(), ErrCode> {
-        unimplemented!("M4：Pipeline::authz")
+    /// authz（3.7.2）：altitude 升序串行；任一 Deny 即拒绝（用它给的码）；否则有 Allow 即允许；全部 Abstain（含一个
+    /// authz 插件都没有）→ `EACCES`（失败即关闭）。fail point `plugin.<名字>.authz` 触发 = 以注入的码拒绝。
+    pub fn authz(&self, input: &AuthzInput) -> Result<(), ErrCode> {
+        let mut allowed = false;
+        for (p, call) in &self.authz {
+            let t0 = call.enter()?;
+            let d = p.check(input);
+            call.exit(t0, true); // 拒绝是正常的判定，不算插件出错
+            match d {
+                Decision::Deny(c) => return Err(c),
+                Decision::Allow => allowed = true,
+                Decision::Abstain => {}
+            }
+        }
+        if allowed { Ok(()) } else { Err(ErrCode::EACCES) }
     }
     /// 按 3.7.2 合并多个插件的结果
     pub fn quota(&self, _input: &QuotaInput) -> QuotaDecision {
         unimplemented!("M10：Pipeline::quota")
     }
-    /// 依次 rank
-    pub fn place(&self, _input: &PlacementInput, _candidates: Vec<ChainView>) -> Result<Vec<ChainView>, ErrCode> {
-        unimplemented!("M4：Pipeline::place")
+    /// placement（3.7.2）：altitude 升序，依次过滤/排序同一个候选链列表；core 再取前 k 条（3.4.2.1）。
+    /// 没有 placement 插件时候选原样返回（core 已按 class/replicas 预先筛过）。
+    pub fn place(&self, input: &PlacementInput, mut candidates: Vec<ChainView>) -> Result<Vec<ChainView>, ErrCode> {
+        for (p, call) in &self.placement {
+            let t0 = call.enter()?;
+            let r = p.rank(input, &mut candidates);
+            call.exit(t0, r.is_ok());
+            r?;
+        }
+        Ok(candidates)
     }
     pub fn qos(&self) -> &Arc<dyn QosPlugin> {
         unimplemented!("M5：Pipeline::qos")
@@ -137,5 +162,6 @@ impl Pipeline {
     }
 }
 // meta/ns/common.rs 里的便捷函数（命名空间代码只用它们，M4）：
-//   authz(v, c, op, target: Option<&InodeV1>, parent: Option<&InodeV1>) -> Result<(), ErrCode>
-//   new_layout(v, c, eff, ino, size_hint) -> Result<LayoutV1, ErrCode>   // 候选链 + gen_chains + Pipeline::place + 取 k 条（3.4.2.1）
+//   authz(v, c, op, target, parent, victim) -> Result<(), ErrCode>      // 实现注记（M4）：多一个 victim（unlink/rename 的粘滞位），
+//                                                                       // inode 用 ns::common::Node（号 + 记录：InodeView 要 ino）
+//   new_layout(v, c, eff, ino, epoch, size_hint) -> Result<LayoutV1, ErrCode>   // 候选链 + gen_chains + Pipeline::place + 取 k 条（3.4.2.1）

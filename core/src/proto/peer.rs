@@ -128,7 +128,7 @@ pub enum NodeReply {
     Epochs { dead: Vec<bool> },
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ClusterMap {
     pub map_epoch: u64,
     pub cluster_id: [u8; 16],

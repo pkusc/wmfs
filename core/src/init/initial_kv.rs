@@ -5,7 +5,9 @@
 //! - default profile 的目录属性：`/home replicas=3`、`/scratch replicas=2`（理念文档第 7 章默认冗余）。
 //! - 存储类 default（id 1，`label = "*"`，replica 3，priority normal，weight 1，无 QoS 限制）与 CLASS_NAME。
 //! - NodeRecV1(1)（voter、Active；地址来自 node.toml 的监听地址）；KEYMETA：key 1 = admin，key 2 = 默认 client。
-//! - GLOBAL：`next_node = 2`、`next_target = 1`（M3 还没有 `--target`）、`next_chain = 1`、`next_class = 2`、`next_key = 3`、
+//! - TargetRecV1：`--target` 给的每个 target 一条，id 1..=n（实现注记（M4）：node 1、状态 Up、`last_up_ms` = init 的时刻，
+//!   `phys_devs` 空、`boot_id` 0——两者由 target 心跳在 M5 填上；容量取 `[[target]] capacity`，0 = 不限）。
+//! - GLOBAL：`next_node = 2`、`next_target = n + 1`、`next_chain = 1`、`next_class = 2`、`next_key = 3`、
 //!   `next_datakey = 1`、`next_changelog = 1`、`next_reconcile = 1`、`next_ino = 18`、`attr_epoch = map_epoch = 1`、
 //!   `cluster`、`features`（空）、`settings`（默认值）、`plugins`（本节点按 node.toml 装出来的插件清单，3.7.2）。init 不写 changelog。
 //!
@@ -18,7 +20,7 @@ use crate::init::initial_keymeta;
 use crate::meta::schema::keys::{self, FIRST_INO, ROOT_INO};
 use crate::meta::schema::records::{
     AttrMapV1, ClassIdV1, ClusterInfoV1, ClusterSettingsV1, DentryV1, FeatureSetV1, InodeV1, KIND_DIR, NodeRecV1,
-    PluginListV1, RStatV1, StorageClassV1, encode_v1,
+    PluginListV1, RStatV1, StorageClassV1, TargetRecV1, encode_v1,
 };
 
 /// `/home` 与 `/scratch` 是 init 分配的头两个普通 inode。
@@ -36,6 +38,7 @@ pub struct InitialKv {
     pub machine_id: String,
     pub hostname: String,
     pub plugins: PluginListV1,
+    pub targets: Vec<TargetRecV1>, // id 依次为 1..=n
 }
 
 /// 按 key 排好序的 (key, value)。
@@ -66,25 +69,7 @@ pub fn initial_kv(i: &InitialKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         symlink: vec![],
     };
     let attr = |k: &str, v: &str| AttrMapV1 { entries: [(k.to_string(), v.to_string())].into_iter().collect() };
-    let default_class = StorageClassV1 {
-        id: 1,
-        name: "default".into(),
-        label: "*".into(),
-        dedicated: false,
-        replica: 3,
-        iops_min: 0,
-        iops_max: 0,
-        bw_min: 0,
-        bw_max: 0,
-        burst_ms: 0,
-        weight: 1, // mClock 权重，缺省 1（6.1）
-        latency_target_us: 0,
-        priority: 1,       // normal
-        failure_domain: 1, // node（首发只有这一种）
-        locality: 0,       // any
-        tier_to: None,
-        tier_when: None,
-    };
+    let default_class = default_class();
     let node = NodeRecV1 {
         addrs: i.addrs.clone(),
         mgmt_addr: i.mgmt_addr.clone(),
@@ -112,7 +97,7 @@ pub fn initial_kv(i: &InitialKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         (keys::node(1), encode_v1(&node)),
         (keys::global(keys::G_NEXT_INO), encode_v1(&(SCRATCH_INO + 1))),
         (keys::global(keys::G_NEXT_NODE), encode_v1(&2u32)),
-        (keys::global(keys::G_NEXT_TARGET), encode_v1(&1u32)),
+        (keys::global(keys::G_NEXT_TARGET), encode_v1(&(i.targets.len() as u32 + 1))),
         (keys::global(keys::G_NEXT_CHAIN), encode_v1(&1u32)),
         (keys::global(keys::G_NEXT_CLASS), encode_v1(&2u16)),
         (keys::global(keys::G_NEXT_KEY), encode_v1(&3u32)),
@@ -130,6 +115,30 @@ pub fn initial_kv(i: &InitialKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         (keys::global(keys::G_PLUGINS), encode_v1(&i.plugins)),
     ];
     kv.extend(initial_keymeta(i.created_ms).into_iter().map(|(id, m)| (keys::keymeta(id), encode_v1(&m))));
+    kv.extend(i.targets.iter().zip(1u32..).map(|(t, id)| (keys::target(id), encode_v1(t))));
     kv.sort();
     kv
+}
+
+/// init 预置的存储类 default（3.4.3、6.1）：id 1，`label = "*"` 匹配任何 target，replica 3，priority normal，没有 QoS 限制。
+pub fn default_class() -> StorageClassV1 {
+    StorageClassV1 {
+        id: 1,
+        name: "default".into(),
+        label: "*".into(),
+        dedicated: false,
+        replica: 3,
+        iops_min: 0,
+        iops_max: 0,
+        bw_min: 0,
+        bw_max: 0,
+        burst_ms: 0,
+        weight: 1, // mClock 权重，缺省 1（6.1）
+        latency_target_us: 0,
+        priority: 1,       // normal
+        failure_domain: 1, // node（首发只有这一种）
+        locality: 0,       // any
+        tier_to: None,
+        tier_when: None,
+    }
 }

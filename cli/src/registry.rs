@@ -21,6 +21,10 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     s.transport(Arc::new(plugin_mem_transport::MemTransport::new())); // 独立 crate 示例
     #[cfg(feature = "shared-key")]
     s.authn(Arc::new(wmfs_plugins::shared_key::SharedKey::new()));
+    #[cfg(feature = "posix-mode")]
+    s.authz(Arc::new(wmfs_plugins::posix_mode::PosixMode::new()));
+    #[cfg(feature = "label-match")]
+    s.placement(Arc::new(wmfs_plugins::label_match::LabelMatch::new()));
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST); // embedded-kv：代码在 core（元数据 Raft 是契约，4.10）
     if !cfg.plugins.dylib.is_empty() {
         return Err("node.toml 的 [plugins] dylib：动态库插件 M14 才支持".into());

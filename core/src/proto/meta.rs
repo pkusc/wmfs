@@ -15,7 +15,15 @@ use crate::meta::schema::records::LayoutV1;
 /// 每个会话同时在途的修改型请求上限（3.5.2）。
 pub const DEDUP_WINDOW: u64 = 256;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+// `Rename.flags` 与 `SetXattr.flags` 原样沿用 Linux 的数值（renameat2(2)、setxattr(2)）；实现注记（M4）：规格没写数值，
+// 取 Linux 的，钉在 tests/golden/constants.golden。RENAME_WHITEOUT 不支持（EINVAL，3.1.1）。
+pub const RENAME_NOREPLACE: u32 = 1;
+pub const RENAME_EXCHANGE: u32 = 2;
+pub const RENAME_WHITEOUT: u32 = 4;
+pub const XATTR_CREATE: u32 = 1;
+pub const XATTR_REPLACE: u32 = 2;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ReqHead {
     pub session: u64,
     pub seq: u64,

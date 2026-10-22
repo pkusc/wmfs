@@ -17,9 +17,10 @@ cd /home/yzl/wmfs && cargo build --release
 export PATH=/home/yzl/wmfs/target/release:$PATH
 export no_proxy=127.0.0.1,localhost,10.77.0.1 NO_PROXY=127.0.0.1,localhost,10.77.0.1   # 本机设置了 http_proxy，不加这行 curl 访问本机会失败
 # 想从头再来时：wmfs dev down --purge   （停掉所有开发节点、卸载开发挂载点——包括被冻住的——再删除 ~/wmfs-dev）
+# 换到新的里程碑后也先执行一次：旧版本建的开发集群插件清单与新版本不同，节点不会成为就绪 leader（wmfs dev up 会报错并提示这条命令）
 ```
 
-   `wmfs dev up` 启动的第 n 个节点使用端口：rpc `19n00`、RDMA 引导 `19n01`、HTTP 管理 `19n80`（例如 node1 = 19100 / 19101 / 19180）。`eval "$(wmfs dev env)"` 会设置 `WMFS_CLUSTER`（**全部节点**的管理地址，逗号分隔——所以杀掉任何一个节点，包括 leader，之后命令照样能用）、`WMFS_KEY_FILE` 与 `WMFS_MGR_DIR`，之后 `wmfs set/get/...` 就知道连哪个集群、用哪把管理员密钥。
+   `wmfs dev up` 启动的第 n 个节点使用端口：rpc `19n00`、RDMA 引导 `19n01`、HTTP 管理 `19n80`（例如 node1 = 19100 / 19101 / 19180）。`eval "$(wmfs dev env)"` 会设置 `WMFS_CLUSTER`（**全部节点**的管理地址，逗号分隔——所以杀掉任何一个节点，包括 leader，之后命令照样能用）、`WMFS_KEY_FILE` 与 `WMFS_MGR_DIR`，之后 `wmfs set/get/...` 就知道连哪个集群、用哪把管理员密钥。`scripts/accept.sh` 用自己的开发目录起集群，用的也是这些端口，所以起了开发集群的演示在最后一行 `scripts/accept.sh Mx` 之前都有一行 `wmfs dev down`，先停掉演示用的集群（忘了这一步，验收会因为端口被占而失败）。
 4. **完成的定义**（理念文档 10.4）：代码 + 单元测试 + fail point 用例 + 指标 + 文档（插件 `docs.md`、`docs/semantics.md` 更新）+（有旋钮时）目录属性 +（触及契约时）已批准的 ADR，并且通过本里程碑应跑的 profile 测试。功能是一个个里程碑长出来的，所以 profile 测试**分阶段收紧**（design.md 9.7，【ADR-0015】）：M0–M5 只要求单元测试与 fail point 测试；M6 起每个里程碑都跑 `minimal`；M9–M11 再跑 `nas-safe` 阶段版（3 节点、replicas=3，只设置已有消费者的属性）；M12 起阶段版加上 `trash` 与 `audit`；M14 起跑完整的 `nas-safe`；`hpc-rdma` 从 M9 起有 Soft-RoCE 时每次都跑，没有就 SKIP。
 5. **回归**：`scripts/accept.sh all` 依次重跑全部已完成里程碑（实现 agent 每次提交前跑一遍）。
 6. **提交规范与节奏**（2026-10-20 你的决定："只在需要拍板或 sudo 时停"）：agent 自测通过（`scripts/accept.sh Mx` 与 `scripts/accept.sh all`）后直接提交、打 tag，然后接着做下一个里程碑，不停下来等你验收；你随时可以挑任何一个已完成里程碑的演示命令来验。每个里程碑一个或多个提交，提交信息用中文简述（例如 `M3: 单节点元数据引擎（raft-rs + redb）`），**不包含任何 AI 署名或 co-author 行**（你的明确要求）；每个里程碑完成时打 tag `m0` … `m15`；M2 开工时另打 `m2-base`（"本体零改动"检查要用）。
@@ -202,6 +203,7 @@ wmfs fs --as-uid 2000 mkdir /a/x                    # 预期：Permission denied
 wmfs failpoint set 1 meta.reply.drop 'times(1,return(EIO))'   # 让服务端"弄丢"下一个元数据回复
 wmfs fs mkdir /b --verbose                          # 预期：约 10 秒后（一次 RPC 超时）出现"超时重试 seq=… → 去重命中"，结果成功（没有 File exists）
 wmfs dev kill 1 && wmfs dev start 1 && wmfs dev wait leader && wmfs fs ls -l /a   # 预期：仍是 f2、g
+wmfs dev down
 scripts/accept.sh M4
 ```
 
@@ -230,6 +232,7 @@ wmfs debug chunk-header "$(wmfs debug chunk-path /big 3)"      # 预期：versio
 wmfs debug corrupt-chunk /big 3 --node 1 --block 0 # 人为制造一个坏块（按块表找到第 0 块的数据，翻转一个字节）
 wmfs fs get /big /tmp/x                             # 预期：Input/output error（校验和不符；单副本修不了，诚实报错）
 wmfs fs truncate /big 10M && wmfs fs stat /big      # 预期：size=10485760（坏掉的 chunk 3 被整块截掉，不需要读它）
+wmfs dev down
 scripts/accept.sh M5
 ```
 
@@ -259,6 +262,7 @@ ln -s cto.txt ~/wmfs-mnt/link && cat ~/wmfs-mnt/link             # 预期：v2
 python3 -c "import os; p=os.path.expanduser('~/wmfs-mnt/cto.txt'); os.setxattr(p,'user.k',b'hi'); print(os.getxattr(p,'user.k'))"   # 预期：b'hi'
 wmfs dev umount ~/wmfs-mnt && wmfs dev mount ~/wmfs-mnt && md5sum ~/wmfs-mnt/big   # 预期：与上面相同
 scripts/build-tools-image.sh                        # 第一次需要几分钟并联网（先征得你同意）
+wmfs dev down
 scripts/accept.sh M6
 ```
 
@@ -288,6 +292,7 @@ cp -r /usr/include ~/wmfs-mnt/proj/a/
 wmfs usage ~/wmfs-mnt/proj                          # 预期：立即返回字节数与文件数
 find ~/wmfs-mnt/proj -type f -printf '%s\n' | awk '{s+=$1} END {print s}'   # 预期：与上一行的字节数相同
 wmfs changelog tail -n 100000 | grep -E 'AttrSet|Mkdir' | tail -3   # 预期：能看到 AttrSet 与 Mkdir 事件（最后几条大多是 cp 产生的 Create）
+wmfs dev down
 scripts/accept.sh M7
 ```
 
@@ -316,6 +321,7 @@ wmfs dev wait leader && wmfs node list              # 预期：换了新 leader�
 ls ~/wmfs-mnt/m | wc -l                             # 预期：3000
 wmfs dev start $L && wmfs dev wait leader && wmfs node list   # 预期：该节点回来当 follower 并追平
 wmfs cluster plugins show                           # 预期：每个节点都必须启用的插件清单（钩子:名字）
+wmfs dev down
 scripts/accept.sh M8
 ```
 
@@ -346,6 +352,7 @@ wmfs chain list                                     # 预期：节点 2 的 targ
 wmfs status ~/wmfs-mnt/home                         # 预期：第一行警告链降级；replicas 声明 3、实际 2 的文件数 > 0
 wmfs dev start 2 && wmfs dev wait chains-serving && wmfs chain list   # 预期：节点 2 的 target 先 Syncing，后 Serving
 wmfs status ~/wmfs-mnt/home                         # 预期：差距归零
+wmfs dev down
 scripts/accept.sh M9
 ```
 
@@ -380,6 +387,7 @@ kill -STOP $(wmfs dev client-pid ~/wmfs-mnt2)
 wmfs dev wait session-evicted ~/wmfs-mnt2 --timeout 90 && wmfs session list   # 预期：该会话显示 EVICTED
 kill -CONT $(wmfs dev client-pid ~/wmfs-mnt2); cat <&3    # 预期：Input/output error（旧句柄不再可用）
 cat ~/wmfs-mnt2/home/private/s                      # 预期：secret（自动建立新会话后，新打开正常）
+wmfs dev down
 scripts/accept.sh M10
 ```
 
@@ -419,6 +427,7 @@ wmfs task run gc && wmfs dev wait task-idle gc
 grep -rl "WMFS-PLAINTEXT-MARKER" ~/wmfs-dev/n*/targets/ | head -1        # 预期：没有输出（落盘的是密文）
 wmfs debug corrupt-chunk /home/data/f1 0 --node 2 --block 0              # 人为损坏节点 2 上的一个副本
 wmfs task run scrub && wmfs dev wait task-idle scrub && wmfs changelog tail -n 50 | grep ChecksumRepaired   # 预期：发现并修复了这个坏块
+wmfs dev down
 scripts/accept.sh M11
 ```
 
@@ -451,6 +460,7 @@ python3 -c "import mmap,os; f=os.open(os.path.expanduser('~/mntA/home/shared/x')
 wmfs set ~/mntA/home trash=7d && echo important > ~/mntA/home/doc && rm ~/mntA/home/doc
 ls ~/mntA/home/.wmfs-trash/                         # 预期：<时间>-<ino>-doc
 mv ~/mntA/home/.wmfs-trash/*-doc ~/mntA/home/doc && cat ~/mntA/home/doc   # 预期：important
+wmfs dev down
 scripts/accept.sh M12
 ```
 
@@ -488,6 +498,7 @@ wmfs set ~/wmfs-mnt/fast qos=r=0,w=1,l=3000
 dd if=/dev/zero of=~/wmfs-mnt/fast/z2 bs=4M count=50 oflag=direct   # 预期：明显变快（上限放大 10 倍）
 curl --noproxy '*' -s 127.0.0.1:19180/metrics | grep wmfs_qos_served_total
 wmfs status ~/wmfs-mnt/fast                         # 预期：class=gold，replicas 声明 2、实际 2
+wmfs dev down
 scripts/accept.sh M13
 ```
 
@@ -524,6 +535,7 @@ wmfs fs --as-uid 4242 touch /home/zz                # 预期：Permission denied
 wmfs dev restart 1; wmfs dev logs 1 | tail -3       # 不带 .so 重启节点 1；预期："插件集合与集群清单不一致：缺少 authz:deny-uid"，节点 1 退出
 wmfs dev restart 1 --dylib /tmp/deny_uid.so --dylib /tmp/bad_abi.so; wmfs dev logs 1 | tail -3   # 预期："动态库 ABI 版本 2 不受支持（支持 [1]），拒绝启动"
 wmfs dev restart 1 --dylib /tmp/deny_uid.so && wmfs dev wait chains-serving   # 恢复正常
+wmfs dev down
 scripts/accept.sh M14
 ```
 

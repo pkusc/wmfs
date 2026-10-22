@@ -14,3 +14,11 @@ pub mod shared_key;
 #[cfg(feature = "rdma")]
 #[path = "rdma/mod.rs"]
 pub mod rdma;
+
+#[cfg(feature = "posix-mode")]
+#[path = "posix-mode/mod.rs"]
+pub mod posix_mode;
+
+#[cfg(feature = "label-match")]
+#[path = "label-match/mod.rs"]
+pub mod label_match;

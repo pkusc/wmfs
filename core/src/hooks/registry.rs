@@ -10,13 +10,15 @@
 //! 实现注记（M3）：meta_engine 的实现（embedded-kv）在 core 里（元数据 Raft 是契约），注册表登记的是它的 manifest
 //! （[`PluginSet::meta_engine`]），服务端装配时据此建引擎。`validate` 查"最多一个"（只做传输的进程——`wmfs ping`、
 //! 组件测试——不需要元数据引擎），服务端装配（`server::start`）再查"恰好一个"。
+//! 实现注记（M4）：加了 authz 与 placement 两种钩子（各自的 add 方法与访问器）；它们的规则与 authn 相同（altitude 区间、
+//! 同一钩子内不重名、altitude 不相同），已由 `check_one` 与 `validate` 的通用部分覆盖。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::base::config::PluginTable;
 use crate::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
-use crate::hooks::traits::{AuthnPlugin, Transport};
+use crate::hooks::traits::{AuthnPlugin, AuthzPlugin, PlacementPlugin, Transport};
 use crate::meta::schema::records::PluginListV1;
 
 /// 本节点装上的插件（按钩子分开、同一钩子内按 altitude 升序）。
@@ -25,6 +27,8 @@ pub struct PluginSet {
     disable: Vec<String>,
     transports: Vec<Arc<dyn Transport>>,
     authn: Vec<Arc<dyn AuthnPlugin>>,
+    authz: Vec<Arc<dyn AuthzPlugin>>,
+    placement: Vec<Arc<dyn PlacementPlugin>>,
     meta_engines: Vec<&'static Manifest>,
 }
 
@@ -52,6 +56,20 @@ impl PluginSet {
         }
     }
 
+    pub fn authz(&mut self, a: Arc<dyn AuthzPlugin>) {
+        if self.enabled(a.manifest()) {
+            self.authz.push(a);
+            self.authz.sort_by_key(|p| p.manifest().altitude);
+        }
+    }
+
+    pub fn placement(&mut self, p: Arc<dyn PlacementPlugin>) {
+        if self.enabled(p.manifest()) {
+            self.placement.push(p);
+            self.placement.sort_by_key(|p| p.manifest().altitude);
+        }
+    }
+
     /// 唯一型钩子 meta_engine：登记实现的 manifest（实现在 core，见文件头的实现注记）。
     pub fn meta_engine(&mut self, m: &'static Manifest) {
         if self.enabled(m) {
@@ -72,11 +90,21 @@ impl PluginSet {
         &self.authn
     }
 
+    pub fn authz_plugins(&self) -> &[Arc<dyn AuthzPlugin>] {
+        &self.authz
+    }
+
+    pub fn placement_plugins(&self) -> &[Arc<dyn PlacementPlugin>] {
+        &self.placement
+    }
+
     /// 全部 (钩子, manifest)。
     fn all(&self) -> Vec<(Hook, &'static Manifest)> {
         let t = self.transports.iter().map(|p| (Hook::Transport, p.manifest()));
         let a = self.authn.iter().map(|p| (Hook::Authn, p.manifest()));
-        t.chain(a).chain(self.meta_engines.iter().map(|m| (Hook::MetaEngine, *m))).collect()
+        let z = self.authz.iter().map(|p| (Hook::Authz, p.manifest()));
+        let pl = self.placement.iter().map(|p| (Hook::Placement, p.manifest()));
+        t.chain(a).chain(z).chain(pl).chain(self.meta_engines.iter().map(|m| (Hook::MetaEngine, *m))).collect()
     }
 
     /// 启动时校验（3.7.2）：每个插件的 manifest（[`check_one`]）；同一钩子内不重名、altitude 不相同；不同的插件不同名；

@@ -94,6 +94,11 @@ pub fn wall_ts() -> Ts {
     Ts { secs: (ms / 1000) as i64, nanos: ((ms % 1000) * 1_000_000) as u32 }
 }
 
+/// 时间戳换成 Unix 毫秒（1970 年之前的按 0）：显示与比较用。
+pub fn ts_ms(t: Ts) -> u64 {
+    (t.secs.max(0) as u64).saturating_mul(1000).saturating_add(t.nanos as u64 / 1_000_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

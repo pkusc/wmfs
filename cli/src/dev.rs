@@ -8,6 +8,10 @@
 //! 安全：只对 pid 文件里、且命令行确实是"wmfs server --data-dir <这个节点>"的进程发信号；`down --purge` 只删除
 //! 默认的 `~/wmfs-dev` 或带 `.wmfs-dev` 标记的目录。实现注记（M1）：多节点要 `wmfs join`（M8），所以 M1 的 `up` 只支持 `--nodes 1`。
 //! M3：开发节点打开 `debug_ops`（`wmfs debug kv`）；`wmfs dev wait <条件>`（[`wait`]，M3 只有 leader）。
+//! M4：每个节点默认一个 target（`<节点目录>/targets/1`，容量上限 20 GiB，design.md 12 节第 13 条）；`up` 起好节点后取一次
+//! 集群图，把集群警告打印出来（ADR-0016：例如"default 类声明 3 副本，只有 1 个故障域……"）。取不到集群图（节点没有成为
+//! 就绪的 leader，多半是旧里程碑建的开发集群、插件清单不一致）→ 打印原因与修法（`wmfs dev down --purge`）并以非 0 退出。
+//! `up --rdma` 改写 node.toml 的部分在 `dev/rdma.rs`。
 
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
@@ -17,15 +21,19 @@ use std::time::Duration;
 
 use serde::Serialize;
 use wmfs_core::api::types::{Health, KeyFile};
-use wmfs_core::base::config::{NodeConfig, PluginTable};
+use wmfs_core::base::config::{NodeConfig, TargetConfig};
 use wmfs_core::base::{clock, sys};
 use wmfs_core::buf::PoolConfig;
+use wmfs_core::client::meta_client::fetch_map;
 use wmfs_core::init::{InitOpts, NodeFile, init_node};
 use wmfs_mgr::api::ApiClient;
 
 use crate::{fail, home, out};
 
+mod rdma;
 mod wait;
+
+use rdma::set_rdma;
 
 #[derive(clap::Subcommand)]
 pub enum DevCmd {
@@ -136,10 +144,16 @@ fn running_pid(d: &Path, n: u32) -> Option<i32> {
     (ours && sys::process_alive(pid)).then_some(pid)
 }
 
+/// 第 n 个节点的 admin key（`<节点目录>/keys/admin.key`）。
+fn admin_key(d: &Path, n: u32) -> Result<KeyFile, String> {
+    let p = node_dir(d, n).join("keys/admin.key");
+    KeyFile::parse(&std::fs::read_to_string(&p).map_err(|e| format!("读 {} 失败：{e}", p.display()))?)
+}
+
 /// 这个节点的 health；端口上回答的是别的集群（例如另一个开发目录的节点占着这个端口）也算失败。
 fn health(d: &Path, n: u32) -> Result<Health, String> {
     let nd = node_dir(d, n);
-    let key = KeyFile::parse(&std::fs::read_to_string(nd.join("keys/admin.key")).map_err(|e| e.to_string())?)?;
+    let key = admin_key(d, n)?;
     let h: Health = ApiClient::new(vec![mgmt_addr(d, n)?], key).get("/api/v1/health").map_err(|e| e.to_string())?;
     let mine = NodeFile::read(&nd)?.cluster_id;
     if h.cluster_id != mine {
@@ -175,6 +189,11 @@ fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>) -> Result<Vec<String>, Strin
                 debug_ops: true, // wmfs debug kv（M3 演示）
                 host_id,
                 plugins,
+                targets: vec![TargetConfig {
+                    path: node_dir(d, n).join("targets/1").display().to_string(),
+                    labels: vec![],
+                    capacity: "20G".into(),
+                }],
             };
             init_node(&o)?;
         }
@@ -184,38 +203,21 @@ fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>) -> Result<Vec<String>, Strin
             ));
         }
         lines.push(start(d, n)?);
+        // 取不到集群图 = 节点没有成为就绪的 leader（例如旧里程碑建的开发集群插件清单不一致）：大声失败，别让后面的命令白等
+        let ws = warnings(d, n).map_err(|e| {
+            let log = log_path(d, n).display().to_string();
+            format!("{}\nnode{n} 起来了，但没能取到集群图：{e}（日志 {log}）", lines.join("\n"))
+        })?;
+        lines.extend(ws.iter().map(|w| format!("警告：{w}")));
     }
     Ok(lines)
 }
 
-/// `up` 的 `--rdma`（声明式：每次 up 都按这次的参数改写 node.toml，返回它变了没有）。给了 IP → `[plugin.rdma] listen =
-/// "IP:19n01"` 与 `max_qps = 32`（dev 的 S 档 128 MiB 只够 32 个 QP 的接收槽，design.md 3.6.1；不写的话插件取服务端默认的
-/// 64，启动校验会让节点起不来），`[net] data_scheme = "rdma"`；没给 → 去掉 `[plugin.rdma]`，data_scheme 是 rdma 的改回 tcp
-/// （`up --rdma` 起不来时，不带 --rdma 再 up 一次就恢复，不用 `down --purge`）。
-fn set_rdma(nd: &Path, n: u32, ip: Option<Ipv4Addr>) -> Result<bool, String> {
-    let p = nd.join("node.toml");
-    let old = NodeConfig::parse(&std::fs::read_to_string(&p).map_err(|e| format!("读 {} 失败：{e}", p.display()))?)?;
-    let mut cfg = old.clone();
-    match ip {
-        Some(ip) => {
-            let t: PluginTable = format!("listen = \"{ip}:{}\"\nmax_qps = 32\n", ports(n).0 + 1)
-                .parse()
-                .map_err(|e| format!("[plugin.rdma] 编码失败：{e}"))?;
-            cfg.plugin.insert("rdma".into(), t);
-            cfg.net.data_scheme = "rdma".into();
-        }
-        None => {
-            cfg.plugin.remove("rdma");
-            if cfg.net.data_scheme == "rdma" {
-                cfg.net.data_scheme = "tcp".into();
-            }
-        }
-    }
-    if cfg == old {
-        return Ok(false);
-    }
-    sys::atomic_write(&p, cfg.to_toml().as_bytes()).map_err(|e| format!("写 {} 失败：{e}", p.display()))?;
-    Ok(true)
+/// 集群警告（ADR-0016：`wmfs dev up` 的输出里也要看得到）：用这个节点的 admin key 取一次集群图（等 leader 最多 30 s）。
+fn warnings(d: &Path, n: u32) -> Result<Vec<String>, String> {
+    let l = crate::leader::connect(&[mgmt_addr(d, n)?], admin_key(d, n)?)?;
+    let m = fetch_map(l.rpc, &[l.ep], Duration::from_secs(30)).map_err(|e| format!("取集群图失败：{e}"))?;
+    Ok(m.warnings.clone())
 }
 
 /// 启动第 n 个节点（已在运行就只报告），等它就绪：health 有响应，并且 pid 文件里就是这个进程

@@ -21,6 +21,10 @@
 #   build_no_warnings                                cargo build --release --workspace 成功且零警告
 #   one_test <cargo test 参数…> <完整测试名>          只跑这一个测试（-- --exact），并确认它真的跑了
 #   tests_at_least <N> <cargo test 参数…>            通过，且至少跑了 N 个测试
+#   dev_ports_free <里程碑>                          开发集群的端口 19100、19180 空闲（演示用的开发集群要先 wmfs dev down）
+#   expect_error <错误码> 命令…                      命令失败（退出码非 0），且 --json 输出里 .error 是这个错误码
+# 以及给检查函数用的：
+#   dev_metric <指标名>                              node1（127.0.0.1:19180）/metrics 里一个不带标签的指标的值（没有就是空）
 # 每条检查的完整输出写在日志目录里的 NN.log（NN = 检查序号）。
 set -u
 # 这两个变量会改变测试的行为：WMFS_GOLDEN_UPDATE=1 让金样测试"重写金样并直接通过"（假通过），
@@ -119,6 +123,38 @@ tests_at_least() {
     n=$(printf '%s' "$out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | awk '{s += $1} END {print s + 0}')
     echo "跑了 $n 个测试（至少要 $want 个）"
     [ "$n" -ge "$want" ]
+}
+
+# dev_ports_free <里程碑>：开发集群的 rpc 与管理端口上已经有人在听（多半是演示用的开发集群还在运行）→ 失败并提示 wmfs dev down。
+dev_ports_free() {
+    local p
+    for p in 19100 19180; do
+        if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
+            echo "127.0.0.1:$p 已被占用：演示用的开发集群还在运行？请先 wmfs dev down，再跑 scripts/accept.sh $1"
+            return 1
+        fi
+    done
+    echo "19100、19180 都空闲"
+}
+
+# expect_error <错误码> 命令…：命令必须失败（退出码非 0），且 --json 输出里 .error 是期望的错误码。
+expect_error() {
+    local want="$1"
+    shift
+    local out rc
+    out="$("$@")"
+    rc=$?
+    printf '%s\n' "$out"
+    if [ "$rc" -eq 0 ]; then
+        echo "命令应该失败，却成功了"
+        return 1
+    fi
+    printf '%s' "$out" | jq -e --arg w "$want" '.error == $w'
+}
+
+# dev_metric <指标名>：node1 的 /metrics 里一个不带标签的指标的值（没有这个指标就输出空，调用方当失败处理）。
+dev_metric() {
+    curl --noproxy '*' -s "http://127.0.0.1:19180/metrics" | awk -v n="$1" '$1 == n { print $2 }'
 }
 
 # 跑一个里程碑（在子 shell 里，失败时 check 用 exit 结束它）。

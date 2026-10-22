@@ -8,6 +8,9 @@
 //! `Responder` 按值传递、恰好用一次；回复只是 `try_send` 进连接的发送队列（队列满就断开这条连接，对端会重试），
 //! 所以回复永远不会阻塞执行器或 io 线程。被 Drop 而没有回复时自动回 `EIO` 并计数 `wmfs_req_dropped_total`；
 //! 流式回复的 [`StreamTx`] 没发最后一帧就被 Drop 时也一样。回复超过协议上限时改回 `FEATURE_UNSUPPORTED`（只让这一个请求失败）。
+//! 实现注记（M4）：回 `NOT_LEADER` 的 ERROR 帧由 core 自动填 `leader_hint`（[`RpcServer::set_leader_hint`] 登记的函数给出
+//! leader 在 control_scheme 上的 rpc 地址，例如 "127.0.0.1:19100"；不知道 leader 时为 None）；[`Responder::drop_reply`]
+//! 什么也不回、Drop 时也不自动回 EIO（fail point `meta.reply.drop` 用它"弄丢"一次回复）。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -44,6 +47,9 @@ pub struct ServerId {
     pub node_id: u32,
 }
 
+/// 给出 leader 的 rpc 地址（填进 NOT_LEADER 的 `leader_hint`；不知道 → None）。
+pub type HintFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// 各自计数的消息族（3.3.3）；其余的 msg_type（不认识的、认证之后又发来的握手消息）都记在 "Unknown" 名下。
 const FAMILIES: [u16; 7] =
     [MSG_PING, MSG_META_CALL, MSG_DATA_CALL, MSG_PEER_CALL, MSG_NODE_CALL, MSG_RAFT, MSG_SNAPSHOT_FETCH];
@@ -56,6 +62,7 @@ pub struct RpcServer {
     queue: usize,
     services: RwLock<HashMap<u16, Arc<dyn Service>>>,
     stats: [OnceLock<Arc<FamilyStats>>; FAMILIES.len() + 1], // FAMILIES 各一个 + Unknown；第一次用到时注册，之后不加锁
+    hint: OnceLock<HintFn>,
 }
 
 impl RpcServer {
@@ -73,7 +80,13 @@ impl RpcServer {
             queue: net.send_queue as usize,
             services: RwLock::new(HashMap::new()),
             stats: Default::default(),
+            hint: OnceLock::new(),
         })
+    }
+
+    /// 登记"leader 在哪"的函数：之后回 `NOT_LEADER` 的 ERROR 帧都带上它给的 `leader_hint`（只登记一次，再登记被忽略）。
+    pub fn set_leader_hint(&self, f: HintFn) {
+        let _ = self.hint.set(f);
     }
 
     /// 注册一个消息族的服务（例如 `MSG_META_CALL`）。
@@ -137,17 +150,18 @@ impl RpcServer {
         }
         // 角色权限先查（请求与 OneWay 都查）：OneWay 没法回 EACCES，不符就只计数、丢弃
         let family = msg_name(hdr.msg_type).unwrap_or("Unknown");
+        let hint = self.hint.get().cloned();
         if !allowed(id.role, hdr.msg_type, &f.body) {
             denied(id.role, family);
             if hdr.kind == FrameKind::Request {
-                Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type)).error(ErrCode::EACCES, 0);
+                Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type), hint).error(ErrCode::EACCES, 0);
             }
             return;
         }
         if hdr.kind == FrameKind::OneWay {
             return; // OneWay（RaftMsg）的服务 M8 起才有：现在丢弃（raft 会重发）
         }
-        let r = Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type));
+        let r = Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type), hint);
         if f.bulk_dropped {
             return r.error(ErrCode::BUSY, 0); // 内存池 100 ms 内没有空槽：bulk 已读出丢弃，让对端退避重试
         }
@@ -246,22 +260,28 @@ pub struct Responder {
     done: bool,
     stats: Arc<FamilyStats>, // 指标句柄（第一次用到这个族时注册好的）
     t0: Instant,
+    hint: Option<HintFn>,
 }
 
 impl Responder {
-    fn new(conn: ConnHandle, req: &FrameHeader, stats: Arc<FamilyStats>) -> Responder {
+    fn new(conn: ConnHandle, req: &FrameHeader, stats: Arc<FamilyStats>, hint: Option<HintFn>) -> Responder {
         let (req_id, msg_type, trace_id, span_id) = (req.req_id, req.msg_type, req.trace_id, req.span_id);
-        Responder { conn, req_id, msg_type, trace_id, span_id, done: false, stats, t0: Instant::now() }
+        Responder { conn, req_id, msg_type, trace_id, span_id, done: false, stats, t0: Instant::now(), hint }
     }
     /// 编成 Response 帧，ConnHandle::send（try_send，不阻塞）
     pub fn reply(mut self, body: Vec<u8>, bulk: Vec<BufSlice>) {
         let f = OutFrame { hdr: self.header(), body, bulk, recv_into: None };
         self.finish(f, ErrCode(0));
     }
-    /// ERROR 帧；leader_hint 由 core 自动填（M3 起有 leader 信息；M1 为 None）
+    /// ERROR 帧；leader_hint 由 core 自动填（`NOT_LEADER` 时问 [`RpcServer::set_leader_hint`] 登记的函数）
     pub fn error(mut self, code: ErrCode, extra: u64) {
-        let f = error_frame(self.header(), code, extra);
+        let hint = self.hint.as_ref().filter(|_| code == ErrCode::NOT_LEADER).and_then(|f| f());
+        let f = error_frame(self.header(), ErrorBody { leader_hint: hint, ..ErrorBody::new(code, extra) });
         self.finish(f, code);
+    }
+    /// 什么也不回（Drop 时也不自动回 EIO）：对端等到超时后用同一个 seq 重试。只给 fail point `meta.reply.drop` 用。
+    pub fn drop_reply(mut self) {
+        self.done = true;
     }
     pub fn identity(&self) -> &ConnIdentity {
         self.conn.identity()
@@ -285,7 +305,7 @@ impl Responder {
         let code = match self.conn.send(f) {
             // 回复超过协议上限（body > 1 MiB，或 bulk > 16 MiB + 128 KiB）：改回一个 ERROR 帧，只让这一个请求失败（3.3.8）
             Err(ErrCode::FEATURE_UNSUPPORTED) => {
-                let _ = self.conn.send(error_frame(self.header(), ErrCode::FEATURE_UNSUPPORTED, 0));
+                let _ = self.conn.send(error_frame(self.header(), ErrorBody::new(ErrCode::FEATURE_UNSUPPORTED, 0)));
                 ErrCode::FEATURE_UNSUPPORTED
             }
             _ => code, // 其他失败 = 连接已断，对端会重连重试
@@ -299,16 +319,16 @@ impl Drop for Responder {
         if !self.done {
             // 没回复过 → 回 EIO，计数 wmfs_req_dropped_total
             conn::counters().req_dropped.inc();
-            let f = error_frame(self.header(), ErrCode::EIO, 0);
+            let f = error_frame(self.header(), ErrorBody::new(ErrCode::EIO, 0));
             self.finish(f, ErrCode::EIO);
         }
     }
 }
 
 /// 一个 ERROR 帧（flags 带 ERROR，body 是 ErrorBody）；`hdr` 是这个请求的回复帧头。
-fn error_frame(mut hdr: FrameHeader, code: ErrCode, extra: u64) -> OutFrame {
+fn error_frame(mut hdr: FrameHeader, body: ErrorBody) -> OutFrame {
     (hdr.kind, hdr.flags) = (FrameKind::Response, FLAG_ERROR);
-    OutFrame { hdr, body: encode_body(&ErrorBody::new(code, extra)), bulk: vec![], recv_into: None }
+    OutFrame { hdr, body: encode_body(&body), bulk: vec![], recv_into: None }
 }
 
 /// 流式回复的发送端（`Responder::into_stream`）。没发最后一帧就被丢弃时自动回 `EIO`（与 Responder 相同，3.6.3），
@@ -342,7 +362,7 @@ impl StreamTx {
     }
 
     fn fail(&mut self, code: ErrCode) {
-        let _ = self.conn.send(error_frame(self.hdr, code, 0));
+        let _ = self.conn.send(error_frame(self.hdr, ErrorBody::new(code, 0)));
         self.end(code);
     }
 

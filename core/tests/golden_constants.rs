@@ -8,6 +8,8 @@ use common::Golden;
 use wmfs_core::base::types::Role;
 use wmfs_core::data::format::*;
 use wmfs_core::data::superblock::{TARGET_FORMAT_VERSION, TARGET_INCOMPAT_KNOWN, TARGET_MAGIC, TARGET_SB_LEN};
+use wmfs_core::meta::ns::acl;
+use wmfs_core::meta::ns::xattr::{ACL_ACCESS, ACL_DEFAULT};
 use wmfs_core::meta::schema::keys::*;
 use wmfs_core::meta::schema::raft_state::{KEY_APPLIED, KEY_CONF_STATE, KEY_FORMAT, KEY_HARD_STATE, KEY_SNAP_META};
 use wmfs_core::meta::schema::records::{
@@ -17,7 +19,9 @@ use wmfs_core::meta::schema::records::{
 use wmfs_core::proto::cap::{CAP_MAC_LEN, RIGHT_ADMIN, RIGHT_READ, RIGHT_WRITE};
 use wmfs_core::proto::features::*;
 use wmfs_core::proto::frame::*;
-use wmfs_core::proto::meta::DEDUP_WINDOW;
+use wmfs_core::proto::meta::{
+    DEDUP_WINDOW, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, XATTR_CREATE, XATTR_REPLACE,
+};
 
 #[test]
 fn golden_constants() {
@@ -193,5 +197,26 @@ fn golden_constants() {
     for (code, name) in wmfs_api::ops::CHANGE_OPS {
         g.add(&format!("changelog_op.{name}"), code.to_le_bytes().to_vec());
     }
+    // M4 追加：Rename / SetXattr 的标志（沿用 Linux 的数值）、存进 KV 的 ACL 格式（与 Linux 的 xattr 相同）、root_squash 的 uid
+    let m4: &[(&str, u32)] = &[
+        ("RENAME_NOREPLACE", RENAME_NOREPLACE),
+        ("RENAME_EXCHANGE", RENAME_EXCHANGE),
+        ("RENAME_WHITEOUT", RENAME_WHITEOUT),
+        ("XATTR_CREATE", XATTR_CREATE),
+        ("XATTR_REPLACE", XATTR_REPLACE),
+        ("acl.ACL_VERSION", acl::ACL_VERSION),
+        ("acl.USER_OBJ", acl::USER_OBJ as u32),
+        ("acl.USER", acl::USER as u32),
+        ("acl.GROUP_OBJ", acl::GROUP_OBJ as u32),
+        ("acl.GROUP", acl::GROUP as u32),
+        ("acl.MASK", acl::MASK as u32),
+        ("acl.OTHER", acl::OTHER as u32),
+        ("NOBODY", wmfs_core::meta::service::NOBODY),
+    ];
+    for (n, v) in m4 {
+        g.add(n, v.to_le_bytes().to_vec());
+    }
+    g.add("xattr.ACL_ACCESS", ACL_ACCESS.to_vec());
+    g.add("xattr.ACL_DEFAULT", ACL_DEFAULT.to_vec());
     g.check();
 }

@@ -2,6 +2,8 @@
 //!
 //! M3 的服务端 = 内存池 + 元数据引擎（raft 线程 + 执行器 + 8 个 meta-read 线程，`meta/meta.redb`）+ 各传输插件监听 +
 //! RPC 服务端（握手、Ping、MetaCall）+ 管理 API。认证用的 key 表读已应用的 KEYMETA（3.3.2）。数据服务（M5）等随里程碑加入。
+//! M4：NodeCall（`GetClusterMap`）也交给元数据服务；回 `NOT_LEADER` 时带 `leader_hint`（[`hint_of`]）；起 cluster-mgr 线程
+//! （leader 就绪时与集群图变化时把集群警告写进日志）。
 //! 信号（design.md 0.2 第 4 条）：main 在**创建任何线程之前** `sys::block_signals(&[SIGTERM, SIGINT])`，
 //! 调用 `start` 之后 `sys::wait_signals(..)`，收到后 [`Running::stop`] 再退出。
 
@@ -19,12 +21,13 @@ use crate::hooks::pipeline::Pipeline;
 use crate::hooks::registry::PluginSet;
 use crate::hooks::traits::KeyLookup;
 use crate::init::{NodeFile, read_master};
+use crate::meta::cluster::cluster_mgr;
 use crate::meta::engine::txn::{MetaEngine, RoleInfo};
 use crate::meta::engine::{self, EmbeddedEngine, EngineOpts};
 use crate::meta::service::MetaService;
 use crate::mgmt::{MgmtCtx, MgmtServer, RoleFn};
 use crate::net::server::{RpcServer, ServerId};
-use crate::proto::frame::MSG_META_CALL;
+use crate::proto::frame::{MSG_META_CALL, MSG_NODE_CALL};
 
 /// 运行中的节点。
 pub struct Running {
@@ -65,7 +68,9 @@ pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &st
     let meta = EmbeddedEngine::open(&meta_path, opts)?; // 出错时的消息里已经带了元数据库的路径
     let keys: Arc<dyn KeyLookup + Send + Sync> = Arc::new(meta.keys(master));
     let rpc = RpcServer::new(ServerId { cluster_id, node_id: node.node_id }, pipeline.clone(), keys.clone(), &cfg.net);
-    rpc.add_service(MSG_META_CALL, MetaService::start(meta.clone(), cfg.debug_ops)?);
+    let svc = MetaService::start(meta.clone(), cfg.debug_ops)?;
+    rpc.add_service(MSG_META_CALL, svc.clone());
+    rpc.add_service(MSG_NODE_CALL, svc);
     let mut addrs = Vec::new();
     for t in pipeline.transports() {
         let (scheme, name) = (t.scheme(), t.manifest().name);
@@ -82,9 +87,14 @@ pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &st
             cfg.net.control_scheme
         ));
     }
+    cluster_mgr::start(&meta)?;
     let mgmt = MgmtServer::bind(&cfg.mgmt.listen)?;
     let mgmt_addr = mgmt.addr().to_string();
     let me = NodeAddrs { node_id: node.node_id, addrs: addrs.clone(), mgmt_addr: mgmt_addr.clone() };
+    let (eng, mine, scheme) = (meta.clone(), me.clone(), cfg.net.control_scheme.clone());
+    rpc.set_leader_hint(Arc::new(move || {
+        hint_of(leader_addrs(eng.role().leader_id, &mine, &|id| eng.node_addrs(id)), &scheme)
+    }));
     let health = Health {
         ok: true,
         version: version.into(),
@@ -110,17 +120,27 @@ pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &st
     Ok(Running { node_id: node.node_id, addrs, mgmt_addr, rpc, meta, pid_file })
 }
 
-/// health 里的元数据角色与 leader 的地址（实现注记（M3），7.1）。leader 的地址：是自己就用本节点的实际地址，
-/// 否则取已应用的 NodeRecV1。
+/// health 里的元数据角色与 leader 的地址（实现注记（M3），7.1）。
 fn meta_role(eng: &EmbeddedEngine, me: &NodeAddrs) -> (String, Option<NodeAddrs>) {
     let r = eng.role();
     let learner = r.role == StateRole::Follower && eng.status().learners.contains(&me.node_id);
-    let leader = match r.leader_id {
+    (role_name(&r, learner).to_string(), leader_addrs(r.leader_id, me, &|id| eng.node_addrs(id)))
+}
+
+/// leader 的地址（health 与 NOT_LEADER 的 `leader_hint` 共用）：不知道 leader（`leader_id` 为 0）→ None；是自己 → 本节点
+/// 实际监听的地址；是别人 → `others(id)`（已应用的 NodeRecV1，查不到 → None。注意：`wmfs dev up --rdma` 改了 node.toml
+/// 之后，KV 里的地址不会跟着变——那只影响 rdma 一项，control_scheme 的 tcp 地址不变）。
+fn leader_addrs(leader_id: u32, me: &NodeAddrs, others: &dyn Fn(u32) -> Option<NodeAddrs>) -> Option<NodeAddrs> {
+    match leader_id {
         0 => None,
         id if id == me.node_id => Some(me.clone()),
-        id => eng.node_addrs(id),
-    };
-    (role_name(&r, learner).to_string(), leader)
+        id => others(id),
+    }
+}
+
+/// NOT_LEADER 的 `leader_hint`（实现注记（M4），3.3.1、3.3.7）：leader 在 control_scheme 上的 rpc 地址（"127.0.0.1:19100"）。
+fn hint_of(leader: Option<NodeAddrs>, scheme: &str) -> Option<String> {
+    leader?.addrs.into_iter().find(|(s, _)| s == scheme).map(|(_, a)| a)
 }
 
 /// `meta_role` 的取值：`leader` = **就绪**的 leader（可以服务请求，`wmfs dev wait leader` 等的就是它）；`candidate` =
@@ -161,5 +181,28 @@ mod tests {
         assert_eq!(role_name(&r(StateRole::PreCandidate, false), false), "candidate");
         assert_eq!(role_name(&r(StateRole::Follower, false), false), "follower");
         assert_eq!(role_name(&r(StateRole::Follower, false), true), "learner");
+    }
+
+    #[test]
+    fn leader_hint_is_the_leaders_control_scheme_address() {
+        let node = |id: u32, port: u16| NodeAddrs {
+            node_id: id,
+            addrs: vec![("mem".into(), format!("mem-{id}")), ("tcp".into(), format!("127.0.0.1:{port}"))],
+            mgmt_addr: String::new(),
+        };
+        let me = node(1, 19100);
+        let others = |id: u32| (id == 2).then(|| node(2, 19200));
+        let hint = |leader_id| hint_of(leader_addrs(leader_id, &me, &others), "tcp");
+        assert_eq!(hint(0), None, "不知道 leader");
+        assert_eq!(hint(1), Some("127.0.0.1:19100".into()), "leader 是自己：本节点实际监听的地址");
+        assert_eq!(
+            hint(2),
+            Some("127.0.0.1:19200".into()),
+            "leader 是别人：已应用的 NodeRecV1 里 control_scheme 的那一项"
+        );
+        assert_eq!(hint(3), None, "集群图里查不到这个节点");
+        assert_eq!(hint_of(leader_addrs(2, &me, &others), "mem"), Some("mem-2".into()), "按 control_scheme 挑地址");
+        assert_eq!(hint_of(leader_addrs(2, &me, &others), "udp"), None, "leader 没有这种传输");
+        assert_eq!(leader_addrs(1, &me, &others), Some(me.clone()), "health 里的 leader 地址");
     }
 }

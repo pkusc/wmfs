@@ -14,7 +14,7 @@
 M3_HTTP=http://127.0.0.1:19180
 
 accept_m3() {
-    check "开发集群的端口 19100、19180 空闲（演示用的开发集群要先 wmfs dev down）" m3_ports_free
+    check "开发集群的端口 19100、19180 空闲（演示用的开发集群要先 wmfs dev down）" dev_ports_free M3
     check "cargo build --release 成功且零警告" build_no_warnings
     check "单飞建连（M2 遗留的 core 修复，ADR-0031 第 11 条）：16 个线程同时第一次调用，tcp 与 mem 的服务端都只看到 1 条连接" \
         one_test --release -p wmfs-testkit --test net_rpc first_calls_from_16_threads_share_one_connection
@@ -66,18 +66,6 @@ accept_m3() {
     check "wmfs dev down 停掉全部开发节点" wmfs dev down
 }
 
-# 开发集群的 rpc 与管理端口上已经有人在听（多半是演示用的开发集群还在运行）→ 失败并提示 wmfs dev down。
-m3_ports_free() {
-    local p
-    for p in 19100 19180; do
-        if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
-            echo "127.0.0.1:$p 已被占用：演示用的开发集群还在运行？请先 wmfs dev down，再跑 scripts/accept.sh M3"
-            return 1
-        fi
-    done
-    echo "19100、19180 都空闲"
-}
-
 m3_init_state() {
     tests_at_least 2 --release -p wmfs-core --lib init::tests || return 1
     cargo test --release -p wmfs-core --test golden_init 2>&1 | tee /dev/stderr | grep -q 'test result: ok. 1 passed'
@@ -97,15 +85,10 @@ m3_missing_key() {
     [ "$rc" -eq 1 ] && printf '%s' "$out" | jq -e '.found == false and .value == null'
 }
 
-# /metrics 里一个不带标签的指标的值（没有就是空）。
-m3_metric() {
-    curl --noproxy '*' -s "$M3_HTTP/metrics" | awk -v n="$1" '$1 == n { print $2 }'
-}
-
 m3_metrics() {
     local applied stale
-    applied="$(m3_metric wmfs_raft_applied_index)"
-    stale="$(m3_metric wmfs_meta_batch_stale_total)"
+    applied="$(dev_metric wmfs_raft_applied_index)"
+    stale="$(dev_metric wmfs_meta_batch_stale_total)"
     echo "wmfs_raft_applied_index = $applied，wmfs_meta_batch_stale_total = $stale"
     [ -n "$applied" ] && [ "${applied%.*}" -gt 0 ] && [ "$stale" = "0" ]
 }
@@ -140,7 +123,7 @@ m3_abort_before_commit() {
 
 m3_after_restarts() {
     local stale log
-    stale="$(m3_metric wmfs_meta_batch_stale_total)"
+    stale="$(dev_metric wmfs_meta_batch_stale_total)"
     echo "wmfs_meta_batch_stale_total = $stale"
     [ "$stale" = "0" ] || return 1
     log="$WMFS_DEV_DIR/n1/logs/server.log"

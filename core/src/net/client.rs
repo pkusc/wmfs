@@ -166,6 +166,11 @@ impl RpcClient {
         Ok(rpc)
     }
 
+    /// 构造时给的传输选择（MetaClient 按 control_scheme 解释 NOT_LEADER 的 leader_hint）。
+    pub fn net(&self) -> &NetConfig {
+        &self.net
+    }
+
     /// 阻塞：发出请求、等回复。只允许在可以阻塞的线程里用（1.2 规则 3）。不重试（重试在 MetaClient/DataClient/retry.rs）
     pub fn call(&self, to: &Endpoint, fam: Family, f: OutFrame, timeout: Duration) -> Result<InFrame, ErrCode> {
         self.start(to, fam, f, timeout)?.wait()

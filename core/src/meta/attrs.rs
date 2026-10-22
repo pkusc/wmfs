@@ -5,12 +5,29 @@
 //! 最后用内置默认值补齐（来源显示为 "(默认值)"）。leader 上 `AttrResolver` 缓存 `dir → (attr_epoch, Arc<Resolved>)`，
 //! 任何属性修改和任何目录 rename 都令 `attr_epoch += 1`，缓存整体失效。
 //!
-//! 接口骨架（M0）：签名以这里为准，实现在 M4（内置默认值）与 M7（继承、来源、注册表）。
+//! 实现注记（M4）：`resolve` 只返回内置默认值（class = default、replicas = 存储类的默认副本数、chunk 4M、stripe 1、
+//! inline 64K、checksum crc32c、cto、attr_ttl 1 s，其余关闭）；DIRATTR 的继承、来源与缓存在 M7。`ancestors` 沿 parent
+//! 指针点查到根（rename 判断"不得把目录移进自己的子树"用它；M7 起继承解析、M10 起 path-caps 也用，到时加缓存）。
 
 use std::sync::Arc;
 
 use crate::base::ErrCode;
+use crate::data::format::{CK_CRC32C, CMP_NONE};
 use crate::meta::engine::txn::KvRead;
+use crate::meta::schema::keys::{self, ROOT_INO};
+use crate::meta::schema::kv;
+use crate::meta::schema::records::{ClassIdV1, InodeV1, StorageClassV1};
+
+/// 内置默认值（3.8）。
+const DEFAULT_CLASS: &str = "default";
+const DEFAULT_CHUNK: u32 = 4 << 20;
+const DEFAULT_INLINE: u32 = 64 << 10;
+pub const DEFAULT_ATTR_TTL_MS: u32 = 1000;
+/// `consistency` 的取值（`EffectiveAttrs.consistency`、`AttrOut.consistency`，3.3.4）。
+pub const CONSISTENCY_CTO: u8 = 1;
+pub const CONSISTENCY_STRONG: u8 = 2;
+/// 目录树的深度上限（防止损坏的 parent 指针让遍历不停）。
+const MAX_DEPTH: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectiveAttrs {
@@ -37,16 +54,60 @@ pub struct EffectiveAttrs {
     pub sources: Vec<(&'static str, u64)>,      // 每个键的来源目录（0 = 内置默认值）
 }
 
-pub struct AttrResolver {/* dir → (attr_epoch, Arc<EffectiveAttrs>) 缓存；祖先链缓存 */}
-
-#[allow(unused_variables)] // 骨架：函数体在 M4/M7 实现，实现后删除这一行
-impl AttrResolver {
-    pub fn resolve(&self, v: &dyn KvRead, dir: u64) -> Result<Arc<EffectiveAttrs>, ErrCode> {
-        unimplemented!("M4/M7：AttrResolver::resolve")
+impl EffectiveAttrs {
+    /// 内置默认值：存储类 `class_id`、副本数 = 它的默认副本数，其余见文件头。来源全部是"默认值"（`sources` 为空）。
+    pub fn defaults(class_id: u16, replicas: u8) -> EffectiveAttrs {
+        EffectiveAttrs {
+            class_id,
+            replicas,
+            chunk: DEFAULT_CHUNK,
+            stripe: 1,
+            inline_max: DEFAULT_INLINE,
+            checksum: CK_CRC32C,
+            compress: CMP_NONE,
+            compress_level: 0,
+            encrypt_key: 0,
+            consistency: CONSISTENCY_CTO,
+            attr_ttl_ms: DEFAULT_ATTR_TTL_MS,
+            trash_ms: 0,
+            trash_root: 0,
+            ttl_ms: 0,
+            tier: None,
+            audit: AuditSpec::default(),
+            locality: 0,
+            acl_default: None,
+            qos_id: 0,
+            quotas: vec![],
+            sources: vec![],
+        }
     }
-    /// dir → … → 根
+}
+
+#[derive(Default)]
+pub struct AttrResolver {/* dir → (attr_epoch, Arc<EffectiveAttrs>) 缓存；祖先链缓存（M7） */}
+
+impl AttrResolver {
+    /// 目录 `dir` 的生效属性。实现注记（M4）：只有内置默认值（见文件头）；default 类读 CLASS_NAME 与 CLASS 两次点查。
+    pub fn resolve(&self, v: &dyn KvRead, dir: u64) -> Result<Arc<EffectiveAttrs>, ErrCode> {
+        let _ = dir; // M7 起按 dir 的祖先链继承
+        let id = kv::get::<ClassIdV1>(v, &keys::class_name(DEFAULT_CLASS))?.ok_or(ErrCode::INTERNAL)?.id;
+        let class = kv::get::<StorageClassV1>(v, &keys::class(id))?.ok_or(ErrCode::INTERNAL)?;
+        Ok(Arc::new(EffectiveAttrs::defaults(id, class.replica)))
+    }
+
+    /// dir → … → 根（沿 parent 指针点查；根的 parent 是 0）。
     pub fn ancestors(&self, v: &dyn KvRead, dir: u64) -> Result<Arc<Vec<u64>>, ErrCode> {
-        unimplemented!("M4：AttrResolver::ancestors")
+        let mut out = vec![dir];
+        let mut cur = dir;
+        while cur != ROOT_INO {
+            let i = kv::get::<InodeV1>(v, &keys::inode(cur))?.ok_or(ErrCode::ENOENT)?;
+            if i.parent == 0 || out.len() > MAX_DEPTH {
+                return Err(ErrCode::INTERNAL); // 走不到根：parent 指针损坏
+            }
+            cur = i.parent;
+            out.push(cur);
+        }
+        Ok(Arc::new(out))
     }
 }
 

@@ -6,6 +6,7 @@
 //! 线程上执行（meta-read 线程、后台任务、管理 API 线程）。这两个线程上的 panic（不变量破坏）一律写日志并 abort（fail-stop）。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ use crate::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
 use crate::hooks::pipeline::{HookCall, Pipeline};
 use crate::hooks::traits::KeyLookup;
 use crate::meta::attrs::AttrResolver;
+use crate::meta::cluster::map::MapCache;
 use crate::meta::raft::driver::{Driver, DriverOpts, ProposeOutcome, Published, RaftInput};
 use crate::meta::raft::redb_eio;
 use crate::meta::raft::storage::{KV, read_global};
@@ -62,37 +64,21 @@ pub struct EngineOpts {
 }
 
 /// 执行器闭包与只读回调能用到的一切（[`OpCtx`] 的来源）。插件拿不到 redb 本身。
+/// 集群图不放在这里：每个批次开始时、每个只读请求在 ReadIndex 之后各自从自己的读事务里取一份快照（`maps`，按 map_epoch 缓存）。
 pub struct OpEnv {
     pub pipeline: Arc<Pipeline>,
     pub attrs: AttrResolver,
-    pub map: ClusterMap, // M3：只有 cluster_id 与集群参数；集群图在 M4 起由已提交状态构建
-    pub settings: ClusterSettingsV1,
+    pub maps: MapCache,
 }
 
 impl OpEnv {
-    pub fn new(pipeline: Arc<Pipeline>, cluster_id: [u8; 16], settings: ClusterSettingsV1) -> OpEnv {
-        let map = ClusterMap {
-            map_epoch: 0,
-            cluster_id,
-            leader: None,
-            settings: settings.clone(),
-            features: Default::default(),
-            nodes: vec![],
-            targets: vec![],
-            chains: vec![],
-            classes: vec![],
-            keys: vec![],
-            datakeys: vec![],
-            qos: vec![],
-            evicted: vec![],
-            plugins: Default::default(),
-            warnings: vec![],
-        };
-        OpEnv { pipeline, attrs: AttrResolver {}, map, settings }
+    pub fn new(pipeline: Arc<Pipeline>) -> OpEnv {
+        OpEnv { pipeline, attrs: AttrResolver::default(), maps: MapCache::default() }
     }
 
-    pub fn op_ctx<'a>(&'a self, req: &'a ReqCtx) -> OpCtx<'a> {
-        OpCtx { req, pipeline: &self.pipeline, attrs: &self.attrs, map: &self.map, settings: &self.settings }
+    /// 一个操作的上下文：`map` 是这个批次（或这个只读请求）的集群图快照，集群参数取自它。
+    pub fn op_ctx<'a>(&'a self, req: &'a ReqCtx, map: &'a ClusterMap) -> OpCtx<'a> {
+        OpCtx { req, pipeline: &self.pipeline, attrs: &self.attrs, map, settings: &map.settings }
     }
 }
 
@@ -102,6 +88,7 @@ pub(crate) struct EngineShared {
     pub raft_tx: Sender<RaftInput>,
     pub published: Arc<Published>,
     pub env: OpEnv,
+    pub stopped: AtomicBool, // shutdown 之后为 true（cluster-mgr 线程据此退出）
     batch_ops: Arc<Histogram>,
     batch_bytes: Arc<Histogram>,
     commit_secs: Arc<Histogram>,
@@ -116,6 +103,12 @@ impl EngineShared {
             return ProposeOutcome::Lost;
         }
         rx.recv().unwrap_or(ProposeOutcome::Lost)
+    }
+
+    /// 与读视图 `v` 一致的集群图快照（leader 取自当前角色）。
+    pub fn map_for(&self, v: &ReadView) -> Result<Arc<ClusterMap>, ErrCode> {
+        let leader = Some(self.published.role().leader_id).filter(|id| *id != 0);
+        self.env.maps.get(v, leader)
     }
 
     pub fn observe_batch(&self, ops: usize, bytes: usize, took: Duration) {
@@ -148,9 +141,8 @@ impl EmbeddedEngine {
         let published = driver.published();
         let rtx = db.begin_read().map_err(|e| format!("redb 读事务失败：{e}"))?;
         let missing = |k: &str| format!("元数据库里没有 GLOBAL {k}（不是 wmfs init 建的元数据库？）");
-        let cluster: ClusterInfoV1 = read_global(&rtx, keys::G_CLUSTER)?.ok_or_else(|| missing(keys::G_CLUSTER))?;
-        let settings: ClusterSettingsV1 =
-            read_global(&rtx, keys::G_SETTINGS)?.ok_or_else(|| missing(keys::G_SETTINGS))?;
+        read_global::<ClusterInfoV1>(&rtx, keys::G_CLUSTER)?.ok_or_else(|| missing(keys::G_CLUSTER))?;
+        read_global::<ClusterSettingsV1>(&rtx, keys::G_SETTINGS)?.ok_or_else(|| missing(keys::G_SETTINGS))?;
         drop(rtx);
         let (raft_tx, raft_rx) = bounded(RAFT_QUEUE);
         let raft = fail_stop_thread("raft", move || driver.run(raft_rx))?;
@@ -159,7 +151,8 @@ impl EmbeddedEngine {
             db,
             raft_tx,
             published,
-            env: OpEnv::new(o.pipeline, cluster.cluster_id, settings),
+            env: OpEnv::new(o.pipeline),
+            stopped: AtomicBool::new(false),
             batch_ops: h("wmfs_meta_batch_ops", "每个批次的操作数", BATCH_OPS),
             batch_bytes: h("wmfs_meta_batch_bytes", "每个批次的写集编码字节数", BATCH_BYTES),
             commit_secs: h("wmfs_meta_commit_seconds", "批次从提议到应用的耗时", metrics::SECONDS_BUCKETS),
@@ -168,6 +161,7 @@ impl EmbeddedEngine {
         let s = shared.clone();
         fail_stop_thread("meta-exec", move || executor::run(exec_rx, s))?;
         let gate_secs = h("wmfs_meta_read_gate_seconds", "线性一致读等 ReadIndex 的耗时", metrics::SECONDS_BUCKETS);
+        super::dedup::register_metrics();
         let hook = HookCall::new(&MANIFEST, Hook::MetaEngine);
         Ok(Arc::new(EmbeddedEngine { shared, exec_tx, hook, gate_secs, raft: Mutex::new(Some(raft)) }))
     }
@@ -189,8 +183,20 @@ impl EmbeddedEngine {
         KvKeys { master, eng: self.clone() }
     }
 
+    /// 当前的集群图（本地读已应用的状态，不经 ReadIndex：cluster-mgr 写集群警告的日志用）。
+    pub fn cluster_map(&self) -> Result<Arc<ClusterMap>, ErrCode> {
+        let rtx = self.shared.db.begin_read().map_err(|e| redb_eio("本地读的读事务", e))?;
+        self.shared.map_for(&ReadView::new(&rtx)?)
+    }
+
+    /// 已经 `shutdown` 了吗（cluster-mgr 线程据此退出）。
+    pub fn stopped(&self) -> bool {
+        self.shared.stopped.load(Ordering::Relaxed)
+    }
+
     /// 停止：raft 线程补一次 Immediate 提交、在途提议判 Lost，然后退出（之后的请求一律 NOT_LEADER）。
     pub fn shutdown(&self) {
+        self.shared.stopped.store(true, Ordering::Relaxed);
         let _ = self.shared.raft_tx.send(RaftInput::Shutdown);
         let h = self.raft.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(h) = h {
@@ -206,7 +212,8 @@ impl EmbeddedEngine {
         self.gate_secs.observe(t0.elapsed().as_secs_f64());
         let rtx = self.shared.db.begin_read().map_err(|e| redb_eio("读事务", e))?;
         let view = ReadView::new(&rtx)?;
-        f(&view, &self.shared.env.op_ctx(ctx))
+        let map = self.shared.map_for(&view)?;
+        f(&view, &self.shared.env.op_ctx(ctx, &map))
     }
 }
 

@@ -9,27 +9,32 @@
 //! 之后加入的节点一律先通过快照追上（M8），保证所有节点初始状态相同。服务端认得的 key 从 M3 起来自 KV 里的 KEYMETA
 //! （`meta::engine::KvKeys`）；[`InitKeys`] 是 M1 的临时 key 表，现在只给不带元数据库的组件测试用。
 //! **NODE 最后写**，它是 init 的提交点：NODE 存在 = init 已经完成（`wmfs dev` 靠它判断"已初始化"）；init 中途失败或
-//! 被杀时目录里没有 NODE，删掉重来即可。实现注记（M3）：TARGET 超级块与 `--target` 在 M5，`--profile`/`--owner` 随用到它们
-//! 的里程碑加入（M3 只写 default profile，根目录的属主是运行 init 的用户）。
+//! 被杀时目录里没有 NODE，删掉重来即可。实现注记（M3）：`--profile`/`--owner` 随用到它们的里程碑加入（只写 default
+//! profile，根目录的属主是运行 init 的用户）。实现注记（M4）：`--target PATH[:label,label]` 写进 node.toml 的 `[[target]]`
+//! 与初始 KV 的 TargetRecV1（id 1..=n，gen_chains 用它们生成链）；同一个路径给两次、或一个 target 在另一个里面 → 拒绝
+//! （两个 target 的超级块与 chunk 目录会互相踩到）。target 目录与它的 TARGET 超级块（3.2.3）随 M5 的 chunk_store 一起写
+//! （M4 还不存数据）。
 
 mod initial_kv;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-pub use initial_kv::{HOME_INO, InitialKv, SCRATCH_INO, initial_kv};
+pub use initial_kv::{HOME_INO, InitialKv, SCRATCH_INO, default_class, initial_kv};
 use serde::{Deserialize, Serialize};
 use wmfs_api::hex::{hex, unhex};
 use wmfs_api::types::KeyFile;
 
-use crate::base::config::NodeConfig;
+use crate::base::config::{NodeConfig, TargetConfig};
 use crate::base::types::Role;
 use crate::base::{clock, log, rand, sys};
 use crate::buf::PoolConfig;
 use crate::hooks::traits::KeyLookup;
+use crate::meta::cluster::chains::TARGET_UP;
 use crate::meta::raft::storage;
-use crate::meta::schema::records::{KeyMetaV1, PluginListV1};
+use crate::meta::schema::records::{KeyMetaV1, PluginListV1, TargetRecV1};
 use crate::proto::handshake::derive_secret;
+use crate::proto::peer::ClusterMap;
 
 /// key 号的约定（key 0 = 服务端之间、1 = admin、2 = 默认 client）是协议常量，定义在 `proto::handshake`，这里原样转出。
 pub use crate::proto::handshake::{ADMIN_KEY, CLIENT_KEY, SERVER_KEY};
@@ -74,9 +79,10 @@ pub struct InitOpts {
     pub mgmt_port: u16,
     pub mem: PoolConfig,
     pub failpoints_api: bool,
-    pub debug_ops: bool,         // 允许 wmfs debug kv（wmfs dev 打开；wmfs init 默认关闭）
-    pub host_id: Option<String>, // wmfs dev 用它给每个节点模拟不同的"主机"（1.1）
-    pub plugins: PluginListV1,   // 本节点按 node.toml 装出来的插件清单：写进 GLOBAL plugins（3.4.3、3.7.2）
+    pub debug_ops: bool,            // 允许 wmfs debug kv（wmfs dev 打开；wmfs init 默认关闭）
+    pub host_id: Option<String>,    // wmfs dev 用它给每个节点模拟不同的"主机"（1.1）
+    pub plugins: PluginListV1,      // 本节点按 node.toml 装出来的插件清单：写进 GLOBAL plugins（3.4.3、3.7.2）
+    pub targets: Vec<TargetConfig>, // `--target`：写进 node.toml 的 [[target]] 与初始 KV 的 TargetRecV1（M4）
 }
 
 /// 建一个新的单节点数据目录。目录必须不存在或为空（防止覆盖已有集群，坑 P14）。
@@ -85,6 +91,7 @@ pub fn init_node(o: &InitOpts) -> Result<(), String> {
     if std::fs::read_dir(d).is_ok_and(|mut it| it.next().is_some()) {
         return Err(format!("{} 不是空目录：拒绝初始化（防止覆盖已有集群）", d.display()));
     }
+    check_targets(&o.targets)?;
     for sub in ["keys", "logs", "run", "meta"] {
         std::fs::create_dir_all(d.join(sub)).map_err(|e| format!("建目录 {} 失败：{e}", d.join(sub).display()))?;
     }
@@ -99,6 +106,7 @@ pub fn init_node(o: &InitOpts) -> Result<(), String> {
         toml::Table::from_iter([("listen".to_string(), toml::Value::String(format!("{}:{}", o.addr, o.rpc_port)))]);
     cfg.plugin.insert("tcp".into(), tcp);
     cfg.debug.host_id = o.host_id.clone();
+    cfg.targets = o.targets.clone();
     let node_toml = toml::to_string(&node).map_err(|e| format!("NODE 编码失败：{e}"))?;
     let key = |id| KeyFile { key_id: id, secret: derive_secret(&master, id) }.to_line();
     let write = |name: &str, bytes: &[u8]| {
@@ -134,6 +142,7 @@ fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile) -> Result<(), String> {
         machine_id,
         hostname: read("/proc/sys/kernel/hostname"),
         plugins: o.plugins.clone(),
+        targets: o.targets.iter().map(|t| target_rec(t, node.node_id, node.created_ms)).collect::<Result<_, _>>()?,
     };
     let db = redb::Database::create(&path).map_err(|e| format!("建元数据库 {} 失败：{e}", path.display()))?;
     let private = std::fs::Permissions::from_mode(0o600); // 与 NODE、密钥文件一样只给本用户读写（3.2.1 的实现注记）
@@ -143,6 +152,64 @@ fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile) -> Result<(), String> {
     // meta/ 自己在数据目录里的目录项已经落盘了——写 cluster.key 的 atomic_write 在它建好之后 fsync 过数据目录
     let meta_dir = d.join("meta");
     sys::fsync_dir(&meta_dir).map_err(|e| format!("fsync 目录 {} 失败：{e}", meta_dir.display()))
+}
+
+/// 一个 `[[target]]` 的初始 TargetRecV1（见 `initial_kv` 的实现注记）。
+fn target_rec(t: &TargetConfig, node: u32, created_ms: u64) -> Result<TargetRecV1, String> {
+    Ok(TargetRecV1 {
+        node,
+        path: t.path.clone(),
+        labels: t.labels.clone(),
+        phys_devs: vec![],
+        capacity: t.capacity_bytes()?,
+        boot_id: 0,
+        state: TARGET_UP,
+        last_up_ms: created_ms,
+        read_only: false,
+    })
+}
+
+/// init 写下的初始状态里的集群警告（3.4.3 第 4 步、ADR-0016）：例如单节点上 default 类声明 3 副本、只有 1 个故障域。
+pub fn initial_warnings(o: &InitOpts) -> Vec<String> {
+    let targets = o.targets.iter().filter_map(|t| target_rec(t, 1, 0).ok());
+    let m = ClusterMap {
+        targets: (1u32..).zip(targets).collect(),
+        classes: vec![default_class()],
+        ..ClusterMap::default()
+    };
+    crate::meta::cluster::map::warnings(&m)
+}
+
+/// 解析 `--target PATH[:label,label]`（3.4.3）：路径换成绝对路径，标签只能由小写字母、数字与 `-` 组成。
+/// 路径里不能有 `:`（它分隔标签）。容量不限（`capacity = "0"`；`--target` 没有容量的写法）。
+pub fn parse_target(s: &str) -> Result<TargetConfig, String> {
+    let (path, labels) = s.split_once(':').unwrap_or((s, ""));
+    if path.is_empty() {
+        return Err(format!("--target {s:?}：缺少路径"));
+    }
+    let path = std::path::absolute(path).map_err(|e| format!("--target {s:?}：{e}"))?;
+    let labels: Vec<String> = labels.split(',').filter(|l| !l.is_empty()).map(String::from).collect();
+    let ok = |l: &String| l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if let Some(bad) = labels.iter().find(|l| !ok(l)) {
+        return Err(format!("--target {s:?}：标签 {bad:?} 只能由小写字母、数字与 - 组成"));
+    }
+    Ok(TargetConfig { path: path.display().to_string(), labels, capacity: "0".into() })
+}
+
+/// 同一个节点的 target 不能重复，也不能一个在另一个里面（按路径的各段比较，例如 /data 与 /data/t2）。
+fn check_targets(ts: &[TargetConfig]) -> Result<(), String> {
+    for (i, a) in ts.iter().enumerate() {
+        for b in &ts[i + 1..] {
+            let (pa, pb) = (Path::new(&a.path), Path::new(&b.path));
+            if pa == pb {
+                return Err(format!("target {} 给了两次", a.path));
+            }
+            if pa.starts_with(pb) || pb.starts_with(pa) {
+                return Err(format!("target {} 与 {} 一个在另一个里面：每个 target 要用各自的目录", a.path, b.path));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 读 `<data_dir>/cluster.key`（32 字节）。

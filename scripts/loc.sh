@@ -47,6 +47,7 @@ LIMIT=36000
 # M3（design.md 2.2 的 M3 注记）：core/net 1120 → 1180（单飞建连约 +65：审查后补了"拿着登记表的锁再查一次连接表"与
 # 建连线程 panic 时的收尾；余下 leader_hint、OneWay 服务、call_cb 后台建连约 60）、
 # core/meta/engine 720 → 760（已写约 660：执行器、覆盖层、读闸门、引擎、去重；余下 M4 的 changelog 接入、M8 的 leader 提示约 100）。
+# M4（design.md 2.2 的 M4 注记）：新增约 2,680 行（预算 2,650），没有模块超过估算，估算都不变。
 MODULES="wmfs-api:900 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1180 core/hooks:1060
 core/meta/raft:1570 core/meta/engine:760 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
 core/data:3000 core/client:1800 core/bg:850 core/mgmt:790 core:540 plugins:5380 cli:2950 dashboard:880

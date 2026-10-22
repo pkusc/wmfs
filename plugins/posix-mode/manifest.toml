@@ -1,0 +1,13 @@
+# posix-mode 授权插件的 manifest（design.md 3.7.1、4.3）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "posix-mode"
+version = "0.1.0"
+hooks = ["authz"]
+altitude = 210
+hot_path = true
+abi_version = 1
+attrs = []
+budget_ns = 5000
+fail_points = ["plugin.posix-mode.authz"]
+
+[config_schema]
+# 没有部署参数：权限是文件自己的属性（mode、属主、属组），不进插件配置

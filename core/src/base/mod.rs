@@ -20,6 +20,14 @@ pub mod units;
 
 pub use errcode::ErrCode;
 
+use std::sync::{Mutex, MutexGuard};
+
+/// 拿锁；锁"中毒"了（持锁的线程 panic 过）也照样拿。被保护的都是计数、缓存这类小状态，没有"改到一半"的不变量要守；
+/// 而 raft 与执行器线程上的 panic 会让整个进程 abort（fail-stop，0.2 第 5 条），轮不到别人再用这把锁。
+pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// 测试用：建一个本次测试独有的临时目录（用完由测试自己删除）。
 #[cfg(test)]
 pub(crate) fn test_dir(name: &str) -> std::path::PathBuf {
