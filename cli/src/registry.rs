@@ -3,9 +3,13 @@
 //! 新增一个插件 = 新建插件目录（或独立 crate）+ 这里加一行 + `cli/Cargo.toml` 一个 feature，core 一行不改。
 //! node.toml 只能启停插件（`[plugins] disable`）与给部署参数（`[plugin.<name>]`），不能改顺序。
 
+#[cfg(feature = "local-fs")]
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use wmfs_core::base::config::NodeConfig;
+#[cfg(feature = "local-fs")]
+use wmfs_core::base::types::ChunkId;
 use wmfs_core::hooks::registry::PluginSet;
 use wmfs_core::hooks::traits::Transport;
 use wmfs_core::meta::schema::records::PluginListV1;
@@ -25,12 +29,29 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     s.authz(Arc::new(wmfs_plugins::posix_mode::PosixMode::new()));
     #[cfg(feature = "label-match")]
     s.placement(Arc::new(wmfs_plugins::label_match::LabelMatch::new()));
+    #[cfg(feature = "local-fs")]
+    s.chunk_store(Arc::new(wmfs_plugins::local_fs::LocalFs::new()));
+    #[cfg(feature = "crc32c")]
+    s.transform(Arc::new(wmfs_plugins::crc32c::Crc32c::new()));
+    #[cfg(feature = "replica")]
+    s.codec(Arc::new(wmfs_plugins::replica::Replica::new()));
+    #[cfg(feature = "fifo")]
+    s.qos(Arc::new(wmfs_plugins::fifo::Fifo::new()));
+    #[cfg(feature = "gc")]
+    s.bg_task(Box::new(wmfs_plugins::gc::Gc::new()));
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST); // embedded-kv：代码在 core（元数据 Raft 是契约，4.10）
     if !cfg.plugins.dylib.is_empty() {
         return Err("node.toml 的 [plugins] dylib：动态库插件 M14 才支持".into());
     }
     s.validate(&cfg.plugin)?;
     Ok(s)
+}
+
+/// `id` 的已提交版本在 local-fs target `root` 里的路径（`wmfs debug chunk-path` 等在本机直接找文件用；没编进 local-fs 就没有这几个
+/// 子命令）。
+#[cfg(feature = "local-fs")]
+pub fn chunk_path(root: &Path, id: &ChunkId) -> PathBuf {
+    wmfs_plugins::local_fs::committed_path(root, id)
 }
 
 /// 一次性命令（`wmfs ping` 等）用的传输：同一组传输插件，只用来连别人、不监听。

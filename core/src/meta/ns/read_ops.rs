@@ -4,7 +4,8 @@
 //! readdir：前缀扫描 `02 ino`，从 `after` 之后（不含）开始，最多 `limit`（≤ 1024）条，回复编码 ≤ 512 KiB（先到先停，
 //! `eof = false`）；`plus` 时每条带属性（多一次点查）。目录里没有 `.` 与 `..` 这两项（FUSE 适配层自己补，M6）。
 //! 实现注记（M4）：`Open` 先只回属性、layout 与 inline 内容（只在读打开时带，`common` 的实现注记；`wmfs fs stat` 用它看
-//! layout）；cap 的签发在 M5，配额额度在 M10。
+//! layout）；配额额度在 M10。实现注记（M5）：cap 按打开方式带读/写权限位（`common::sign_cap`）；签之前先核对会话
+//! （`sessions::may_sign_cap`：只读路径不经执行器的会话检查）。
 //! `ResolvePath` 不跟随中间的符号链接（中间的一段是符号链接 → `ENOTDIR`），最后一段是符号链接时返回它本身（像 lstat）。
 
 use super::common::{Node, attr_out, authz, check_name, child, dir, get, open_out, searchable_dir};
@@ -13,8 +14,10 @@ use crate::hooks::traits::AuthzOp;
 use crate::meta::engine::txn::{KvRead, KvScan, OpCtx};
 use crate::meta::schema::keys::{self, ROOT_INO};
 use crate::meta::schema::records::{DentryV1, KIND_SYMLINK, decode_v1};
+use crate::meta::sessions;
+use crate::proto::cap::{RIGHT_READ, RIGHT_WRITE};
 use crate::proto::encode_body;
-use crate::proto::meta::{DirEntryOut, MetaReply};
+use crate::proto::meta::{DirEntryOut, MetaReply, O_ACCMODE, O_RDONLY, O_WRONLY};
 
 /// readdir 一页的上限：条数、回复的编码字节数（3.3.4）。
 pub const MAX_READDIR: u32 = 1024;
@@ -102,14 +105,13 @@ pub fn resolve(v: &dyn KvRead, c: &OpCtx, path: &[u8]) -> Result<MetaReply, ErrC
 
 /// `Open`：按打开方式（O_ACCMODE）要读或写权限；目录不能写打开（`EISDIR`）。只在读打开时带 inline 内容。
 pub fn open(v: &dyn KvRead, c: &OpCtx, ino: u64, flags: u32) -> Result<MetaReply, ErrCode> {
-    const O_ACCMODE: u32 = 3;
-    const O_RDONLY: u32 = 0;
-    const O_WRONLY: u32 = 1;
     let n = get(v, ino)?;
     let (read, write) = (flags & O_ACCMODE != O_WRONLY, flags & O_ACCMODE != O_RDONLY);
     if n.is_dir() && write {
         return Err(ErrCode::EISDIR);
     }
     authz(v, c, AuthzOp::Open { read, write }, Some(&n), None, None)?;
-    Ok(MetaReply::Opened(open_out(v, &n, read)?))
+    sessions::may_sign_cap(v, c.req)?;
+    let rights = if read { RIGHT_READ } else { 0 } | if write { RIGHT_WRITE } else { 0 };
+    Ok(MetaReply::Opened(open_out(v, c, &n, read, rights)?))
 }

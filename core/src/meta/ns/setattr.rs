@@ -2,19 +2,21 @@
 //!
 //! - **截断到 0**（含 `O_TRUNC`、覆盖式 `cp`）：只有元数据，一个闭包——`epoch = max_epoch + 1`，**按当前生效属性重建整个
 //!   layout**（与 create 共用 `new_layout`，必要时生成新链），size = 0，`class_id` 改为新类，F_INLINE 按新 layout 重新判定、
-//!   INLINE 清空；旧 epoch 写 GC 记录（kind 2，宽限 `epoch_gc_grace` 后由 gc 任务删除；旧 inode 有 F_INLINE 时没有 chunk，不写）。
+//!   INLINE 清空；旧 epoch 写 GC 记录（kind 2，宽限 `epoch_gc_grace` 后由 gc 任务删除）。实现注记（M5）：旧 inode 有 F_INLINE 时
+//!   也写——ADR-0034 之后 inline 文件的 epoch 下面也可能有 chunk（Uninline 写完 chunk、提交之前崩溃，或 CAS 因截断失败）。
+//! - 新长度超过单个文件的最大长度（`common::max_file_size`）→ `EFBIG`。
 //! - **截断到 s > 0**：数据面的截断已由客户端先完成（3.4.2.9），这里只改 size；F_INLINE 文件把 INLINE 截到 `min(len, s)`
 //!   （`len(INLINE) ≤ size` 不变式）；`epoch_seen` 与当前 layout 的 epoch 不同 → `STALE_LAYOUT`（客户端截断的是旧 epoch）。
 //! - 改了 size 的 SetAttr 回 `Opened(OpenOut)`（新 attr、layout，3.1.4 C4；调用者能读这个文件时才带 inline 内容），
-//!   否则回 `Entry`。
+//!   否则回 `Entry`。实现注记（M5）：OpenOut 带一张写 cap（能读时也带读权限），截断到 0 之后的写直接用它进新 epoch。
 //! - chmod：只有属主或 root（authz 钩子查）；不在文件所属组里的非 root 设不了 setgid（静默去掉，与 Linux 相同）；有 ACL 时
 //!   同步 `system.posix_acl_access` 的 USER_OBJ / MASK / OTHER。chown：只有 root 能改 uid；属主只能把 gid 改成自己所在的组；
 //!   非目录 chown 之后去掉 setuid、以及带组执行位时的 setgid。非属主改长度也去掉它们（"非属主写入时清除 suid/sgid"）。
 //! - 时间：设成"现在"只要有写权限（或是属主）；设成指定值要是属主或 root。任何改动都更新 ctime、change_id + 1。
 
 use super::common::{
-    MODE_MASK, Node, S_ISGID, S_ISUID, S_IXGRP, attr_out, authz, bump_ctime, get, in_group, is_file, may_read,
-    open_out, save, set_new_layout,
+    MODE_MASK, Node, S_ISGID, attr_out, authz, bump_ctime, get, in_group, is_file, kill_suid, max_file_size, may_read,
+    open_out, save, set_new_layout, write_rights,
 };
 use super::xattr::sync_acl_mode;
 use crate::base::ErrCode;
@@ -77,16 +79,11 @@ pub fn setattr(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, set: &SetAttrIn) -> Resul
     save(v, &n);
     changelog::append(v, c, Change { op: "SetAttr", ino, size: n.rec.size, ..Default::default() })?;
     match set.size {
-        Some(_) => Ok(MetaReply::Opened(open_out(v, &n, may_read(v, c, &n))?)),
+        Some(_) => {
+            let r = may_read(v, c, &n);
+            Ok(MetaReply::Opened(open_out(v, c, &n, r, write_rights(r))?))
+        }
         None => Ok(MetaReply::Entry { attr: attr_out(&n) }),
-    }
-}
-
-/// 去掉 setuid，以及带组执行位时的 setgid（不带组执行位的 setgid 表示强制锁，Linux 保留它）。
-fn kill_suid(n: &mut Node) {
-    n.rec.mode &= !S_ISUID;
-    if n.rec.mode & S_IXGRP != 0 {
-        n.rec.mode &= !S_ISGID;
     }
 }
 
@@ -98,11 +95,14 @@ fn truncate(v: &mut dyn KvTxn, c: &OpCtx, n: &mut Node, size: u64, epoch_seen: u
     if !is_file(n) {
         return Err(ErrCode::EINVAL);
     }
+    if n.rec.layout.as_ref().is_some_and(|l| size > max_file_size(l)) {
+        return Err(ErrCode::EFBIG);
+    }
     let was_inline = n.rec.flags & F_INLINE != 0;
     if size == 0 {
         let old = n.rec.layout.clone();
         set_new_layout(v, c, n)?;
-        if let Some(l) = old.filter(|_| !was_inline) {
+        if let Some(l) = old {
             let now = c.req.now_ms;
             let rec = GcRecV1 { due_ms: now + c.settings.epoch_gc_grace_ms, chains: l.chains, created_ms: now };
             kv::put(v, &keys::gc(GC_EPOCH, n.ino, l.epoch), &rec);

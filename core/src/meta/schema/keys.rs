@@ -111,6 +111,16 @@ pub fn dedup(session: u64, seq: u64) -> Vec<u8> {
 pub fn gc(kind: u8, ino: u64, epoch: u32) -> Vec<u8> {
     make_key(T_GC, &[&[kind], &ino.to_be_bytes(), &epoch.to_be_bytes()])
 }
+/// [`gc`] 的反过来：`0D kind:u8 ino:u64 epoch:u32`（1 + 1 + 8 + 4 = 14 字节）→ (kind, ino, epoch)；不是这个形状 → None。
+/// 实现注记（M5）：新增（只增）。
+pub fn parse_gc(k: &[u8]) -> Option<(u8, u64, u32)> {
+    if k.len() != 14 || k[0] != T_GC {
+        return None;
+    }
+    let ino = u64::from_be_bytes(k[2..10].try_into().ok()?);
+    let epoch = u32::from_be_bytes(k[10..14].try_into().ok()?);
+    Some((k[1], ino, epoch))
+}
 pub fn changelog(seq: u64) -> Vec<u8> {
     make_key(T_CHANGELOG, &[&seq.to_be_bytes()])
 }

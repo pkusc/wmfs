@@ -11,7 +11,7 @@ path = "lib.rs"
 
 [dependencies]
 wmfs-core.workspace = true
-wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "label-match"] }
+wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc"] }
 plugin-mem-transport.workspace = true
 crc32c.workspace = true
 redb.workspace = true
@@ -112,3 +112,44 @@ path = "it/failpoint_ns_plugins.rs"
 
 [lints]
 workspace = true
+
+# M5：单节点数据路径（design.md 9.1 的 chunk 格式、9.3 的单节点部分、9.4 的 chunk.* fail point、ADR-0034）。
+[[test]]
+name = "data_chunk"
+path = "it/data_chunk.rs"
+
+[[test]]
+name = "meta_file_ops"
+path = "it/meta_file_ops.rs"
+
+[[test]]
+name = "data_e2e"
+path = "it/data_e2e.rs"
+
+[[test]]
+name = "data_gc"
+path = "it/data_gc.rs"
+
+[[test]]
+name = "data_target"
+path = "it/data_target.rs"
+
+[[test]]
+name = "failpoint_chunk"
+path = "it/failpoint_chunk.rs"
+
+[[test]]
+name = "failpoint_bg"
+path = "it/failpoint_bg.rs"
+
+[[test]]
+name = "failpoint_chunk_torn"
+path = "it/failpoint_chunk_torn.rs"
+
+[[test]]
+name = "failpoint_uninline_crash"
+path = "it/failpoint_uninline_crash.rs"
+
+[[test]]
+name = "failpoint_uninline_race"
+path = "it/failpoint_uninline_race.rs"

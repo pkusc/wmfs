@@ -12,13 +12,22 @@
 //! 组件测试——不需要元数据引擎），服务端装配（`server::start`）再查"恰好一个"。
 //! 实现注记（M4）：加了 authz 与 placement 两种钩子（各自的 add 方法与访问器）；它们的规则与 authn 相同（altitude 区间、
 //! 同一钩子内不重名、altitude 不相同），已由 `check_one` 与 `validate` 的通用部分覆盖。
+//! 实现注记（M5）：加了 qos、codec、transform、chunk_store、bg_task 五种钩子。各自的规则：transform 的 altitude 要落在它
+//! 那一类的子区间（checksum 700–729、compress 730–759、encrypt 760–789），同一类里算法编号不重复；codec 编号不重复；
+//! qos 只允许一个活跃、chunk_store 最多一个（服务端装配时再查"恰好一个"）。后台任务（`BgTask` 只是 `Send`）放在锁里，
+//! 服务端装配时整批取走交给调度器（[`PluginSet::take_bg_tasks`]），它们的 manifest 另存一份给清单与校验用。
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::base::config::PluginTable;
+use crate::base::lock;
+use crate::bg::task::BgTask;
 use crate::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
-use crate::hooks::traits::{AuthnPlugin, AuthzPlugin, PlacementPlugin, Transport};
+use crate::hooks::traits::{
+    AuthnPlugin, AuthzPlugin, ChunkStore, CodecPlugin, PlacementPlugin, QosPlugin, TransformKind, TransformPlugin,
+    Transport,
+};
 use crate::meta::schema::records::PluginListV1;
 
 /// 本节点装上的插件（按钩子分开、同一钩子内按 altitude 升序）。
@@ -30,6 +39,12 @@ pub struct PluginSet {
     authz: Vec<Arc<dyn AuthzPlugin>>,
     placement: Vec<Arc<dyn PlacementPlugin>>,
     meta_engines: Vec<&'static Manifest>,
+    qos: Vec<Arc<dyn QosPlugin>>,
+    codecs: Vec<Arc<dyn CodecPlugin>>,
+    transforms: Vec<Arc<dyn TransformPlugin>>,
+    chunk_stores: Vec<Arc<dyn ChunkStore>>,
+    bg_tasks: Mutex<Vec<Box<dyn BgTask>>>, // 服务端装配时整批取走（调度器独占它们）
+    bg_manifests: Vec<&'static Manifest>,  // 取走之后清单与校验仍要用
 }
 
 impl PluginSet {
@@ -77,6 +92,60 @@ impl PluginSet {
         }
     }
 
+    pub fn qos(&mut self, p: Arc<dyn QosPlugin>) {
+        if self.enabled(p.manifest()) {
+            self.qos.push(p);
+        }
+    }
+
+    pub fn codec(&mut self, p: Arc<dyn CodecPlugin>) {
+        if self.enabled(p.manifest()) {
+            self.codecs.push(p);
+        }
+    }
+
+    pub fn transform(&mut self, p: Arc<dyn TransformPlugin>) {
+        if self.enabled(p.manifest()) {
+            self.transforms.push(p);
+            self.transforms.sort_by_key(|p| p.manifest().altitude);
+        }
+    }
+
+    pub fn chunk_store(&mut self, p: Arc<dyn ChunkStore>) {
+        if self.enabled(p.manifest()) {
+            self.chunk_stores.push(p);
+        }
+    }
+
+    pub fn bg_task(&mut self, t: Box<dyn BgTask>) {
+        if self.enabled(t.manifest()) {
+            self.bg_manifests.push(t.manifest());
+            lock(&self.bg_tasks).push(t);
+        }
+    }
+
+    /// 取走全部后台任务（服务端装配时交给调度器；只能取一次，之后是空的）。
+    pub fn take_bg_tasks(&self) -> Vec<Box<dyn BgTask>> {
+        std::mem::take(&mut *lock(&self.bg_tasks))
+    }
+
+    pub fn qos_plugins(&self) -> &[Arc<dyn QosPlugin>] {
+        &self.qos
+    }
+
+    pub fn codec_plugins(&self) -> &[Arc<dyn CodecPlugin>] {
+        &self.codecs
+    }
+
+    pub fn transform_plugins(&self) -> &[Arc<dyn TransformPlugin>] {
+        &self.transforms
+    }
+
+    /// 启用的 chunk_store（`validate` 之后最多一个）。
+    pub fn chunk_store_plugin(&self) -> Option<&Arc<dyn ChunkStore>> {
+        self.chunk_stores.first()
+    }
+
     /// 启用的 meta_engine（`validate` 之后最多一个）。
     pub fn meta_engine_manifest(&self) -> Option<&'static Manifest> {
         self.meta_engines.first().copied()
@@ -104,7 +173,13 @@ impl PluginSet {
         let a = self.authn.iter().map(|p| (Hook::Authn, p.manifest()));
         let z = self.authz.iter().map(|p| (Hook::Authz, p.manifest()));
         let pl = self.placement.iter().map(|p| (Hook::Placement, p.manifest()));
-        t.chain(a).chain(z).chain(pl).chain(self.meta_engines.iter().map(|m| (Hook::MetaEngine, *m))).collect()
+        let me = self.meta_engines.iter().map(|m| (Hook::MetaEngine, *m));
+        let q = self.qos.iter().map(|p| (Hook::Qos, p.manifest()));
+        let c = self.codecs.iter().map(|p| (Hook::Codec, p.manifest()));
+        let tf = self.transforms.iter().map(|p| (Hook::Transform, p.manifest()));
+        let cs = self.chunk_stores.iter().map(|p| (Hook::ChunkStore, p.manifest()));
+        let bg = self.bg_manifests.iter().map(|m| (Hook::BgTask, *m));
+        t.chain(a).chain(z).chain(pl).chain(me).chain(q).chain(c).chain(tf).chain(cs).chain(bg).collect()
     }
 
     /// 启动时校验（3.7.2）：每个插件的 manifest（[`check_one`]）；同一钩子内不重名、altitude 不相同；不同的插件不同名；
@@ -140,6 +215,7 @@ impl PluginSet {
             let names: Vec<&str> = self.meta_engines.iter().map(|m| m.name).collect();
             return Err(format!("meta_engine 是唯一型钩子，却启用了 {} 个：{names:?}", names.len()));
         }
+        self.check_data_hooks()?;
         for (i, t) in self.transports.iter().enumerate() {
             if self.transports[..i].iter().any(|o| o.scheme() == t.scheme()) {
                 return Err(format!("有两个传输插件都用 scheme {}", t.scheme()));
@@ -160,6 +236,44 @@ impl PluginSet {
         Ok(())
     }
 
+    /// 数据面几种钩子（qos、chunk_store、transform、codec，M5）特有的规则（见文件头的实现注记）。
+    fn check_data_hooks(&self) -> Result<(), String> {
+        let one = |n: usize, h: Hook| match n {
+            0 | 1 => Ok(()),
+            n => Err(format!(
+                "{} 只允许一个活跃的插件，却启用了 {n} 个（用 node.toml 的 [plugins] disable 停掉多余的）",
+                h.name()
+            )),
+        };
+        one(self.qos.len(), Hook::Qos)?;
+        one(self.chunk_stores.len(), Hook::ChunkStore)?;
+        for (i, t) in self.transforms.iter().enumerate() {
+            let (m, kind) = (t.manifest(), t.kind());
+            let (lo, hi) = transform_range(kind);
+            if !(lo..=hi).contains(&m.altitude) {
+                return Err(format!(
+                    "transform 插件 {} 是 {kind:?} 类，altitude {} 应在 {lo}–{hi}",
+                    m.name, m.altitude
+                ));
+            }
+            if let Some(o) = self.transforms[..i].iter().find(|o| o.kind() == kind && o.alg_id() == t.alg_id()) {
+                return Err(format!(
+                    "transform 插件 {} 与 {} 的算法编号都是 {}",
+                    m.name,
+                    o.manifest().name,
+                    t.alg_id()
+                ));
+            }
+        }
+        for (i, c) in self.codecs.iter().enumerate() {
+            if let Some(o) = self.codecs[..i].iter().find(|o| o.codec_id() == c.codec_id()) {
+                let (a, b) = (c.manifest().name, o.manifest().name);
+                return Err(format!("codec 插件 {a} 与 {b} 的编号都是 {}", c.codec_id()));
+            }
+        }
+        Ok(())
+    }
+
     /// 本节点会影响策略的插件清单（3.7.2 第 1 条）：8 个钩子上启用的插件各一条 `"钩子:名字"`，排序；只比名字、不比版本。
     pub fn plugin_list(&self) -> PluginListV1 {
         let mut plugins: Vec<String> = self
@@ -171,6 +285,15 @@ impl PluginSet {
         plugins.sort();
         plugins.dedup();
         PluginListV1 { plugins }
+    }
+}
+
+/// transform 每一类的 altitude 子区间（3.7.2）。
+fn transform_range(kind: TransformKind) -> (u16, u16) {
+    match kind {
+        TransformKind::Checksum => (700, 729),
+        TransformKind::Compress => (730, 759),
+        TransformKind::Encrypt => (760, 789),
     }
 }
 

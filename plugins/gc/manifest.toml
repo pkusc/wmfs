@@ -1,0 +1,13 @@
+# gc 后台任务插件的 manifest（design.md 3.7.1、4.12）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "gc"
+version = "0.1.0"
+hooks = ["bg_task"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = []
+budget_ns = 0
+fail_points = ["plugin.gc.bg_task"]
+
+[config_schema]
+# 没有部署参数：宽限期 epoch_gc_grace 是集群运行参数（wmfs cluster set，M7），限速用 wmfs task set gc（M11）

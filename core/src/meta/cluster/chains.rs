@@ -5,8 +5,8 @@
 //! 没有时调用它，直接用返回值作 placement 的候选）。写了 CHAIN 键 = 拓扑变了，执行器执行完这个操作就结束本批（3.4.1.4
 //! 规则 5）。之后由链管理器维护（M9）。
 //!
-//! 候选 target（[`candidates`]）= 状态 Up、标签匹配存储类的 `label`（`"*"` 匹配任何 target）；`dedicated` 的类独占它的
-//! target，别的类不得使用；按 target id 排序。链数 = 候选数（每个 target 当一次 head）；第 i 条链从候选 i 开始按环形顺序取，
+//! 候选 target（[`candidates`]）= 状态 Up、不是只读（3.2.3：只读的 target 不进入任何链的写路径）、标签匹配存储类的 `label`
+//! （`"*"` 匹配任何 target）；`dedicated` 的类独占它的 target，别的类不得使用；按 target id 排序。链数 = 候选数（每个 target 当一次 head）；第 i 条链从候选 i 开始按环形顺序取，
 //! 跳过同一节点（故障域 = 节点）的 target，直到 replicas 个或候选用完（[`plan`]）——故障域不够时链以较短长度创建
 //! （期望长度仍是 replicas，`wmfs status` 与集群警告显示差距，ADR-0016）。新链 `ver = 1`、`incarnation = 1`、成员全部 Serving。
 
@@ -34,7 +34,7 @@ pub fn candidates(m: &ClusterMap, class: &StorageClassV1) -> Vec<(u32, u32)> {
     let mut v: Vec<(u32, u32)> = m
         .targets
         .iter()
-        .filter(|(_, t)| t.state == TARGET_UP && label_ok(&t.labels, &class.label) && !taken(&t.labels))
+        .filter(|(_, t)| t.state == TARGET_UP && !t.read_only && label_ok(&t.labels, &class.label) && !taken(&t.labels))
         .map(|(id, t)| (*id, t.node))
         .collect();
     v.sort();

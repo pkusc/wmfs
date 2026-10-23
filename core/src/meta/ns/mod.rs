@@ -10,14 +10,16 @@
 //! - [`setattr`]：chmod、chown、utimensat、truncate（截断到 0 按当前属性重建 layout）
 //! - [`xattr`]：扩展属性与 POSIX ACL 的存储（mode 与 F_HAS_ACL 同步）
 //! - [`acl`]：ACL 的二进制格式、新文件继承默认 ACL（umask 规则）
+//! - [`file_ops`]：CommitWrite、Fallocate、GetInline、RenewCap，以及服务端 uninline 的只读前半段（M5）
 //!
-//! 实现注记（M4）：`StatFs`（要 target 的容量，M5）、`GetInline`/`RenewCap`/`CommitWrite`/`Fallocate`（M5）、`SetAtime`（M6）、
-//! `GetLock`/`SetLock`/`AppendReserve`（M12）还没有实现，回 `FEATURE_UNSUPPORTED`；回收站（M12）、递归计数（M7）、
-//! 配额（M10）、目录属性的继承（M7）随各自的里程碑加入。
+//! 实现注记（M4）：`SetAtime`（M6）、`GetLock`/`SetLock`/`AppendReserve`（M12）还没有实现，回 `FEATURE_UNSUPPORTED`；回收站
+//! （M12）、递归计数（M7）、配额（M10）、目录属性的继承（M7）随各自的里程碑加入。实现注记（M5）：`StatFs`（要心跳报上来的
+//! target 容量，`meta/cluster/targets.rs`）与 `Uninline`（要经数据面写 chunk，`meta/uninline.rs`）由元数据服务另外处理。
 
 pub mod acl;
 pub mod common;
 pub mod create;
+pub mod file_ops;
 pub mod read_ops;
 pub mod remove;
 pub mod rename;
@@ -60,6 +62,19 @@ pub fn txn_op(op: MetaOp) -> Option<TxnOp> {
             Box::new(move |v, c| xattr::setxattr(v, c, ino, &name, &value, flags))
         }
         MetaOp::RemoveXattr { ino, name } => Box::new(move |v, c| xattr::removexattr(v, c, ino, &name)),
+        MetaOp::CommitWrite { ino, epoch, new_size, inline_patches, uninline_expect_change_id, .. } => {
+            let w = file_ops::CommitIn {
+                ino,
+                epoch,
+                new_size,
+                patches: inline_patches,
+                expect_change_id: uninline_expect_change_id,
+            };
+            Box::new(move |v, c| file_ops::commit_write(v, c, &w))
+        }
+        MetaOp::Fallocate { ino, offset, len, mode } => {
+            Box::new(move |v, c| file_ops::fallocate(v, c, ino, offset, len, mode))
+        }
         _ => return None,
     })
 }
@@ -76,6 +91,8 @@ pub fn is_read(op: &MetaOp) -> bool {
             | MetaOp::ListXattr { .. }
             | MetaOp::ResolvePath { .. }
             | MetaOp::Open { .. }
+            | MetaOp::GetInline { .. }
+            | MetaOp::RenewCap { .. }
     )
 }
 
@@ -90,6 +107,8 @@ pub fn read(v: &dyn KvScan, c: &OpCtx, op: &MetaOp) -> Result<MetaReply, ErrCode
         MetaOp::ListXattr { ino } => xattr::listxattr(v, c, *ino),
         MetaOp::ResolvePath { path } => read_ops::resolve(v, c, path),
         MetaOp::Open { ino, flags } => read_ops::open(v, c, *ino, *flags),
+        MetaOp::GetInline { ino } => file_ops::get_inline(v, c, *ino),
+        MetaOp::RenewCap { ino, write } => file_ops::renew_cap(v, c, *ino, *write),
         _ => Err(ErrCode::FEATURE_UNSUPPORTED),
     }
 }

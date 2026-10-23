@@ -9,7 +9,7 @@ use wmfs_core::meta::schema::records::{
     ChainRecV1, ChangeRecV1, F_INLINE, F_ORPHAN, GcRecV1, KIND_CHR, KIND_DIR, KIND_FIFO, KIND_FILE, KIND_SYMLINK,
     decode_v1,
 };
-use wmfs_core::proto::meta::{MetaOp, MetaReply, SetAttrIn};
+use wmfs_core::proto::meta::{MetaOp, MetaReply, O_RDONLY, O_RDWR, O_WRONLY, SetAttrIn};
 use wmfs_testkit::harness::ns::{Ns, OWNER, ROOT, user};
 
 fn name(s: &str) -> Vec<u8> {
@@ -248,9 +248,9 @@ fn permission_bits_and_sticky_directories() {
     ns.op(&OWNER, MetaOp::Unlink { parent: scratch, name: name("f2") }).unwrap(); // OWNER 是 /scratch 的属主
     let open = |ino, flags| MetaOp::Open { ino, flags };
     let f = ns.create(&OWNER, p, "f").unwrap(); // 0644
-    assert!(matches!(ns.read(&u2, open(f, 0)), Ok(MetaReply::Opened(o)) if o.layout.is_some()), "其他人可读");
-    assert_eq!(ns.read(&u2, open(f, 1)), Err(ErrCode::EACCES), "其他人不可写");
-    assert_eq!(ns.read(&OWNER, open(p, 2)), Err(ErrCode::EISDIR));
+    assert!(matches!(ns.read(&u2, open(f, O_RDONLY)), Ok(MetaReply::Opened(o)) if o.layout.is_some()), "其他人可读");
+    assert_eq!(ns.read(&u2, open(f, O_WRONLY)), Err(ErrCode::EACCES), "其他人不可写");
+    assert_eq!(ns.read(&OWNER, open(p, O_RDWR)), Err(ErrCode::EISDIR));
     let again = MetaOp::Create { parent: p, name: name("f"), mode: 0o644, umask: 0, excl: false };
     assert_eq!(ns.op(&u2, again), Err(ErrCode::EACCES), "按名字打开已有的 0644 文件也要写权限");
 }

@@ -128,7 +128,16 @@ pub fn rename(
         }
     }
     ps.apply(v, c, (-1, -dir_moves), (dsize, dnlink));
-    let ch = Change { op: "Rename", ino: src.ino, parent, name, new_parent, new_name, size: src.rec.size };
+    let ch = Change {
+        op: "Rename",
+        ino: src.ino,
+        parent,
+        name,
+        new_parent,
+        new_name,
+        size: src.rec.size,
+        ..Default::default()
+    };
     changelog::append(v, c, ch)?;
     Ok(MetaReply::Ok)
 }
@@ -153,7 +162,8 @@ fn exchange(v: &mut dyn KvTxn, c: &OpCtx, ps: Parents, mut a: Side, mut b: Side)
     let (ad, bd) = ((across && a.node.is_dir()) as i64, (across && b.node.is_dir()) as i64);
     ps.apply(v, c, (0, bd - ad), (0, ad - bd));
     let (ino, size) = (a.node.ino, a.node.rec.size);
-    let ch = Change { op: "Rename", ino, parent: a.parent, name: a.name, new_parent: b.parent, new_name: b.name, size };
+    let (parent, name, new_parent, new_name) = (a.parent, a.name, b.parent, b.name);
+    let ch = Change { op: "Rename", ino, parent, name, new_parent, new_name, size, ..Default::default() };
     changelog::append(v, c, ch)?;
     Ok(MetaReply::Ok)
 }

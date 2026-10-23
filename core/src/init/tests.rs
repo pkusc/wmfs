@@ -18,7 +18,10 @@ fn opts(d: &Path) -> InitOpts {
         debug_ops: true,
         host_id: Some("host-1".into()),
         plugins: PluginListV1 { plugins: vec!["authn:shared-key".into()] },
-        targets: vec![TargetConfig { capacity: "20G".into(), ..parse_target("/data/t1:nvme,fast").unwrap() }],
+        targets: vec![TargetConfig {
+            capacity: "20G".into(),
+            ..parse_target(&format!("{}/t1:nvme,fast", d.display())).unwrap()
+        }],
     }
 }
 
@@ -42,6 +45,13 @@ fn init_writes_files_and_refuses_non_empty_dir() {
     assert!(keys.secret(0).is_some() && keys.meta(0).is_none(), "key 0 不在 KEYMETA 里");
     assert!(keys.secret(3).is_none() && keys.meta(3).is_none());
     assert!(init_node(&o).unwrap_err().contains("不是空目录"), "第二次 init 必须拒绝");
+    // M5：每个 target 一个超级块（target_id 1..=n、本集群的 cluster_id）
+    let sb = TargetSuperblock::decode(&std::fs::read(d.join("t1/TARGET")).unwrap()).unwrap();
+    assert_eq!((sb.target_id, sb.node_id, sb.cluster_id), (1, 1, n.cluster_id_bytes().unwrap()));
+    let mut again = InitOpts { data_dir: d.join("n2"), ..opts(&d) };
+    again.targets.insert(0, parse_target(&format!("{}/t0", d.display())).unwrap()); // 第 1 个是新的，第 2 个已经有超级块
+    assert!(init_node(&again).unwrap_err().contains("已经有 target 超级块"), "target 已经属于一个集群");
+    assert!(!d.join("n2").exists() && !d.join("t0").exists(), "被拒绝时什么也没写：改正参数就能重来");
     std::fs::remove_dir_all(&d).unwrap();
 }
 
@@ -74,9 +84,10 @@ fn init_writes_the_index_1_metadata_state() {
     assert_eq!(next_ino, 18);
     // M4：--target 写 TargetRecV1（id 1..=n）与 node.toml 的 [[target]]
     let t: TargetRecV1 = decode_v1(&get(keys::target(1)).unwrap()).unwrap();
+    let want_path = d.join("t1").display().to_string();
     assert_eq!(
         (t.node, t.path.as_str(), t.labels.clone(), t.capacity, t.state),
-        (1, "/data/t1", vec!["nvme".to_string(), "fast".to_string()], 20 << 30, 1)
+        (1, want_path.as_str(), vec!["nvme".to_string(), "fast".to_string()], 20 << 30, 1)
     );
     assert!(get(keys::target(2)).is_none());
     let next_target: u32 = decode_v1(&get(keys::global(keys::G_NEXT_TARGET)).unwrap()).unwrap();
@@ -96,12 +107,15 @@ fn targets_on_the_command_line_and_the_initial_warnings() {
     assert!(parse_target("/x:NVMe").is_err(), "标签只能是小写字母、数字与 -");
     let d = crate::base::test_dir("init-warn");
     let mut o = opts(&d);
-    let twice =
-        |a: &str, b: &str| InitOpts { targets: vec![parse_target(a).unwrap(), parse_target(b).unwrap()], ..opts(&d) };
-    assert!(init_node(&twice("/x", "/x/")).unwrap_err().contains("给了两次"), "同一个路径给两次");
-    assert!(init_node(&twice("/x/t1", "/x")).unwrap_err().contains("一个在另一个里面"), "互相嵌套");
+    let x = d.join("x").display().to_string();
+    let twice = |a: &str, b: &str| {
+        let t = |s: &str| parse_target(&format!("{x}{s}")).unwrap();
+        InitOpts { targets: vec![t(a), t(b)], ..opts(&d) }
+    };
+    assert!(init_node(&twice("", "/")).unwrap_err().contains("给了两次"), "同一个路径给两次");
+    assert!(init_node(&twice("/t1", "")).unwrap_err().contains("一个在另一个里面"), "互相嵌套");
     assert!(!o.data_dir.exists(), "拒绝时什么也没写");
-    assert!(init_node(&twice("/x/t1", "/x/t10")).is_ok(), "/x/t10 不在 /x/t1 里面（按路径的各段比较）");
+    assert!(init_node(&twice("/t1", "/t10")).is_ok(), "x/t10 不在 x/t1 里面（按路径的各段比较）");
     let w = initial_warnings(&o);
     assert_eq!(
         w,

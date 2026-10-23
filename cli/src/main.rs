@@ -2,8 +2,9 @@
 //!
 //! M1 的子命令：`doctor`、`init`、`server`、`ping`、`failpoint set/clear/list`、`dev up/down/env/status/kill/start/logs`
 //! （基础版）、`debug gen-key`；M3 加了 `dev wait`（leader）与 `debug kv put/get/bench`，`init` 写元数据的初始状态；
-//! M4 加了 `fs`（元数据命令与 `--as-uid`）、`init --target`。其余子命令随里程碑加入。
-//! 插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
+//! M4 加了 `fs`（元数据命令与 `--as-uid`）、`init --target`。M5 加了 `fs put/get/cat/truncate` 与
+//! `debug chunk-path/chunk-header/corrupt-chunk`（按 local-fs 的路径规则找 chunk 文件：没编进 local-fs 插件就没有这三个子命令）。
+//! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod debug;
 mod dev;
@@ -64,7 +65,7 @@ enum Cmd {
         #[arg(long, global = true)]
         dir: Option<PathBuf>,
     },
-    /// 不经 FUSE 的调试客户端：直接发元数据请求（ls、stat、mkdir、rmdir、rm、mv、ln、touch）
+    /// 不经 FUSE 的调试客户端：直接发元数据与数据请求（ls、stat、mkdir、rmdir、rm、mv、ln、touch、put、get、cat、truncate）
     Fs(fs::FsArgs),
     /// 调试工具
     Debug {
@@ -86,6 +87,25 @@ enum DebugCmd {
         #[command(subcommand)]
         cmd: debug::KvCmd,
     },
+    /// 某个文件第 idx 个 chunk 的已提交版本在本机上的路径（--node 选链上哪个节点的副本，默认 head）
+    #[cfg(feature = "local-fs")]
+    ChunkPath(debug::chunk::Where),
+    /// 解析一个 chunk 文件的固定头与块表
+    #[cfg(feature = "local-fs")]
+    ChunkHeader {
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 人为制造一个坏块：按块表找到第 b 块的存储字节，翻转其中一个字节（演示与验收用）
+    #[cfg(feature = "local-fs")]
+    CorruptChunk {
+        #[command(flatten)]
+        at: debug::chunk::Where,
+        /// 第几块（从 0 起）
+        #[arg(long, default_value_t = 0)]
+        block: u32,
+    },
 }
 
 fn main() {
@@ -105,6 +125,12 @@ fn main() {
         Cmd::Fs(a) => fs::run(a),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),
+        #[cfg(feature = "local-fs")]
+        Cmd::Debug { cmd: DebugCmd::ChunkPath(w) } => debug::chunk::chunk_path(&w),
+        #[cfg(feature = "local-fs")]
+        Cmd::Debug { cmd: DebugCmd::ChunkHeader { file, json } } => debug::chunk::chunk_header(&file, json),
+        #[cfg(feature = "local-fs")]
+        Cmd::Debug { cmd: DebugCmd::CorruptChunk { at, block } } => debug::chunk::corrupt(&at, block),
     };
     std::process::exit(code);
 }
@@ -191,7 +217,17 @@ mod tests {
     #[test]
     fn registry_builds_the_default_plugin_set() {
         let s = super::registry::build_plugins(&Default::default()).unwrap();
-        assert_eq!(s.plugin_list().plugins, vec!["authn:shared-key", "authz:posix-mode", "placement:label-match"]);
+        let want = [
+            "authn:shared-key",
+            "authz:posix-mode",
+            "bg_task:gc",
+            "codec:replica",
+            "placement:label-match",
+            "qos:fifo",
+            "transform:crc32c",
+        ];
+        assert_eq!(s.plugin_list().plugins, want, "chunk_store（local-fs）与传输插件不进集群插件清单（3.7.2）");
+        assert!(s.chunk_store_plugin().is_some());
         let t = super::registry::client_transports().unwrap();
         assert_eq!(
             t.iter().map(|t| t.scheme()).collect::<Vec<_>>(),

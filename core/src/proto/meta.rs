@@ -6,6 +6,9 @@
 //! `last_seen` 与打开文件集合（3.5.6）。
 //!
 //! postcard 编码 enum 用的是变体序号：**变体顺序就是线格式**，新变体只能加在末尾（3.2.11）。
+//! 实现注记（M5）：`MetaOp::Uninline { ino }` 按 ADR-0034 追加在末尾（金样 `tests/golden/meta.golden` 的 `MetaOp.Uninline`）：
+//! inline 小文件这次会长过 `inline_max` 时，客户端请服务端把旧内容搬进 chunk（只有写权限的人也能把小文件写大，
+//! `GetInline` 仍只给能读的人）。
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +25,12 @@ pub const RENAME_EXCHANGE: u32 = 2;
 pub const RENAME_WHITEOUT: u32 = 4;
 pub const XATTR_CREATE: u32 = 1;
 pub const XATTR_REPLACE: u32 = 2;
+// `Open.flags` 的访问方式（O_ACCMODE 那两位）：原样沿用 Linux open(2) 的数值。实现注记（M5）：新增（只增），钉在
+// tests/golden/constants.golden。
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_RDWR: u32 = 2;
+pub const O_ACCMODE: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ReqHead {
@@ -85,6 +94,8 @@ pub enum MetaOp {
     // ---- 调试（仅 admin key，且服务端 node.toml 里 debug_ops = true）----
     DebugPut { key: Vec<u8>, value: Vec<u8> },                           // 写 0x2F 键空间
     DebugGet { key: Vec<u8> },
+    // ---- ADR-0034（M5 追加，只增不改）----
+    Uninline { ino: u64 },                                               // 服务端把 inline 内容搬进 chunk：要写权限；幂等；只读路径、seq 0；回 Opened
 }
 
 impl MetaOp {
@@ -124,6 +135,7 @@ impl MetaOp {
             MetaOp::SetLock { .. } => "SetLock",
             MetaOp::DebugPut { .. } => "DebugPut",
             MetaOp::DebugGet { .. } => "DebugGet",
+            MetaOp::Uninline { .. } => "Uninline",
         }
     }
 }

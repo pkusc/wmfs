@@ -63,6 +63,7 @@ pub struct OpCtx<'a> {
     pub attrs: &'a AttrResolver, // 目录属性解析（带 attr_epoch 缓存，3.8）
     pub map: &'a ClusterMap, // 批次开始时的集群图快照（placement 用）
     pub settings: &'a ClusterSettingsV1,
+    pub cap_key: &'a [u8; 32], // 实现注记（M5）：K_cap——Open/Create/改长度的 SetAttr 的回复与后台任务的管理 cap 都在闭包里签
 }
 
 // ---- 3.4.1.4 串行执行器的请求 ----
@@ -171,7 +172,8 @@ mod tests {
             empty_map(),
             ClusterSettingsV1::default(),
         );
-        let ctx = OpCtx { req: &req, pipeline: &pipeline, attrs: &attrs, map: &map, settings: &settings };
+        let ctx =
+            OpCtx { req: &req, pipeline: &pipeline, attrs: &attrs, map: &map, settings: &settings, cap_key: &[0; 32] };
 
         let mut kv = BTreeMap::new();
         let op: TxnOp = Box::new(|v, _c| put_if_absent(v, b"k"));

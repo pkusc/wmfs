@@ -10,7 +10,7 @@
 use super::acl;
 use super::common::{
     MAX_LINKS, MAX_SYMLINK, Node, S_ISVTX, alloc_ino, attr_out, authz, bump_ctime, check_name, child, dir, get,
-    link_dentry, may_read, new_node, open_out, save, searchable_dir, set_new_layout, update_dir,
+    link_dentry, may_read, new_node, open_out, save, searchable_dir, set_new_layout, update_dir, write_rights,
 };
 use super::xattr::{ACL_DEFAULT, get_xattr, put_acls};
 use crate::base::ErrCode;
@@ -20,6 +20,7 @@ use crate::meta::engine::txn::{KvTxn, OpCtx};
 use crate::meta::schema::records::{
     F_ORPHAN, KIND_BLK, KIND_CHR, KIND_DIR, KIND_FIFO, KIND_FILE, KIND_SOCK, KIND_SYMLINK,
 };
+use crate::proto::cap::{RIGHT_READ, RIGHT_WRITE};
 use crate::proto::meta::MetaReply;
 
 /// 一个待建的 inode。
@@ -89,12 +90,13 @@ pub fn create(
             return Err(ErrCode::EISDIR);
         }
         authz(v, c, AuthzOp::Open { read: false, write: true }, Some(&n), None, None)?;
-        return Ok(MetaReply::Opened(open_out(v, &n, may_read(v, c, &n))?));
+        let r = may_read(v, c, &n);
+        return Ok(MetaReply::Opened(open_out(v, c, &n, r, write_rights(r))?));
     }
     authz(v, c, AuthzOp::Create, None, Some(&p), None)?;
     let o = NewInode { name, kind: KIND_FILE, mode, umask, rdev: 0, target: b"", op: "Create" };
     let n = make(v, c, &mut p, o)?;
-    Ok(MetaReply::Opened(open_out(v, &n, true)?))
+    Ok(MetaReply::Opened(open_out(v, c, &n, true, RIGHT_READ | RIGHT_WRITE)?)) // 新建的文件：创建者读写都可以（POSIX）
 }
 
 pub fn mkdir(

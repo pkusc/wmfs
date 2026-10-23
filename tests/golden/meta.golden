@@ -34,6 +34,7 @@ MetaOp.Fallocate 1d120080804000
 MetaOp.SetLock 1e12bb01922100ffffffffffffffff7f02
 MetaOp.DebugPut 1f0568656c6c6f05776f726c64
 MetaOp.DebugGet 200568656c6c6f
+MetaOp.Uninline 219280808010
 MetaReply.Session 00b0ea0109
 MetaReply.Heartbeat 01b0ea010901
 MetaReply.Entry 021201a003e807e9070280808080208abcb5ad0da58d068cbcb5ad0da68d068ebcb5ad0da78d0690bcb5ad0da88d0603090402e80705

@@ -83,6 +83,24 @@ pub struct ReqCtx {
     pub internal: bool, // 内部操作（cluster-mgr、后台任务）：seq = 0、who = 内部 admin
 }
 
+impl ReqCtx {
+    /// 内部操作（cluster-mgr、后台任务、心跳与服务端 uninline 的内部批次）的上下文：内部 admin（uid 0、key 0 的 Server 身份）、
+    /// 不属于任何会话、seq 0（不进去重表）、时间取现在的墙钟。实现注记（M5）：新增（只增不改）。
+    pub fn internal() -> ReqCtx {
+        let conn = Arc::new(ConnIdentity {
+            key_id: 0,
+            role: Role::Server,
+            tenant: 0,
+            uid_ranges: vec![(0, u32::MAX)],
+            root_squash: false,
+            path_caps: vec![],
+        });
+        let who = Principal { uid: 0, gid: 0, groups: vec![], tenant: 0, job_id: 0, conn };
+        let (now, now_ms) = (super::clock::wall_ts(), super::clock::wall_ms());
+        ReqCtx { who, session: 0, seq: 0, pid: 0, trace_id: 0, now, now_ms, internal: true }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

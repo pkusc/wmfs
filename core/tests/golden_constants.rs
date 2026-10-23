@@ -20,7 +20,8 @@ use wmfs_core::proto::cap::{CAP_MAC_LEN, RIGHT_ADMIN, RIGHT_READ, RIGHT_WRITE};
 use wmfs_core::proto::features::*;
 use wmfs_core::proto::frame::*;
 use wmfs_core::proto::meta::{
-    DEDUP_WINDOW, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT, XATTR_CREATE, XATTR_REPLACE,
+    DEDUP_WINDOW, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT,
+    XATTR_CREATE, XATTR_REPLACE,
 };
 
 #[test]
@@ -218,5 +219,10 @@ fn golden_constants() {
     }
     g.add("xattr.ACL_ACCESS", ACL_ACCESS.to_vec());
     g.add("xattr.ACL_DEFAULT", ACL_DEFAULT.to_vec());
+    // M5 追加：Open.flags 的访问方式（沿用 Linux open(2) 的数值）、codec 编号
+    for (n, v) in [("O_RDONLY", O_RDONLY), ("O_WRONLY", O_WRONLY), ("O_RDWR", O_RDWR), ("O_ACCMODE", O_ACCMODE)] {
+        g.add(n, v.to_le_bytes().to_vec());
+    }
+    g.add("CODEC_REPLICA", vec![wmfs_core::hooks::traits::CODEC_REPLICA]);
     g.check();
 }

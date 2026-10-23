@@ -254,9 +254,12 @@ pub enum ShardSpec {
     Whole,
 }
 
+/// `LayoutV1.codec` 的编号：1 = replica（多副本；cap 里没有 codec，首发只有这一种）。实现注记（M5）：新增（只增）。
+pub const CODEC_REPLICA: u8 = 1;
+
 pub trait CodecPlugin: Send + Sync {
     fn manifest(&self) -> &'static Manifest;
-    fn codec_id(&self) -> u8; // 1 = replica
+    fn codec_id(&self) -> u8; // 1 = replica（CODEC_REPLICA）
     fn shards(&self, chain_len: usize) -> Vec<ShardSpec>; // 链上每个成员存什么
     fn read_order(&self, serving: &[(u32, u32)], prefer_node: Option<u32>, chunk: &ChunkId) -> Vec<u32>; // 读副本的尝试顺序
 }

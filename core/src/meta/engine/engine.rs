@@ -61,6 +61,7 @@ pub struct EngineOpts {
     pub node_id: u32,
     pub plugins: PluginListV1, // 本节点的插件清单（与已提交的 GLOBAL plugins 一致才就绪，3.7.2）
     pub pipeline: Arc<Pipeline>,
+    pub cap_key: [u8; 32], // K_cap（由 cluster.key 派生，3.3.2）：闭包里签 cap 用（M5）
 }
 
 /// 执行器闭包与只读回调能用到的一切（[`OpCtx`] 的来源）。插件拿不到 redb 本身。
@@ -69,16 +70,24 @@ pub struct OpEnv {
     pub pipeline: Arc<Pipeline>,
     pub attrs: AttrResolver,
     pub maps: MapCache,
+    pub cap_key: [u8; 32],
 }
 
 impl OpEnv {
-    pub fn new(pipeline: Arc<Pipeline>) -> OpEnv {
-        OpEnv { pipeline, attrs: AttrResolver::default(), maps: MapCache::default() }
+    pub fn new(pipeline: Arc<Pipeline>, cap_key: [u8; 32]) -> OpEnv {
+        OpEnv { pipeline, attrs: AttrResolver::default(), maps: MapCache::default(), cap_key }
     }
 
     /// 一个操作的上下文：`map` 是这个批次（或这个只读请求）的集群图快照，集群参数取自它。
     pub fn op_ctx<'a>(&'a self, req: &'a ReqCtx, map: &'a ClusterMap) -> OpCtx<'a> {
-        OpCtx { req, pipeline: &self.pipeline, attrs: &self.attrs, map, settings: &map.settings }
+        OpCtx {
+            req,
+            pipeline: &self.pipeline,
+            attrs: &self.attrs,
+            map,
+            settings: &map.settings,
+            cap_key: &self.cap_key,
+        }
     }
 }
 
@@ -151,7 +160,7 @@ impl EmbeddedEngine {
             db,
             raft_tx,
             published,
-            env: OpEnv::new(o.pipeline),
+            env: OpEnv::new(o.pipeline, o.cap_key),
             stopped: AtomicBool::new(false),
             batch_ops: h("wmfs_meta_batch_ops", "每个批次的操作数", BATCH_OPS),
             batch_bytes: h("wmfs_meta_batch_bytes", "每个批次的写集编码字节数", BATCH_BYTES),

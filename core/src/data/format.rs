@@ -44,6 +44,31 @@ pub const CMP_ZSTD: u8 = 2; // 128..=255 保留给二期动态库算法
 pub const ENC_NONE: u8 = 0;
 pub const ENC_AES256GCM: u8 = 1;
 
+/// 算法编号的名字（`wmfs debug chunk-header` 等给人看的输出用；不认识的编号 → "?"）。实现注记（M5）：新增（只增）。
+pub fn checksum_name(alg: u8) -> &'static str {
+    match alg {
+        CK_CRC32C => "crc32c",
+        CK_XXH3 => "xxh3",
+        CK_BLAKE3 => "blake3",
+        _ => "?",
+    }
+}
+pub fn compress_name(alg: u8) -> &'static str {
+    match alg {
+        CMP_NONE => "none",
+        CMP_LZ4 => "lz4",
+        CMP_ZSTD => "zstd",
+        _ => "?",
+    }
+}
+pub fn encrypt_name(alg: u8) -> &'static str {
+    match alg {
+        ENC_NONE => "none",
+        ENC_AES256GCM => "aes-256-gcm",
+        _ => "?",
+    }
+}
+
 /// chunk 文件的固定头（magic 与 format_version 由 encode/decode 处理）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkHeader {

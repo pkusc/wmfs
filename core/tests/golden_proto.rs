@@ -147,6 +147,7 @@ fn meta_ops() -> Vec<(&'static str, MetaOp)> {
         ("SetLock", MetaOp::SetLock { ino: 18, owner: 0xBB, pid: 4242, start: 0, end: u64::MAX >> 1, kind: 2 }),
         ("DebugPut", MetaOp::DebugPut { key: b"hello".to_vec(), value: b"world".to_vec() }),
         ("DebugGet", MetaOp::DebugGet { key: b"hello".to_vec() }),
+        ("Uninline", MetaOp::Uninline { ino: 0x1_0000_0012 }), // M5 追加（ADR-0034）
     ]
 }
 
@@ -159,7 +160,7 @@ fn golden_meta() {
     for (name, op) in &ops {
         assert_eq!(op.name(), *name, "MetaOp::name() 应等于变体名");
     }
-    variants(&mut g, "MetaOp", ops, 33);
+    variants(&mut g, "MetaOp", ops, 34);
     assert_no_more_variants::<TimeSet>("TimeSet", 2); // TimeSet 的两个变体都出现在 SetAttr 的样本里
     let open = OpenOut {
         attr: attr_out(),
@@ -255,6 +256,10 @@ fn golden_data() {
         expires_ms: 1_792_455_000_000,
     };
     g.msg("CapV1", &cap);
+    // M5：签好名的 cap = postcard(CapV1) ‖ HMAC-SHA256(K_cap, "WMFS-CAP-1" ‖ postcard)[0..16]（3.3.5），K_cap 取固定的测试值
+    let signed = wmfs_core::proto::cap::sign(&[0x5A; 32], &cap);
+    assert_eq!(wmfs_core::proto::cap::verify(&[0x5A; 32], &signed), Ok(cap.clone()));
+    g.add("CapV1.signed", signed);
     g.check();
 }
 

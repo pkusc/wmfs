@@ -37,6 +37,15 @@ pub trait PolicyEvaluator: Send + Sync {
     fn eval(&self, input: &PolicyInput) -> PolicyOutput;
 }
 
+/// 首发的内置策略求值器。实现注记（M5）：先只回"默认"（后台任务框架要一个求值器）；第 5 章的简单表达式在 M7 起加入。
+pub struct BuiltinPolicy;
+
+impl PolicyEvaluator for BuiltinPolicy {
+    fn eval(&self, _input: &PolicyInput) -> PolicyOutput {
+        PolicyOutput::Default
+    }
+}
+
 /// 策略求值用（3.12）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileFacts {

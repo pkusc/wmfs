@@ -2,7 +2,8 @@
 //! `meta::ns` 的闭包——每个操作一个"批次"：从当前 KV 建集群图快照、执行、失败就整体丢弃它的写入（与执行器的操作层一样）。
 //! 不经 raft，所以快、可重复；raft 之上的行为（掉电重启、rename 的原子可见性、去重、会话）由 meta_ns_engine.rs 与
 //! fail point 测试覆盖。管线与 `wmfs server` 默认装的一样：posix-mode（authz）+ label-match（placement）。
-//! 根目录的属主是 (1000, 1001)（`sample_init`），/home 与 /scratch 是 1777。
+//! 根目录的属主是 (1000, 1001)（`sample_init`），/home 与 /scratch 是 1777。请求都带会话 7（key 1 打开的 Active 会话，KV 里有它的
+//! 记录：只读路径签 cap 之前要核对会话，`sessions::may_sign_cap`）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,10 +18,11 @@ use wmfs_core::meta::cluster::map;
 use wmfs_core::meta::engine::txn::{KvRead, KvScan, KvTxn, OpCtx};
 use wmfs_core::meta::ns;
 use wmfs_core::meta::schema::keys;
-use wmfs_core::meta::schema::records::{InodeV1, decode_v1};
+use wmfs_core::meta::schema::records::{InodeV1, SessionRecV1, decode_v1, encode_v1};
+use wmfs_core::meta::sessions::SESSION_ACTIVE;
 use wmfs_core::proto::meta::{AttrOut, MetaOp, MetaReply};
 
-use super::meta::{ns_pipeline, quiet_logs, sample_init};
+use super::meta::{CAP_KEY, ns_pipeline, quiet_logs, sample_init};
 
 /// 测试里的 KV 视图。
 #[derive(Clone, Default)]
@@ -64,11 +66,15 @@ pub fn user(uid: u32, gid: u32) -> Who {
     Who { uid, gid, groups: vec![] }
 }
 
+/// 请求带的会话号（Ns::new 写了它的 SESSION 记录）。
+pub const SESSION: u64 = 7;
+
 pub struct Ns {
     pub kv: View,
     pipeline: Pipeline,
     attrs: AttrResolver,
-    pub now: i64, // 每个操作之后 + 1 秒（于是能看出 mtime/ctime 是不是被更新了）
+    pub now: i64,     // 每个操作之后 + 1 秒（于是能看出 mtime/ctime 是不是被更新了）
+    pub session: u64, // 请求带的会话号（默认 SESSION；测试可以改，看会话检查）
 }
 
 impl Default for Ns {
@@ -80,8 +86,22 @@ impl Default for Ns {
 impl Ns {
     pub fn new() -> Ns {
         quiet_logs();
-        let kv = View(initial_kv(&sample_init()).into_iter().collect());
-        Ns { kv, pipeline: ns_pipeline(), attrs: AttrResolver::default(), now: 1_800_000_000 }
+        let mut kv = View(initial_kv(&sample_init()).into_iter().collect());
+        let s = SessionRecV1 {
+            client_name: "ns".into(),
+            host: "h".into(),
+            host_id: "h".into(),
+            mount: "/m".into(),
+            key_id: 1,
+            tenant: 0,
+            created_ms: 0,
+            locked_inos: vec![],
+            state: SESSION_ACTIVE,
+            evict_since_ms: 0,
+            evict_map_epoch: 0,
+        };
+        kv.put(&keys::session(SESSION), encode_v1(&s));
+        Ns { kv, pipeline: ns_pipeline(), attrs: AttrResolver::default(), now: 1_800_000_000, session: SESSION }
     }
 
     fn ctx(&mut self, who: &Who) -> ReqCtx {
@@ -96,7 +116,8 @@ impl Ns {
         });
         let w = Principal { uid: who.uid, gid: who.gid, groups: who.groups.clone(), tenant: 0, job_id: 9, conn };
         let now = Ts { secs: self.now, nanos: 0 };
-        ReqCtx { who: w, session: 7, seq: 1, pid: 1, trace_id: 3, now, now_ms: self.now as u64 * 1000, internal: false }
+        let now_ms = self.now as u64 * 1000;
+        ReqCtx { who: w, session: self.session, seq: 1, pid: 1, trace_id: 3, now, now_ms, internal: false }
     }
 
     /// 一个修改型操作：在 KV 的副本上执行，成功才换上（失败整体丢弃，与执行器的操作层一样）。
@@ -105,7 +126,14 @@ impl Ns {
         let f = ns::txn_op(op).expect("ns::txn_op：这个操作 M4 应该已经实现了");
         let mut v = self.kv.clone();
         let m = map::build(&self.kv, Some(1))?;
-        let c = OpCtx { req: &req, pipeline: &self.pipeline, attrs: &self.attrs, map: &m, settings: &m.settings };
+        let c = OpCtx {
+            req: &req,
+            pipeline: &self.pipeline,
+            attrs: &self.attrs,
+            map: &m,
+            settings: &m.settings,
+            cap_key: &CAP_KEY,
+        };
         let r = f(&mut v, &c);
         if r.is_ok() {
             self.kv = v;
@@ -117,7 +145,14 @@ impl Ns {
     pub fn read(&mut self, who: &Who, op: MetaOp) -> Result<MetaReply, ErrCode> {
         let req = self.ctx(who);
         let m = map::build(&self.kv, Some(1))?;
-        let c = OpCtx { req: &req, pipeline: &self.pipeline, attrs: &self.attrs, map: &m, settings: &m.settings };
+        let c = OpCtx {
+            req: &req,
+            pipeline: &self.pipeline,
+            attrs: &self.attrs,
+            map: &m,
+            settings: &m.settings,
+            cap_key: &CAP_KEY,
+        };
         ns::read(&self.kv, &c, &op)
     }
 

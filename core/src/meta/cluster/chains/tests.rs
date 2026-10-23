@@ -93,18 +93,23 @@ fn random_target_sets_never_put_two_members_on_one_node() {
 }
 
 #[test]
-fn candidates_match_labels_skip_offline_and_honour_dedicated() {
+fn candidates_match_labels_skip_offline_and_read_only_and_honour_dedicated() {
     let m = map(
         vec![
             (3, target(2, &["nvme"], TARGET_UP)),
             (1, target(1, &[], TARGET_UP)),
             (2, target(1, &["hdd"], TARGET_UP)),
             (4, target(3, &[], 2)), // Offline
+            (5, TargetRecV1 { read_only: true, ..target(4, &[], TARGET_UP) }),
         ],
         vec![class(1, "*", false), class(2, "nvme", true), class(3, "hdd", false)],
     );
     let (default, gold, hdd) = (&m.classes[0], &m.classes[1], &m.classes[2]);
-    assert_eq!(candidates(&m, default), vec![(1, 1), (2, 1)], "按 id 排序；nvme 被 dedicated 类独占；Offline 不要");
+    assert_eq!(
+        candidates(&m, default),
+        vec![(1, 1), (2, 1)],
+        "按 id 排序；nvme 被 dedicated 类独占；Offline、只读的不要"
+    );
     assert_eq!(candidates(&m, gold), vec![(3, 2)], "dedicated 类自己用它的 target");
     assert_eq!(candidates(&m, hdd), vec![(2, 1)], "标签匹配");
 }
@@ -143,7 +148,7 @@ fn gen_chains_writes_chain_records_and_bumps_map_epoch() {
     let req = ReqCtx { who, session: 0, seq: 0, pid: 0, trace_id: 0, now: Ts::default(), now_ms: 0, internal: true };
     let (pipeline, attrs, settings) =
         (Pipeline::new(PluginSet::new(&[])), AttrResolver::default(), ClusterSettingsV1::default());
-    let c = OpCtx { req: &req, pipeline: &pipeline, attrs: &attrs, map: &m, settings: &settings };
+    let c = OpCtx { req: &req, pipeline: &pipeline, attrs: &attrs, map: &m, settings: &settings, cap_key: &[0; 32] };
     let views = gen_chains(&mut v, &c, &m.classes[0], 3).unwrap();
     assert_eq!(
         views.iter().map(|c| (c.id, c.serving, c.members.clone())).collect::<Vec<_>>(),

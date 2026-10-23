@@ -83,6 +83,11 @@ pub fn hmac_verify(key: &[u8], parts: &[&[u8]], tag: &[u8]) -> bool {
     mac(key, parts).verify_slice(tag).is_ok()
 }
 
+/// 常数时间校验 `tag` 等于 HMAC-SHA256(key, parts…) 的**前** `tag.len()` 个字节（cap 只带 16 字节的 MAC，3.3.5）。
+pub fn hmac_verify_prefix(key: &[u8], parts: &[&[u8]], tag: &[u8]) -> bool {
+    !tag.is_empty() && mac(key, parts).verify_truncated_left(tag).is_ok()
+}
+
 fn mac(key: &[u8], parts: &[&[u8]]) -> Hmac<Sha256> {
     let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
         .unwrap_or_else(|_| panic!("不变量破坏：HMAC 接受任意长度的密钥"));

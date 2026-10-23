@@ -13,10 +13,13 @@
 //! 不删记录——驱逐的两个阶段（M10）自己走完。会话租约到期的驱逐（cluster-mgr）在 M10。
 //! 会话绑定打开它的 key（`SessionRecV1.key_id`）：session id 在线上是明文，别的 key 拿着它发修改、心跳、关闭或重新打开
 //! 一律 `EACCES`（[`usable`]），否则别人能抢先用它的 seq 污染去重表，或者替它关掉会话。
+//! 实现注记（M5）：签给客户端的 cap 带着会话号（被驱逐会话的 cap 由数据节点拒绝，ADR-0023 第 4 条），所以只读路径上签 cap 之前
+//! 也核对会话（[`may_sign_cap`]）。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::base::types::{ReqCtx, Role};
 use crate::base::{ErrCode, lock};
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
@@ -42,6 +45,17 @@ pub fn usable(v: &dyn KvRead, session: u64, key_id: u32) -> Result<(), ErrCode> 
         Ok(Some(s)) if s.state == SESSION_ACTIVE => Err(ErrCode::EACCES),
         _ => Err(ErrCode::SESSION_EVICTED),
     }
+}
+
+/// 能不能签一张带 `req.session` 的 cap（3.3.5 的实现注记（M5））：Open、RenewCap、Uninline 走只读路径，执行器的会话检查覆盖
+/// 不到它们，所以签 cap 之前在这里核对——会话要能用（[`usable`]：Active、属于这把 key）；session 0 的 cap 不属于任何会话、
+/// 不会被驱逐，只签给内部请求与 Server 角色，别人 → `EINVAL`。执行器里签 cap 的修改（Create、改长度的 SetAttr）带 seq，
+/// 执行器已经核对过会话（3.4.1.4）。
+pub fn may_sign_cap(v: &dyn KvRead, req: &ReqCtx) -> Result<(), ErrCode> {
+    if req.session != 0 {
+        return usable(v, req.session, req.who.conn.key_id);
+    }
+    if req.internal || req.who.conn.role == Role::Server { Ok(()) } else { Err(ErrCode::EINVAL) }
 }
 
 /// SessionOpen 带来的客户端信息（`version` 现在不存、也不用：记录里没有这一项）。
@@ -162,6 +176,18 @@ impl Live {
     /// SessionClose 之后：删掉它的内存状态。
     pub fn forget(&self, session: u64) {
         lock(&self.m).remove(&session);
+    }
+
+    /// 有没有哪个会话打开着 `ino`（孤儿 GC 的条件 ①，3.5.6）。不管记下它的是哪个 term：不知道就当作还开着。
+    pub fn is_open(&self, ino: u64) -> bool {
+        lock(&self.m).values().any(|s| s.open.contains_key(&ino))
+    }
+
+    /// `sessions`（全部存活会话）里的每一个都在 `term` 里报过打开文件的全集，或是在 `term` 里新开的（孤儿 GC 的条件 ③：
+    /// 换过 leader 之后，要等每个存活会话都重发过全集，打开集合才可信）。
+    pub fn covers(&self, term: u64, sessions: &[u64]) -> bool {
+        let m = lock(&self.m);
+        sessions.iter().all(|s| m.get(s).is_some_and(|x| x.term == term))
     }
 
     /// 某个会话打开着的文件，按 ino 排序（测试与 M5 的孤儿 GC 用）。

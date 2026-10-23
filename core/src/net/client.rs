@@ -171,6 +171,11 @@ impl RpcClient {
         &self.net
     }
 
+    /// 这个客户端的内存池（实现注记（M5）：DataClient 重试读的时候从这里取回复用的缓冲）。
+    pub fn pool(&self) -> &MemPool {
+        &self.pool
+    }
+
     /// 阻塞：发出请求、等回复。只允许在可以阻塞的线程里用（1.2 规则 3）。不重试（重试在 MetaClient/DataClient/retry.rs）
     pub fn call(&self, to: &Endpoint, fam: Family, f: OutFrame, timeout: Duration) -> Result<InFrame, ErrCode> {
         self.start(to, fam, f, timeout)?.wait()

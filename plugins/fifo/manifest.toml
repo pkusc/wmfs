@@ -1,0 +1,13 @@
+# fifo qos 插件的 manifest（design.md 3.7.1、4.5）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "fifo"
+version = "0.1.0"
+hooks = ["qos"]
+altitude = 401
+hot_path = true
+abi_version = 1
+attrs = []
+budget_ns = 2000
+fail_points = ["plugin.fifo.qos"]
+
+[config_schema]
+# 没有部署参数，也不消费任何目录属性（qos 属性要 mclock）

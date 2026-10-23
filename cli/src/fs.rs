@@ -1,5 +1,5 @@
 //! `wmfs fs …`：不经 FUSE 的调试客户端（design.md 7.2）。M4 有元数据命令：`ls [-l]`、`stat`、`mkdir`、`rmdir`、`rm`、`mv`、
-//! `ln [-s]`、`touch`；`cat/put/get/truncate`（数据）在 M5。
+//! `ln [-s]`、`touch`；M5 加了数据命令 `put`、`get`、`cat`、`truncate`（[`data`]：经 DataClient 直接读写数据节点）。
 //!
 //! 每条命令 = 问 health 找到元数据 leader → `MetaClient::connect`（GetClusterMap + SessionOpen）→ 按路径解析（`ResolvePath`，
 //! 服务端逐段检查执行权限）→ 一个或几个元数据请求 → SessionClose。修改型请求带 seq，重试用同一个 seq（`--verbose` 打印每次
@@ -7,21 +7,26 @@
 //! `/proc/self/status`）；`--as-uid UID[:GID]` 以别的用户身份发请求——只允许 admin key（3.3.3：只有 admin 能声明任意 uid；
 //! 本机没开 `user_allow_other`，多用户演示靠它）。`--json` 输出机器可读的结果（`scripts/accept.sh` 只解析它）；失败时也是
 //! JSON：`{"error": 码名, "errno", "message"}`，请求失败再加 `path`——发请求之前的失败（参数写错 `EINVAL`、client key 加
-//! `--as-uid` 是 `EACCES`、找不到元数据 leader 是 `ETIMEDOUT`、认证失败 `AUTH_FAILED`）也一样。
+//! `--as-uid` 是 `EACCES`、找不到元数据 leader 是 `ETIMEDOUT`、认证失败 `AUTH_FAILED`）也一样。`cat` 与 `get … -` 把文件内容写到
+//! 标准输出，不能再加 `--json`（两者会混在一起）：一律 `EINVAL`。
 //! 路径是文件系统里的绝对路径；`mv` 等同 rename(2)（目标是已有目录时按 rename 的规则，不会"移进去"）。
 
+mod data;
 mod show;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
 use wmfs_core::base::log::{self, Level};
 use wmfs_core::base::types::Role;
+use wmfs_core::base::units::parse_size;
 use wmfs_core::base::{ErrCode, sys};
+use wmfs_core::client::data_client::DataClient;
 use wmfs_core::client::meta_client::{Caller, MetaClient, MetaClientOpts, SessionInfo};
 use wmfs_core::meta::schema::records::{KIND_DIR, KIND_FILE};
-use wmfs_core::net::client::default_role;
+use wmfs_core::net::client::{RpcClient, default_role};
 use wmfs_core::proto::meta::{AttrOut, MetaOp, MetaReply, SetAttrIn, TimeSet};
 
 use crate::{cluster_addrs, fail, leader, load_key, out};
@@ -74,6 +79,14 @@ pub enum FsCmd {
     },
     /// 文件不存在就建（权限 0666 & ~umask），存在就把时间改成现在
     Touch { path: String },
+    /// 上传：本地文件（- = 标准输入）→ 文件系统里的路径（已存在就覆盖）
+    Put { src: String, dst: String },
+    /// 下载：文件系统里的路径 → 本地文件（- = 标准输出）
+    Get { src: String, dst: String },
+    /// 把文件内容写到标准输出
+    Cat { path: String },
+    /// 改文件长度（例如 10M；变短时被截掉的部分清零，变长时新的部分读为 0）
+    Truncate { path: String, size: String },
 }
 
 /// 一条命令的结果：给人看的文字与 JSON。
@@ -98,13 +111,20 @@ pub fn run(a: FsArgs) -> i32 {
         Ok(x) => x,
         Err(e) => return setup_failed(a.json, ErrCode::EINVAL, e),
     };
-    let client = match connect(&a) {
+    let to_stdout = matches!(&a.cmd, FsCmd::Cat { .. }) || matches!(&a.cmd, FsCmd::Get { dst, .. } if dst == "-");
+    if to_stdout && a.json {
+        return setup_failed(true, ErrCode::EINVAL, "cat 与 get … - 把文件内容写到标准输出，不能同时 --json".into());
+    }
+    let (client, rpc) = match connect(&a) {
         Ok(c) => c,
         Err((code, e)) => return setup_failed(a.json, code, e),
     };
-    let r = exec(&client, &who, umask, &a.cmd);
+    let client = Arc::new(client);
+    let dc = DataClient::for_meta(rpc, client.clone(), OPTS.rpc_timeout, OPTS.op_timeout);
+    let res = exec(&client, &dc, &who, umask, &a.cmd);
     client.close();
-    match r {
+    match res {
+        Ok(_) if to_stdout => 0, // 内容已经写到标准输出
         Ok(d) => out(if a.json { d.json.to_string() } else { d.text }),
         Err(f) => {
             let msg = show::strerror(f.code);
@@ -129,22 +149,33 @@ fn setup_failed(json: bool, code: ErrCode, msg: String) -> i32 {
     1
 }
 
-/// 找到 leader 并打开会话；失败时给出错误码（见文件头）与给人看的原因。
-fn connect(a: &FsArgs) -> Result<MetaClient, (ErrCode, String)> {
-    let key = load_key(&a.key_file).map_err(|e| (ErrCode::EINVAL, e))?;
-    if a.as_uid.is_some() && default_role(key.key_id) != Role::Admin {
+/// 找到 leader 并打开会话；失败时给出错误码（见文件头）与给人看的原因。也给出底下的 RpcClient（数据命令建 DataClient 用）。
+pub fn connect(a: &FsArgs) -> Result<(MetaClient, Arc<RpcClient>), (ErrCode, String)> {
+    connect_with(&a.cluster, &a.key_file, a.as_uid.is_some())
+}
+
+/// 同 [`connect`]，参数分开给（`wmfs debug chunk-*` 也用）；`as_uid` = 要以别的用户身份发请求（只允许 admin key）。
+pub fn connect_with(
+    cluster: &Option<String>,
+    key_file: &Option<PathBuf>,
+    as_uid: bool,
+) -> Result<(MetaClient, Arc<RpcClient>), (ErrCode, String)> {
+    let key = load_key(key_file).map_err(|e| (ErrCode::EINVAL, e))?;
+    if as_uid && default_role(key.key_id) != Role::Admin {
         let why = "--as-uid 只能和 admin key 一起用（只有 admin 能声明任意 uid，design.md 3.3.3）";
         return Err((ErrCode::EACCES, why.into()));
     }
-    let cluster = cluster_addrs(&a.cluster).map_err(|e| (ErrCode::EINVAL, e))?;
+    let cluster = cluster_addrs(cluster).map_err(|e| (ErrCode::EINVAL, e))?;
     let l = leader::connect(&cluster, key).map_err(|e| (ErrCode::ETIMEDOUT, e))?; // 多半是 30 s 内没找到 leader
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim().to_string();
     let info = SessionInfo { client_name: "wmfs-fs".into(), host, host_id: String::new(), mount: String::new() };
-    MetaClient::connect_with(l.rpc, &[l.ep], info, OPTS).map_err(|e| (e, format!("连接元数据 leader 失败：{e}")))
+    let c = MetaClient::connect_with(l.rpc.clone(), &[l.ep], info, OPTS)
+        .map_err(|e| (e, format!("连接元数据 leader 失败：{e}")))?;
+    Ok((c, l.rpc))
 }
 
 /// 身份与 umask：`--as-uid UID[:GID]`（附加组为空）或本进程的 uid/gid/附加组；umask 一律取本进程的（读 /proc/self/status，读不到按 022）。
-fn caller(as_uid: &Option<String>) -> Result<(Caller, u32), String> {
+pub fn caller(as_uid: &Option<String>) -> Result<(Caller, u32), String> {
     let pid = std::process::id();
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name)).map(str::trim).unwrap_or("");
@@ -176,7 +207,7 @@ fn failed(path: &str, code: ErrCode) -> Failed {
     Failed { path: path.to_string(), code }
 }
 
-fn exec(c: &MetaClient, who: &Caller, umask: u32, cmd: &FsCmd) -> Result<Done, Failed> {
+fn exec(c: &MetaClient, dc: &DataClient, who: &Caller, umask: u32, cmd: &FsCmd) -> Result<Done, Failed> {
     let resolve = |path: &str| -> Result<(u64, u8), Failed> {
         match c.read(who, MetaOp::ResolvePath { path: path.as_bytes().to_vec() }).map_err(|e| failed(path, e))? {
             MetaReply::Resolved { ino, kind } => Ok((ino, kind)),
@@ -194,7 +225,15 @@ fn exec(c: &MetaClient, who: &Caller, umask: u32, cmd: &FsCmd) -> Result<Done, F
         Ok((resolve(&p)?.0, name))
     };
     let ok = |text: String, ino: u64| Done { text, json: json!({"ok": true, "ino": ino}) };
+    let x = data::Ctx { meta: c, data: dc, who };
     match cmd {
+        FsCmd::Put { src, dst } => data::put(&x, src, dst, parent_of(dst)?, umask),
+        FsCmd::Get { src, dst } => data::get(&x, resolve(src)?.0, src, dst),
+        FsCmd::Cat { path } => data::get(&x, resolve(path)?.0, path, "-"),
+        FsCmd::Truncate { path, size } => {
+            let size = parse_size(size).map_err(|_| failed(path, ErrCode::EINVAL))?;
+            data::truncate(&x, resolve(path)?.0, path, size)
+        }
         FsCmd::Mkdir { path } => {
             let (parent, name) = parent_of(path)?;
             let r = c.write(who, MetaOp::Mkdir { parent, name, mode: 0o777, umask }).map_err(|e| failed(path, e))?;

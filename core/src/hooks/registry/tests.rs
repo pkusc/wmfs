@@ -1,13 +1,13 @@
 //! PluginSet 校验的单元测试：好的集合、各种坏 manifest、重名与 altitude 冲突、配置键、禁用、manifest.toml 比对
-//! （从 registry.rs 拆出，免得那个文件超过 400 行）。
+//! （从 registry.rs 拆出，免得那个文件超过 400 行），以及 M5 的几种钩子特有的规则（qos 只能一个、transform 的子区间、编号唯一）。
 
 use std::time::Duration;
 
 use super::*;
 use crate::base::ErrCode;
-use crate::buf::{MemPool, RegionInfo};
+use crate::buf::{Buf, MemPool, RegionInfo};
 use crate::hooks::manifest::check_manifest_toml;
-use crate::hooks::traits::{AuthnInput, AuthnResult, Conn, KeyLookup};
+use crate::hooks::traits::{AuthnInput, AuthnResult, BlockMeta, Conn, KeyLookup, TransformCtx};
 
 struct FakeT(&'static Manifest, &'static str);
 impl Transport for FakeT {
@@ -166,4 +166,81 @@ fn meta_engine_is_a_unique_hook_outside_the_cluster_list() {
     let mut d = PluginSet::new(&["embedded-kv".into()]);
     d.meta_engine(&KV);
     assert!(d.meta_engine_manifest().is_none(), "node.toml 禁用了它：服务端装配时会拒绝启动");
+}
+
+struct FakeQ(&'static Manifest);
+impl QosPlugin for FakeQ {
+    fn manifest(&self) -> &'static Manifest {
+        self.0
+    }
+    fn enqueue(&self, _: crate::hooks::traits::QosItem, _: crate::hooks::traits::QosSpec) {}
+    fn dequeue(&self, _: std::time::Instant) -> Result<u64, Option<std::time::Instant>> {
+        Err(None)
+    }
+    fn stats(&self) -> Vec<crate::hooks::traits::QueueStat> {
+        vec![]
+    }
+}
+
+struct FakeX(&'static Manifest, TransformKind, u8);
+impl TransformPlugin for FakeX {
+    fn manifest(&self) -> &'static Manifest {
+        self.0
+    }
+    fn kind(&self) -> TransformKind {
+        self.1
+    }
+    fn alg_id(&self) -> u8 {
+        self.2
+    }
+    fn encode(&self, _: &TransformCtx, i: Buf, _: &mut BlockMeta, _: &MemPool) -> Result<Buf, ErrCode> {
+        Ok(i)
+    }
+    fn decode(&self, _: &TransformCtx, i: Buf, _: &BlockMeta, _: &MemPool) -> Result<Buf, ErrCode> {
+        Ok(i)
+    }
+}
+
+struct FakeC(&'static Manifest, u8);
+impl CodecPlugin for FakeC {
+    fn manifest(&self) -> &'static Manifest {
+        self.0
+    }
+    fn codec_id(&self) -> u8 {
+        self.1
+    }
+    fn shards(&self, _: usize) -> Vec<crate::hooks::traits::ShardSpec> {
+        vec![]
+    }
+    fn read_order(&self, _: &[(u32, u32)], _: Option<u32>, _: &crate::base::types::ChunkId) -> Vec<u32> {
+        vec![]
+    }
+}
+
+#[test]
+fn data_hooks_one_qos_transform_subranges_and_unique_ids() {
+    let qos = |n, alt| Arc::new(FakeQ(man(n, Hook::Qos, alt, |_| {}))) as Arc<dyn QosPlugin>;
+    let mut s = PluginSet::new(&[]);
+    s.qos(qos("q1", 401));
+    s.validate(&no_cfg()).unwrap();
+    s.qos(qos("q2", 402));
+    assert!(s.validate(&no_cfg()).unwrap_err().contains("只允许一个"), "qos 只能有一个活跃的插件");
+    let x = |n, alt, k, id| Arc::new(FakeX(man(n, Hook::Transform, alt, |_| {}), k, id)) as Arc<dyn TransformPlugin>;
+    let one = |p: Arc<dyn TransformPlugin>| {
+        let mut s = PluginSet::new(&[]);
+        s.transform(p);
+        s.validate(&no_cfg())
+    };
+    one(x("ck", 701, TransformKind::Checksum, 1)).unwrap();
+    assert!(one(x("ck", 735, TransformKind::Checksum, 1)).unwrap_err().contains("700–729"), "校验类在 700–729");
+    assert!(one(x("z", 701, TransformKind::Compress, 2)).unwrap_err().contains("730–759"), "压缩类在 730–759");
+    let mut s = PluginSet::new(&[]);
+    s.transform(x("a", 701, TransformKind::Checksum, 1));
+    s.transform(x("b", 702, TransformKind::Checksum, 1));
+    assert!(s.validate(&no_cfg()).unwrap_err().contains("算法编号"), "同一类的算法编号不能重复");
+    let c = |n, alt, id| Arc::new(FakeC(man(n, Hook::Codec, alt, |_| {}), id)) as Arc<dyn CodecPlugin>;
+    let mut s = PluginSet::new(&[]);
+    s.codec(c("r1", 610, 1));
+    s.codec(c("r2", 620, 1));
+    assert!(s.validate(&no_cfg()).unwrap_err().contains("编号"), "codec 编号不能重复");
 }

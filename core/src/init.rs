@@ -12,8 +12,10 @@
 //! 被杀时目录里没有 NODE，删掉重来即可。实现注记（M3）：`--profile`/`--owner` 随用到它们的里程碑加入（只写 default
 //! profile，根目录的属主是运行 init 的用户）。实现注记（M4）：`--target PATH[:label,label]` 写进 node.toml 的 `[[target]]`
 //! 与初始 KV 的 TargetRecV1（id 1..=n，gen_chains 用它们生成链）；同一个路径给两次、或一个 target 在另一个里面 → 拒绝
-//! （两个 target 的超级块与 chunk 目录会互相踩到）。target 目录与它的 TARGET 超级块（3.2.3）随 M5 的 chunk_store 一起写
-//! （M4 还不存数据）。
+//! （两个 target 的超级块与 chunk 目录会互相踩到）。实现注记（M5）：init 给每个 target 建目录、写 TARGET 超级块（3.2.3：
+//! cluster_id、target_id = 1..=n、node_id 1，`atomic_write`，在 NODE 之前）；任何一个 target 目录里已经有超级块（属于别的集群）
+//! → 拒绝初始化——在写任何文件之前就查完（与重复、嵌套的检查一起），所以被拒绝时什么也没写，改正参数就能重来。
+//! `c/`、`p/`、`t/` 由 chunk_store 插件打开 target 时建。
 
 mod initial_kv;
 
@@ -29,6 +31,7 @@ use crate::base::config::{NodeConfig, TargetConfig};
 use crate::base::types::Role;
 use crate::base::{clock, log, rand, sys};
 use crate::buf::PoolConfig;
+use crate::data::superblock::TargetSuperblock;
 use crate::hooks::traits::KeyLookup;
 use crate::meta::cluster::chains::TARGET_UP;
 use crate::meta::raft::storage;
@@ -117,6 +120,7 @@ pub fn init_node(o: &InitOpts) -> Result<(), String> {
     write("keys/admin.key", key(ADMIN_KEY).as_bytes())?;
     write("keys/client.key", key(CLIENT_KEY).as_bytes())?;
     write_meta(d, o, &node)?;
+    write_superblocks(o, &node)?;
     write("NODE", node_toml.as_bytes()) // NODE 放最后：它是提交点（见文件头），之前的文件都已经落盘
 }
 
@@ -152,6 +156,27 @@ fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile) -> Result<(), String> {
     // meta/ 自己在数据目录里的目录项已经落盘了——写 cluster.key 的 atomic_write 在它建好之后 fsync 过数据目录
     let meta_dir = d.join("meta");
     sys::fsync_dir(&meta_dir).map_err(|e| format!("fsync 目录 {} 失败：{e}", meta_dir.display()))
+}
+
+/// 给每个 target 写超级块（见文件头的实现注记）：target_id 依次为 1..=n，与初始 KV 的 TargetRecV1 一致。
+fn write_superblocks(o: &InitOpts, node: &NodeFile) -> Result<(), String> {
+    let cluster_id = node.cluster_id_bytes()?;
+    for (t, target_id) in o.targets.iter().zip(1u32..) {
+        let dir = Path::new(&t.path);
+        let sb_path = dir.join("TARGET");
+        std::fs::create_dir_all(dir).map_err(|e| format!("建 target 目录 {} 失败：{e}", t.path))?;
+        let sb = TargetSuperblock {
+            features_compat: 0,
+            features_ro_compat: 0,
+            features_incompat: 0,
+            cluster_id,
+            target_id,
+            node_id: node.node_id,
+            created_ms: node.created_ms,
+        };
+        sys::atomic_write(&sb_path, &sb.encode()).map_err(|e| format!("写 {} 失败：{e}", sb_path.display()))?;
+    }
+    Ok(())
 }
 
 /// 一个 `[[target]]` 的初始 TargetRecV1（见 `initial_kv` 的实现注记）。
@@ -196,9 +221,12 @@ pub fn parse_target(s: &str) -> Result<TargetConfig, String> {
     Ok(TargetConfig { path: path.display().to_string(), labels, capacity: "0".into() })
 }
 
-/// 同一个节点的 target 不能重复，也不能一个在另一个里面（按路径的各段比较，例如 /data 与 /data/t2）。
+/// 同一个节点的 target 不能重复，也不能一个在另一个里面（按路径的各段比较，例如 /data 与 /data/t2）；目录里不能已经有超级块。
 fn check_targets(ts: &[TargetConfig]) -> Result<(), String> {
     for (i, a) in ts.iter().enumerate() {
+        if Path::new(&a.path).join("TARGET").exists() {
+            return Err(format!("{} 里已经有 target 超级块（属于别的集群？）：拒绝初始化", a.path));
+        }
         for b in &ts[i + 1..] {
             let (pa, pb) = (Path::new(&a.path), Path::new(&b.path));
             if pa == pb {

@@ -32,6 +32,9 @@ use wmfs_plugins::posix_mode::PosixMode;
 
 use super::mem_crash::MemCrashBackend;
 
+/// 测试用的 cap 签名密钥 K_cap（M5：Open/Create 的回复里签 cap）。
+pub const CAP_KEY: [u8; 32] = [0xCA; 32];
+
 /// 测试节点的插件清单（与 init 写进 GLOBAL plugins 的相同，否则不就绪）。
 pub fn plugins() -> PluginListV1 {
     PluginListV1 { plugins: vec!["authn:shared-key".into()] }
@@ -251,7 +254,7 @@ pub fn start_engine(b: &MemCrashBackend, plugins: PluginListV1) -> Arc<EmbeddedE
     quiet_logs();
     let db = Database::builder().create_with_backend(b.clone()).expect("在内存后端上打开 redb");
     let pipeline = Arc::new(ns_pipeline());
-    EmbeddedEngine::start(db, EngineOpts { node_id: 1, plugins, pipeline }).expect("启动元数据引擎")
+    EmbeddedEngine::start(db, EngineOpts { node_id: 1, plugins, pipeline, cap_key: CAP_KEY }).expect("启动元数据引擎")
 }
 
 /// 等引擎成为就绪 leader（最多 10 s）；插件清单不一致的引擎永远等不到（调用方别用它）。

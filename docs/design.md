@@ -104,7 +104,7 @@
 | `conn-<id>` | 每连接 1 | 读帧 → 握手/认证 → 按 `msg_type` 分发；**自己从不执行请求**：元数据只读请求交给 `meta-read`；元数据写请求连同回复回调交给 `meta-exec`；数据请求进 QoS 队列；Peer 请求与确认进 repl 队列；Raft 消息交给 raft 线程；`call_cb` 的回调也在这里执行（只 `try_send`） | 读 socket；取复制 lane 缓冲最多等 100 ms（3.6.1） |
 | `conn-w-<id>` | 每连接 1 | 从该连接的有界发送队列取帧、写 socket（TCP 写超时 5 s）；fail point `plugin.<name>.transport` 包在这里（3.7.4） | 写 socket |
 | `rpc-timer` | 1 | 每 100 ms 扫描 `RpcClient` 的在途表，超时的调用以 `ETIMEDOUT` 结束（3.12） | sleep |
-| `meta-read-<i>` | 8 | 只读元数据请求：等读闸门 → 开 redb 读事务 → 读 → 回复；会话心跳、target 心跳也在这里 | 读闸门 |
+| `meta-read-<i>` | 8 | 只读元数据请求：等读闸门 → 开 redb 读事务 → 读 → 回复；会话心跳、target 心跳也在这里（实现注记（M5）：ADR-0034 的 `Uninline` 也在这里同步等数据面——全部最多占一半线程（4 个），同一个 inode 同时最多一个，超出回 `BUSY`，见 3.3.4 的 M5 注记 ②） | 读闸门 |
 | `raft` | 1 | 独占 `RawNode<RedbStorage>`：tick、step、propose、read_index、处理 Ready、写 redb、apply（3.4.1.3） | `recv_timeout(tick)`、fsync |
 | `raft-send-<peer>` | 每个元数据对端 1 | 把 raft 消息的 protobuf 写进池 Buf 作为 bulk，经到该对端的连接发出（`ConnHandle::send`）；连接断了就重连（自己的输入队列有界 1024，满则丢弃并 `report_unreachable`） | 建连、取缓冲 |
 | `snap-recv` / `snap-serve-<i>` | 按需 | follower 下载快照 / leader 提供快照流（3.4.1.7） | 网络、磁盘 |
@@ -280,6 +280,7 @@ wmfs/
 > 实现注记（M2）：rdma 插件实际约 1,520 行非测试代码（估算 920，超出约 600）：审查要求补上的推迟打开设备与注册、按本端 IPv4 自动选设备与 GID（gid.rs）、按帧计的信用控制、建连线程与 5 s 超时、设备能力核对、"QP 销毁之后缓冲才回池"的拆除顺序、两侧分开的访问位都在里面；M2 审查修复又把 QP 状态迁移的属性拆成可单测的纯函数（qp_attr.rs）、把设备部分从 verbs.rs 拆到 device.rs、日志带上 errno、链路 DOWN 与"没有设备"分开报（约 +30 行）。另有 cli 约 90 行（doctor 的 RDMA 一项、声明式的 `dev up --rdma`）。`scripts/loc.sh` 里 plugins 的估算 4,810 → 5,380，首发总量约 30,380。人类于 2026-10-21 把上限从 30,000 放宽到约 36,000、功能不砍，所以不动用"简化储备"。
 > 实现注记（M3）：M3 新增约 2,150 行非测试代码（含审查修复，预算 2,300）：core/meta/raft 约 850（storage.rs、driver.rs 与它的子模块 driver/apply.rs、types.rs——driver.rs 超过 400 行，把 raft 线程的输入输出类型与 raft 参数拆进 types.rs、把"应用与发布"拆进 driver/apply.rs；peers.rs、snapshot.rs、membership.rs 在 M8）、core/meta/engine 约 600（另有 M0 的 txn.rs）、core/meta 的 service.rs 与 sessions.rs 约 135、core 的 init（含 `init/initial_kv.rs`）与 server 约 190、core/net 的单飞建连约 65（含审查后补的"拿着登记表的锁再查一次连接表"与建连线程 panic 时的收尾）、cli 约 310（`debug kv`、`dev wait`）、hooks 与 mgmt 约 20。按 roadmap §0 第 7 条重估两个模块：**core/net 1,120 → 1,180**（余下 leader_hint、OneWay 服务、call_cb 后台建连约 60）、**core/meta/engine 720 → 760**（余下 M4 的 changelog 接入、M8 的 leader 提示）。重估后 Σ max(当前, 估算) ≈ 30,475（上限 36,000）。`scripts/loc.sh` 把 `core/src/init/` 记在"core"名下（以前这类子目录会被漏数）。
 > 实现注记（M4）：M4 新增约 2,790 行非测试代码（预算 2,650；其中审查修复约 110 行：按 seq 计的在途窗口、会话绑定 key、按名字找目录项之前先查执行权限、inline 内容只给有读权限的人、`wmfs fs` 发请求之前的失败也输出 JSON、`dev up` 等不到就绪的 leader 就失败并给出修法、target 不得重复或嵌套；`cli/src/dev.rs` 把 `--rdma` 的改写拆到 `dev/rdma.rs`）：core/meta/ns 约 1,170（common、read_ops、create、remove、rename、setattr、xattr、acl；file_ops 与回收站在 M5、M12）、core/meta 约 310（sessions.rs 的 open/close/心跳内存状态、changelog.rs、service.rs 的全部分派与 NodeCall、attrs.rs 的内置默认值）、core/meta/cluster 约 210（map.rs 含集群警告、chains.rs 的 gen_chains、cluster_mgr.rs）、core/client 约 190（meta_client.rs）、core/meta/schema 约 40（新文件 kv.rs：按记录类型读写、GLOBAL 计数器取号；records.rs 不动）、core/hooks 约 45（authz、placement 的管线与注册）、core/net 约 20（leader_hint、`Responder::drop_reply`）、core 约 60（init 的 `--target`、server 的装配）、plugins 约 190（posix-mode、label-match）、cli 约 425（`wmfs fs`、`leader.rs`、`init --target`、`dev up` 的默认 target 与集群警告）。没有模块超过它的估算，Σ max(当前, 估算) 仍是 30,475（上限 36,000），`scripts/loc.sh` 的估算不变。
+> 实现注记（M5）：M5 新增约 3,150 行非测试代码（按 rustfmt 格式化之后数；预算约 2,950 = 2,800 + ADR-0034 的约 150，超出约 7%）：core/data 约 970（state、build、write、read、service、node_hb 与 mod.rs 里 target 的打开；截断与写共用 write.rs/build.rs，没有单独的 truncate.rs）、plugins 约 625（local-fs 约 345、gc 约 95、fifo、crc32c、replica 各 50–65）、cli 约 365（`fs put/get/cat/truncate` 的 `fs/data.rs` 约 180、`debug chunk-path/chunk-header/corrupt-chunk` 的 `debug/chunk.rs` 约 125）、core/bg 约 225（scheduler.rs、limiter.rs）、core/meta 约 215（uninline.rs、gc_meta.rs、service.rs 的新分派）、core/meta/ns 约 205（file_ops.rs 约 150、cap 签发）、core/client 约 155（data_client.rs）、core/hooks 约 135（qos/codec/transform/chunk_store/bg_task 的注册、校验与调用包装）、core 约 105（server 的数据面与后台装配、init 写 TARGET 超级块）、core/meta/cluster 约 85（targets.rs：target 心跳与 StatFs）、core/proto 约 45（cap 的签名与校验）、core/meta/engine 与 core/base 约 25（`cap_key`、`ReqCtx::internal`）。按 roadmap §0 第 7 条重估两个模块：**core 540 → 720**（server.rs + init.rs 已约 580；余下 M7 管理面、M8 join 的本地侧约 150）；**cli 2,950 → 3,700**（已约 2,310：`wmfs fs` 调试客户端实际约 560 行，原估 180；余下 fuse/ 约 1,150、挂载路径映射约 70、M6–M15 的其余子命令约 180）。重估后 Σ max(当前, 估算) ≈ 31,400（上限 36,000）。`scripts/loc.sh` 用重估后的数字。审查修复后 M5 共新增约 3,330 行（+约 170：Uninline 的并发控制、R5 的严格判定与"没复制旧块才清除 Corrupt"、只读路径签 cap 之前核对会话、单个文件的最大长度 `EFBIG`、只读 target 不进新链、调用包装统一成 `HookCall::call`、build.rs 拆成几个小函数并把读的一半挪进 read.rs 等），没有模块超过估算，Σ max 不变。
 
 体量控制：每个里程碑结束时 `scripts/loc.sh` 与 roadmap 的预算表对账，并**按模块重新估算剩余工作**（core/data、cli/fuse、core/client 最容易超）。上限原为 30k，人类于 2026-10-21 放宽到约 36k（功能不砍，30k 只当提醒线）；预计总量超过 36k 时停下来与人类商量（可从 roadmap"简化储备"里选），不悄悄扩大范围。
 
@@ -398,6 +399,8 @@ semantics: consistency=cto attr_ttl=1s (来源 /); quota=quantum:64MiB overshoot
 
 pending 与已提交文件在同一个文件系统上，所以提交是同一文件系统内的 `rename`。按链分目录，是为了重同步时"列出我在这条链上的全部 chunk"只需一次目录遍历，不需要任何本地索引数据库。
 
+实现注记（M5）：chunk 文件由 `plugins/local-fs` 按上面的路径规则存放（`local_fs::committed_path(root, id)`，`wmfs debug chunk-path` 用同一个函数）；提交到一个新的 `c/…/<ino>-<epoch>/` 目录时先建目录，rename 之后把新建的各级目录一直 fsync 到 `c/`。target 的"已用"= 已提交文件实际占的块（`st_blocks × 512`），打开 target 时遍历 `c/` 算一次，之后随提交与删除增减（只在内存里）。
+
 #### 3.2.3 target 超级块 `TARGET`（4096 字节）
 
 > 实现注记（M0）：本节的字节布局自 M0 起以 `core/src/data/superblock.rs` 为唯一真源（金样 `tests/golden/target_superblock.golden`）；下表仅供阅读，若不一致以源码为准。
@@ -418,6 +421,8 @@ pending 与已提交文件在同一个文件系统上，所以提交是同一文
 | 4092 | 4 | crc32c(0..4092) |
 
 启动时：cluster_id 不符 → 拒绝启动（防止插错盘）；不认识的 incompat 位 → 拒绝；不认识的 ro_compat 位 → 只读服务（target 不进入任何链的写路径，上报 `read_only = true`）。
+
+实现注记（M5）：`wmfs init` 在写 NODE 之前给每个 `[[target]]` 建目录并 `atomic_write` 它的 TARGET（`target_id` 1..=n，与 TargetRecV1 一致；目录里已经有 TARGET → 拒绝初始化）。server 启动时按 node.toml 的 `[[target]]` 逐个读：读不到或校验不过 → 拒绝启动（M5 之前建的开发集群没有超级块，日志里给出修法：`wmfs dev down --purge` 之后重新 `wmfs dev up`）；cluster_id 不符 → 拒绝启动；有 ro_compat 位 → `read_only`（写、截断与 DeleteEpoch 回 `EROFS`，心跳上报 `read_only = true`，gen_chains 不再拿它当新链的候选，3.4.2.1）；然后清空 `p/`、`t/`（R5）。代码在 `core/src/data/mod.rs` 的 `open_targets`。init 在写任何文件之前就查完所有 target 目录里有没有 TARGET（与重复、嵌套的检查一起），所以被拒绝时什么也没写。
 
 #### 3.2.4 chunk 文件格式 v1（契约）【ADR-0021】
 
@@ -483,6 +488,7 @@ pub struct ChunkId { pub chain: u32, pub ino: u64, pub epoch: u32, pub idx: u32 
 - **AAD**（AES-GCM 附加数据）= `b"WMFS-BLK1" ‖ cluster_id ‖ ino ‖ epoch ‖ chunk_idx ‖ block_idx`（大端整数）。**不含版本号**：未改动的块会被原样复制进新版本文件，其密文、nonce、tag 不变，仍然可解。防止块被挪到别的文件、位置或集群。
 - **packed 形式**（网络传输整 chunk 时用：完整转发、同步、修复）= 固定头 ‖ 块表 ‖ 依块号顺序拼接所有 `stored_len > 0` 的块的存储字节。接收方把头和块表写在偏移 0，各块写回各自固定偏移，得到与源逐字节相同的稀疏文件。
 - **快照预留**（理念文档 8.1"chunk 版本化从第一天设计"）：每个版本是独立文件，二期快照只需在快照点把当前已提交文件硬链接为 `<idx:08x>@<version:016x>` 并启用 incompat 位 `chunk.snapshots`；头部 `snap_epoch` 已预留。
+- 实现注记（M5）：新版本的构建在 `core/src/data/build.rs`（读改写、边界块重新编码、未改动块的 `copies` 清单、incompat 位：有块压缩/加密才置位；首发 M5 只有 crc32c，没有压缩与加密插件），读路径在 `data/read.rs`（洞与 `[plain_len, block_size)` 读 0、`logical_len` 之后不返回）。块的 `plain_len` 可以小于 `block_size`（文件尾的块只存有效部分），扩展长度不必重写前面的块。`write_time_ms` 取 head 的墙钟。`wmfs debug chunk-header <文件>` 解析固定头与块表（`--json`：`version, checksum, compress, encrypt, logical_len, chunk_size, block_size, nblocks, ino, epoch, chunk_idx, chain_id, data_blocks, write_time_ms`）。
 
 #### 3.2.5 数据侧崩溃一致性规则
 
@@ -496,6 +502,8 @@ pub struct ChunkId { pub chain: u32, pub ino: u64, pub epoch: u32, pub idx: u32 
 | R6 | target **任何一次重启**（干净或崩溃）都以 Syncing 身份回到它的链里（唯一例外是"唯一幸存者"规则，3.4.2.7），所以"重启后丢了 pending 或丢了未 fsync 的提交"永远不会被读到 |
 
 ext4（本机）与 XFS 都满足"rename 原子替换"。XFS 没有 ext4 的 `auto_da_alloc` 启发式，掉电后可能出现"rename 已持久、数据未持久"的文件——R5 的校验会发现它，R6 保证它不会被当成好数据服务。
+
+实现注记（M5）：R1、R2、R4、R5 在 `plugins/local-fs`（`copy_file_range` 在 `EXDEV/ENOSYS/EOPNOTSUPP/EINVAL` 时退回 `pread/pwrite`）与 `core/src/data/`（write.rs、state.rs）；R3 的 `install` 已实现（同步与修复在 M9 才用到）；R6 在 M9。Corrupt 标记在 `data/state.rs`（64 路分片的 chunk 状态表，只在内存里），发现时计 `wmfs_chunk_corrupt_total{target}` 并写一行错误日志；`ReportCorrupt` 上报与 `DataLossDetected` 事件在 M11（scrub 与事件流），M5 的单副本上读到坏块就回 `EIO`（诚实报错）。Corrupt 的 chunk 上，写只要还保留任何有数据的旧块就回 `EIO`——部分写，或只把别的块整块覆盖（坏块与没校验过的旧块会被原样复制进新版本）都算；提交的新版本没有从旧版本原样复制任何块（`copies` 为空：全是新编码、校验过的数据）才清除标记，所以读路径并发发现的损坏也不会被一个复制了旧块的写清掉。头 CRC 不符、连块表都读不出时不知道旧块在哪：只接受覆盖整个 chunk 的写与截断到 0；这时不知道旧版本号，新版本号取 `incarnation << 40`（单副本没有下游，不会分叉；多副本时 R5 先从别的成员修复，M9）。测试用 `MemTargetStore`（`tests/harness/mem_target.rs`）模拟 fsync 与掉电（9.3 的注记）。
 
 #### 3.2.6 `meta.redb` 的表与写入规则
 
@@ -923,6 +931,13 @@ pub struct LockOut { pub start: u64, pub end: u64, pub write: bool, pub pid: u32
 - ⑨ 去重命中计入 `wmfs_meta_dedup_hits_total`（引擎启动时注册，新节点上是 0）并写一行 INFO 日志"去重命中"。
 - ⑩ 客户端看不出一次重试是不是"去重命中"（协议里没有这个标志）：`MetaClient` 在超时重试成功、且回复里的 ctime 早于重试发出的时刻时，日志写"超时重试 seq=… → 去重命中"（`wmfs fs --verbose` 打印；判断用两边的墙钟，只影响这一行提示）。
 - ⑪ "同时在途的修改型请求不超过 `DEDUP_WINDOW = 256` 个"**按 seq 计**：`MetaClient` 分配新 seq 时要求它小于"最小的在途 seq + 256"（不只是个数 ≤ 256），到了就等。服务端写入 seq 的结果时点删 seq − 256 的去重记录（3.4.1.4 规则 4），只有这样，一个回复丢了、正在等超时重试的旧请求的记录才不会被同一会话里别的线程的新请求挤掉（M6 的 FUSE 有 16 个线程共用一个会话）。
+
+实现注记（M5）：
+- ① M5 实现了：Open、Create、改了 size 的 SetAttr 签发 cap（3.3.5 的注记）；StatFs、GetInline、RenewCap、CommitWrite、Fallocate（M6 的 FUSE 才有调用者，M5 只有测试用它），以及 ADR-0034 新增的 `Uninline`。`Open.flags` 的访问方式沿用 Linux open(2) 的数值（`proto/meta.rs` 的 `O_RDONLY/O_WRONLY/O_RDWR/O_ACCMODE`，钉在 `constants.golden`）。GetLock、SetLock、AppendReserve、SetAtime 仍回 `FEATURE_UNSUPPORTED`（锁与 strong 在后面的里程碑，SetAtime 随 M6 的 FUSE）。
+- ② **`MetaOp::Uninline { ino }`**（ADR-0034，人类 2026-10-22 决定"让服务端去搬"）：追加在 `MetaOp` 末尾（只增不改，金样 `tests/golden/meta.golden` 多了一个样本）；回 `Opened(OpenOut)`。调用者要有写权限；文件已经不是 inline → 直接成功（幂等），所以按只读请求处理（meta-read 线程、seq 0、不进去重表）。服务端在 `core/src/meta/uninline.rs`：线性一致读出 inode（change_id c）与 INLINE → 用 leader 自己签的写 cap（`session = 0`）按文件当前的 layout 把内容写进 chunk 0、**再截断到内容长度**（上一次没做完的 Uninline 可能在 chunk 里留下更长的旧内容）→ `SyncChunks`（清掉 INLINE 之前数据必须已持久）→ 执行器里 `CommitWrite{uninline_expect_change_id: Some(c)}`（CAS）；CAS 失败从头重做，最多 3 次，仍失败回 `RETRY`。不写 changelog。fail point `meta.uninline.before_commit` 在写完 chunk、提交之前（3.11 的注记）。客户端只用这一条路（8.4、8.5 的注记）；`GetInline` 只给能读的人。规格没写的并发控制取最小方案（leader 内存里的 `uninline::InFlight`）：**同一个 inode 同时最多一个服务端 Uninline**（否则落后的那个可能在别人 CAS 成功、客户端已经往 chunk 0 写了新数据并 CommitWrite 之后，才把旧的 inline 内容写进 chunk 0、再截掉新数据——已确认的写就丢了）；**全部加起来最多 `READ_THREADS / 2` = 4 个**（它们在 meta-read 线程上同步等数据面，而数据节点要经同一组线程上的 Heartbeat/GetClusterMap 拉到新集群图才写得成；不设上限时 8 个并发 Uninline 碰上"数据节点还不认识新链"就互相等满 30 s）。超出 → `BUSY`，客户端按 3.3.8 退避重试（重试时多半已经不是 inline，直接幂等成功）。换 leader 之后旧 leader 上还没做完的 Uninline 不受它约束：M8 要给它加数据面的 fencing（ADR-0035 第 11 条；M8 之前只有一个元数据节点，不会发生）。
+- ③ `CommitWrite`（`core/src/meta/ns/file_ops.rs`）：调用者要对文件有写权限（与 ADR-0034 相同）；请求里的 `mtime` 不用，mtime/ctime 一律取 leader 的时钟（放松 ⑫）；`want_quota`、`close` 在 M10、M6 才有用，回复的 `quota_end` 先一律是 `u64::MAX`；inline 补丁越过 `inline_max` → `EINVAL`（会长过阈值的写先 Uninline），文件已经不是 inline 时带补丁 → `STALE_LAYOUT`，inline 文件不带补丁却把 `new_size` 提到 `max(size, inline_max)` 以上 → `EINVAL`（inline 文件没有 chunk）；改了长度写 changelog `SetSize`（`extra` 写 `via=CommitWrite`；Fallocate 写 `via=Fallocate`）。
+- ④ 规格没写的回复与错误：`Fallocate` 回 `Entry { attr }`；`GetInline` 对已经不是 inline 的文件回 `STALE_LAYOUT`（客户端重新 Open 取 layout）；`StatFs` 的 `bsize` 4096、`blocks/bfree` 是各 Up target 最近一次心跳报的容量与已用之和（leader 内存里，换 leader 后从下一次心跳记起），inode 数不设上限（`files = ffree = 2^32 − 1`），`namelen` 255（`core/src/meta/cluster/targets.rs`）。规格没写单个文件的最大长度：取 `min(chunk_size × 2³², i64::MAX)`（chunk 号 `ChunkId.idx` 是 u32；`st_size` 是有符号 64 位；4 MiB 的 chunk 是 16 PiB），改长度的 SetAttr、CommitWrite 的 `new_size`、Fallocate 超过它 → `EFBIG`（`ns::common::max_file_size`；客户端算 chunk 号时 `u32::try_from` 失败也是 `EFBIG`），否则偏移会回绕到前面的 chunk、静默毁掉数据。
+
 #### 3.3.5 客户端 ↔ 数据：`DataOp` 与能力令牌
 
 > 实现注记（M0）：本节类型自 M0 起以 `core/src/proto/data.rs` 与 `core/src/proto/cap.rs` 为唯一真源；下面的代码块仅供阅读，若不一致以源码为准。
@@ -952,6 +967,8 @@ pub struct CapV1 {
 ```
 
 数据节点校验（全部本地 O(1)，**在 io 线程出队后执行**，不是入队时）：MAC 正确；`expires_ms + 5 min ≥ wall_ms()`；`chunk.ino == cap.ino && chunk.epoch == cap.epoch`；权限位；`chunk.chain == cap.chains[chunk.idx % cap.chains.len()]`（客户端不能把数据塞进 layout 之外的链）；`cap.session` 不在集群图的被驱逐列表里。这就是数据请求的 `authz`：授权插件在元数据侧 `Open/Create` 时求值，cap 是被签名缓存的授权决定（理念文档 4.1"是（可缓存）"）。变换参数在 cap 里，客户端无法绕过 `encrypt` 策略。
+
+实现注记（M5）：签名与校验在 `core/src/proto/cap.rs`（`sign`、`verify`、`CapV1::allows`；金样 `tests/golden/data.golden` 有一个签好的样本），K_cap = `handshake::cap_key(cluster.key)`（leader 签、数据节点验，节点之间不传秘密）。签发（`ns::common::open_out` / `sign_cap`）：O_RDONLY → 读，O_WRONLY → 写，O_RDWR → 读 + 写；新建的文件读 + 写；打开已有文件来写（不带 O_EXCL 的 Create、改长度的 SetAttr、Uninline）→ 写，能读时再加读；没有 layout 的（目录等）不签，cap 为空；`qos_id` 先是 0（qos 属性在 M13），`expires_ms = now + cap_ttl`；续期用 `RenewCap`（按 `write` 重新检查权限）。校验的顺序：MAC → 本节点还没拉到集群图 → `NOT_READY` → `cap.session` 在被驱逐列表里 → `SESSION_EVICTED`（规格没写用哪个码，取 3.3.7 已有的这个，客户端据此知道是会话的问题）→ 链版本与本地视图（`STALE_CHAIN`）→ 本节点是 head / Serving 成员 → 过期、ino/epoch、权限位、链 → 不符一律 `BAD_CAP`。权限位：ReadChunk 要读，WriteChunk/TruncateChunk 要写，SyncChunks 读或写都行，DeleteEpoch 要管理（另核对 ino、epoch 与链）。规格没写的两点取最小方案：① 后台请求 = cap 带管理权限位（走 QoS 的低优先级队列；管理 cap 只签给后台任务）；② ADR-0034 的服务端 uninline 用 `session = 0` 的写 cap（不属于任何会话，不会被驱逐）。所以 cap 里的会话号必须是真的：Open、RenewCap、Uninline 走只读路径，执行器的会话检查覆盖不到，签 cap 之前先核对会话（`sessions::may_sign_cap`：会话 Active 且属于这把 key，否则 `SESSION_EVICTED`/`EACCES`；`session = 0` 只给内部请求与 Server 角色，别人 → `EINVAL`），M10 的两阶段驱逐才不会被一张 session 0 的 cap 绕过；Create 与改长度的 SetAttr 带 seq，执行器已经核对过会话。
 
 #### 3.3.6 服务端 ↔ 服务端
 
@@ -1406,6 +1423,7 @@ struct Waiter { done: Sender<Result<(), ErrCode>>, arrived: Instant }
 - **生成**（`gen_chains(v, c, class, replicas) -> Result<Vec<ChainView>, ErrCode>`，在 create 或截断到 0 的执行器闭包里、`OpCtx.map` 里找不到 (class, replicas) 的链时调用；只写 CHAIN 记录与 `map_epoch += 1`，**返回新建链的 `ChainView` 列表**——它们不在批次开始时的集群图快照里，placement 用 "快照里同 (class, replicas) 的链 + 返回值" 作为候选；调用后本批结束（3.4.1.4 规则 5）；之后由链管理器维护）：候选 = 状态 Up、标签匹配存储类 `label` 的 target（`dedicated` 的类独占其 target，其他类不得使用）；按 target id 排序；链数 = 候选数（每个 target 当一次 head）；第 i 条链从候选 i 开始按环形顺序取，跳过同一节点（故障域 = 节点）的 target，直到 `replicas` 个或候选用完。故障域不够时链以较短长度创建（期望长度仍为 replicas，`wmfs status` 与 dashboard 显示差距，【ADR-0016】）。新链 `ver = 1, incarnation = 1`，成员全部 Serving（尚无数据）。
 - 文件 layout 记录 k 条链，`k = min(stripe, 可用的互不相同的链数)`：可用链不够 `stripe` 条时**用 k 条创建**而不是报错（`k = 0` 才 `ENOSPC`），与短链同一原则【ADR-0016】——`wmfs set stripe=…` 时警告、`wmfs status` 统计"条带数不足"的文件；chunk idx 落在 `chains[idx % k]`。副本数是链的属性，文件不记录每个 chunk 的位置。
 - 实现注记（M4）：`gen_chains` 在 `core/src/meta/cluster/chains.rs`（候选、环形取成员是纯函数 `candidates`/`plan`，有带种子的随机测试）；它写 CHAIN、`next_chain` 与 `map_epoch += 1`，一个候选 target 都没有时什么也不写（调用方回 `ENOSPC`）。`ChainView.used` 来自 target 心跳（M5），在那之前是 0；`capacity` 取成员里**有上限的** target 容量的最小值，成员全都不限才是 0（= 不限）——一个不限容量的成员不会让整条链显得不限。
+- 实现注记（M5）：target 心跳（`core/src/data/node_hb.rs`、`core/src/meta/cluster/targets.rs`）带上了每个 target 的容量与已用，leader 只记在内存里（StatFs 用）；**`ChainView.used` 仍是 0**——集群图里没有用量，按用量放置与 rebalance 在 M13，到时再接（只增）。
 
 ##### 3.4.2.2 chunk 版本、每个 chunk 的状态与不变式
 
@@ -1534,6 +1552,7 @@ Syncing 成员 S，对每条自己是 Syncing 的链（sync 线程，每节点�
 - **截断到 0**（含 `O_TRUNC`、覆盖式 `cp`）：只有元数据，一个闭包：`epoch = max_epoch + 1`，**按当前生效属性重建整个 layout**（与 create 共用 `ns::common::new_layout`：存储类、副本、chunk、stripe、inline、checksum/compress/encrypt 全部取当前值——所以截断到 0 的文件和新文件一样立即享有新属性），size = 0，`class_id` 改为新类（per_class 的文件数随之搬移），F_INLINE 按新 layout 重新判定、INLINE 清空；旧 epoch 写 GC 记录（kind 2，宽限 `epoch_gc_grace`（默认 60 s）后由 gc 任务删除；旧 inode 有 F_INLINE 时没有 chunk，不写）。回复 `Opened(OpenOut)`（新 layout 与 cap，3.1.4 C4）。旧 chunk 瞬间全部不可达，不需要逐个处理。
 - **DeleteEpoch**（只由 gc 任务发出，cap 带管理权限位）：head 放弃该 (ino, epoch) 的 pending、删除本地目录，再 `ForwardDeleteEpoch` 沿链传播，尾回 `Ok` 后逆向确认。离线期间错过删除的成员由本地孤儿扫描（`CheckEpochs`）清理。
 - **SyncChunks**（客户端 fsync）：head 对列出的 chunk 的已提交文件 `fdatasync`（新建过目录项的再 `fsync` 目录），`ForwardSync` 沿链传播（`call_cb`，不占线程），尾确认后逆向回复。已经确认给写者的版本在全链都已提交（I3），所以 fsync 覆盖了此前所有已完成的写。
+- 实现注记（M5，单节点子集）：链长 1，head 就是全部成员：3.4.2.3 的第 1–5 步（无后继 → 写完 pending 立即提交并回复）、等待队列（每个 chunk ≤ 8 个，满了 `BUSY`）、版本分配 `V = max(committed + 1, chain.incarnation << 40)`（incarnation 取本节点集群图里的链记录）；3.4.2.5 的读（不会出现 `CHUNK_DIRTY`）；本节的截断（客户端先 `TruncateChunk` 再 `SetAttr`；**截断一个从未写过的 chunk 什么也不做、回 `Written{version: 0}`**——它读起来本来就是 0，不必建文件）、截断到 0、`DeleteEpoch`、`SyncChunks` 都只在本节点执行。转发、确认、前滚（3.4.2.4、3.4.2.6）、重同步（3.4.2.8）、链管理器（3.4.2.7 的 boot_id 与 incarnation 规则、3.4.2.10）与 I5 的租约在 M8/M9；M5 的心跳只更新 TargetRecV1，不判离线；hb 线程拉到集群图之前每 100 ms 心跳一次（不等满 1 s：数据节点拿到集群图之前对所有请求回 `NOT_READY`）。target 的已用到了容量上限（node.toml 的 `[[target]] capacity`，与文件系统大小取小）时写回 `ENOSPC`，截断照常。截断到 0 时旧 inode 有 F_INLINE **也**写 GC 记录（ADR-0034 之后 inline 文件的 epoch 下面也可能有 chunk：Uninline 写完 chunk、提交之前崩溃，或 CAS 因为截断换了 epoch 而失败；代价是小文件每次覆盖写多一条 GC 记录、gc 多发一次删 0 个文件的 DeleteEpoch）。
 
 ##### 3.4.2.10 链管理器（cluster-mgr，每个决定都是一个 `exclusive` 内部操作：`chain.ver += 1`、`map_epoch += 1`）
 
@@ -1549,6 +1568,8 @@ Syncing 成员 S，对每条自己是 Syncing 的链（sync 线程，每节点�
 | 成员上报不变量破坏（INTERNAL） | 降为 Syncing 并移到末尾，告警 |
 | 成员心跳上报"持续 10 s 无法把转发送达后继"（成员之间分区、但各自心跳正常） | 移除**下游**那一个（保住更靠前、数据更新的成员） |
 | 新 target 加入 | 为已在用的每个 (class, replicas) 生成以它为 head 的新链；补齐长度不足的链（Syncing） |
+
+实现注记（M5）：链管理器在 M9。M5 起 target 的 `read_only`（3.2.3 的 ro_compat 位，经心跳写进 TargetRecV1）会变成真：`gen_chains` 的候选不含只读的 target，新文件不会落到以它为 head 的链上；已有链里的成员变成只读的情况（应把它移出写路径）由 M9 的链管理器处理，在那之前它上面的写与截断回 `EROFS`。
 
 #### 3.4.3 成员与加入（init / join）
 
@@ -1720,6 +1741,8 @@ pub fn create(v: &mut dyn KvTxn, c: &OpCtx, r: &CreateIn) -> Result<MetaReply, E
 - ⑥ ACL 的格式与 Linux 的 xattr 相同（`ns/acl.rs`，钉在 `constants.golden`）；与权限位等价的访问 ACL 不存、只改权限位；扩展 ACL 的访问判定（posix-acl 插件）在 M10——在那之前，带扩展 ACL 的 inode 上 posix-mode 对非 root 弃权（root 先放行，与 Linux 的 CAP_DAC_OVERRIDE 相同），所以只有 root 能访问。
 - ⑦ 测试在 `tests/it/meta_ns*.rs`（内存 KV 视图上逐条检查语义，另有带种子的随机不变式测试）与 `meta_ns_engine.rs`（经 raft：掉电重启、rename 原子可见、会话与去重、会话绑定 key、uid 范围）。
 
+实现注记（M5）：写入相关的操作在 `core/src/meta/ns/file_ops.rs`（CommitWrite、Fallocate、GetInline、RenewCap、服务端 uninline 的只读前半段），细节见 3.3.4 的 M5 注记 ③④。与上表的差异：CommitWrite 的 INLINE 补丁补完之后 size 至少到补丁末尾（`len(INLINE) ≤ size` 一直成立）；"setattr（size = 0）"一格的"旧 inode 有 F_INLINE 时不写"不再成立——也写（3.4.2.9 的 M5 注记）；改长度、CommitWrite、Fallocate 超过单个文件的最大长度 → `EFBIG`（3.3.4 的 M5 注记 ④）；非属主（也不是 root）写入时去掉 setuid/setgid（posix-mode 的规则，core 执行）；RSTAT 与配额在 M7、M10。测试 `tests/it/meta_file_ops.rs`（含 `echo hello>f; echo x>f; truncate -s 6 f` 读到 `"x\n\0\0\0\0"`）。
+
 #### 3.5.2 请求去重（会话 + seq）
 
 - 每个客户端会话为**修改型**请求分配单调递增的 `seq`，重试**必须**用同一个 seq；同时在途的修改型请求 ≤ `DEDUP_WINDOW = 256`。`SessionOpen` 用 seq 0（按客户端随机生成的 session id 幂等）。
@@ -1758,12 +1781,15 @@ pub fn create(v: &mut dyn KvTxn, c: &OpCtx, r: &CreateIn) -> Result<MetaReply, E
 | 配额额度 | 在 `CommitWrite{want_quota}` 闭包里计算，与 size 更新原子 |
 | 会话驱逐 | 两个批次（3.4.4）；每个批次都是原子的 |
 
+实现注记（M5）：上表"inline → chunk"一行按 ADR-0034 改由**服务端**做（`MetaOp::Uninline`，3.3.4 的 M5 注记 ②）：CAS 仍是 `CommitWrite{uninline_expect_change_id}`，失败时服务端从头重做（最多 3 次，之后 `RETRY`），客户端不取旧内容。
+
 #### 3.5.6 删除后仍打开（孤儿 inode）
 
 - 最后一个链接被删除 → inode 标 `F_ORPHAN`、nlink = 0、写 GC 记录 kind 1（`due_ms = now + 6 s`），立即从祖先 RSTAT 扣除（配额立即释放，物理空间稍后回收）。
 - 客户端会话心跳上报"打开文件集合"的增量（新打开 / 已关闭，带是否写打开），leader 只在内存里维护所有存活会话的并集。**open 本身不写 raft**。
 - gc 任务删除孤儿的条件（全部满足）：① 不在任何存活会话的打开集合里；② 距 unlink 已超过 2 个心跳周期（6 s，确保"刚 open 的客户端"已上报）；③ 本 leader 就绪已超过 2 个心跳周期，且所有存活会话都已在就绪后发送过一次全集（3.4.1.10）。然后在执行器之外对 layout（及 `pending_epoch`）的每条链 `DeleteEpoch`，最后一个批次删除 inode、XATTR、INLINE、LOCKS、GC 记录。
 - 对孤儿的 `CommitWrite` 允许（size 照常更新），但不再计入任何目录的 RSTAT。
+- 实现注记（M5）：gc 任务（`plugins/gc`，元数据 leader 上）按上面三个条件删孤儿：① 用 `sessions::Live::is_open`；③ 用 `Live::covers(term, 存活会话)`（本 term 里每个存活会话都报过全集）加"本 leader 就绪已超过 6 s"（gc 自己记就绪的时刻）；然后对 inode **当前** layout 的每条链 `DeleteEpoch`，最后一个带前提的批次删 inode、XATTR、INLINE、LOCKS 与 GC 记录（`core/src/meta/gc_meta.rs`）。崩溃了但还没被驱逐的会话（驱逐在 M10）会一直挡住条件 ③，孤儿只是晚删，不会误删。
 
 ### 3.6 缓冲区与内存模型【ADR-0022】
 
@@ -2141,6 +2167,7 @@ core 的 `Pipeline` 对每次钩子调用统一包一层：`fail_point(&fp_name)
 transport 的 fail point `plugin.<name>.transport` 包在 core 写线程对 `Conn::send` 的调用外层：触发 = 这条连接作废（关闭、计为连接错误），于是走"连接断开 → 重连重试"的路径（3.3.8）。
 
 > 实现注记（M1）：包装是 `core/src/hooks/pipeline.rs` 的 `HookCall`（`enter()` 过 fail point 并开始计时，`exit()` 计数、计时、超预算与错误计数），authn 与 transport 已经用上；`Pipeline::new(PluginSet)`、`Pipeline::authn(..)`（返回连接身份与接受它的插件算出的 `server_proof`）、`Pipeline::transports()` 是 M1 加的。transport 的计时分两半：发的一半由 core 的写线程包在 `Conn::send` 外层（带 fail point；fail point 触发时不论配置的是哪个码都让连接作废）；收的一半由传输插件自己计——读到帧头之后开始、读完 body + bulk 时调用 `HookCall::exit`（不过 fail point），插件用 `HookCall::new(&MANIFEST, Hook::Transport)` 拿到与 core 同一组指标句柄（tcp、mem 都这样做，M2 的 rdma 照做，core 不用改）。
+> 实现注记（M5）：`HookCall::call(f)`（enter → f → exit，只增）是"调一次插件方法"的统一写法：qos 的 `enqueue`、codec 的 `shards`、transform 的编解码、bg_task 的 `step` 都经它；chunk_store 的每一次调用——包括已提交版本读句柄的每次 `read_at` 与 hb 线程上报容量时的 `statfs`——都经 `DataNode::store`（里面就是 `call`），所以 `wmfs_hook_seconds{hook="chunk_store"}` 能看到慢盘的读。只有服务端启动时打开 target 的 `open_target`、`clear_temp` 不包（只调一次，失败就拒绝启动）。
 
 #### 3.7.5 静态注册（首发全部内置插件）
 
@@ -2305,6 +2332,7 @@ pub struct TaskCtx<'a> {
 
 - **调度**：每个节点一个 `bg-sched` 线程，轮转本节点该跑的任务：`MetaLeader` 任务只在元数据 leader 就绪时运行，失去 leader 立即停（新 leader 从 `TaskRecV1` 游标续跑——断点续跑）；`EveryDataNode` 任务（scrub、本地孤儿扫描）在每个数据节点运行，游标由 core 框架以 `atomic_write` 存在 `<data_dir>/run/task-<kind>.cursor`（本地数据的本地进度，插件自己不持有状态）。每步：取令牌（任务级 `bytes/items per sec` + 节点级 `ClusterSettingsV1.bg_bytes_per_sec`）→ `step` → 每步后或至少每 5 s 持久化游标与进度。
 - **为什么要求幂等**：`step` 的副作用（例如迁移了一个文件）与游标持久化不在同一个事务里；崩溃后从旧游标重放，幂等保证不出错（迁移原语本身用 CAS，重复执行只会"已经是目标状态 → 跳过"）。
+- 实现注记（M5）：调度器骨架在 `core/src/bg/scheduler.rs`、限速在 `limiter.rs`（任务级 bytes/items 与节点级 `bg_bytes_per_sec` 取更严的，这一步已经花掉的时间算进去）。只有 `MetaLeader` 任务（M5 只有 gc 的 leader 部分）：本节点是**就绪**的 leader 才跑，换了 term 先从 TaskRecV1（键 `task(kind, "")`：leader 任务的 name 为空）读回游标；每步经 3.7.4 的包装（fail point `plugin.<名字>.bg_task`），**这一步处理了对象时**再过 fail point `bg.step.crash_after_effect`（副作用已发生、游标还没持久化）；有进展就持久化（每 5 s 最多一次，一轮结束时一定写）；失败只记 `wmfs_task_errors_total` 与一行警告，隔 `interval()` 从同一个游标重试。`TaskCtx` 加了一个字段 `live: &Live`（leader 内存里的会话与打开集合，gc 判孤儿用；只增，插件只读字段，`CORE_ABI_VERSION` 不变）。`EveryDataNode` 任务与本地游标文件、`wmfs task …`、`task_progress_ratio` 在 M11。迁移原语第 3、4 步的"把 INLINE 内容写进 chunk"与 ADR-0034 的服务端 uninline 共用 `meta::uninline::write_inline`（M11 接入）。
 - **控制**：`wmfs task list|show|pause|resume|run <kind>`；限速 `wmfs task set <kind> bw=100M,items=1000`（运维参数，存在 `TaskRecV1`，不是数据策略）。
 - **可观测**：`wmfs_task_items_total{task}`、`wmfs_task_bytes_total{task}`、`wmfs_task_backlog{task}`（理念文档 5.3："进度与积压量是一等指标"）、`wmfs_task_progress_ratio{task}`、`wmfs_task_step_seconds{task}`、`wmfs_task_errors_total{task}`；dashboard 显示进度条。
 - **遍历器 `Walker`**：两种模式。① 子树 DFS：游标 = `Vec<(dir_ino, 最后处理的名字)>` 的 postcard 编码，每次读 256 个 dentry，输出 `(ino, InodeV1, parent, 生效属性)`（属性按目录缓存）；② 全量扁平扫描：按 ino 顺序扫 `INODE` 前缀，游标 = 上次的 ino（最简单、天然可续跑）。
@@ -2367,6 +2395,7 @@ pub fn fail_point_hit(name: &str) -> bool;          // 只问"这次是否触发
   首批：`raft.persist.before_commit`、`raft.persist.after_commit`、`raft.apply.before`、`meta.exec.before_propose`、`meta.reply.drop`（吞掉一次元数据回复，演示重试 + 去重）、`snapshot.fetch.midway`、`chunk.pending.eio`、`chunk.pending.torn`（只写一半 pending 文件然后 abort）、`chunk.commit.before_rename`、`chunk.read.eio`、`chunk.read.corrupt`、`chunk.sync.eio`、`chain.forward.drop`、`chain.forward.delay`、`chain.head.crash_after_pending`、`chain.ack.drop`、`sync.fetch.midway`、`net.drop.to.<node>` / `net.drop.from.<node>`（不用 iptables 就能模拟网络分区）、`net.delay`、`clock.mono.skew_ms`、`clock.mono.rate_ppm`、`clock.wall.skew_ms`、`client.flush.before_commit`、`client.heartbeat.stop`、`bg.step.crash_after_effect`，以及每个插件自动拥有的 `plugin.<name>.<hook>`。
   实现注记（M3）：已埋好并各有测试：`raft.persist.before_commit`、`raft.persist.after_commit`、`raft.apply.before`（abort 用子进程测，`tests/it/failpoint_raft_abort.rs`；panic 用来验证坑 P2 的先后，`failpoint_raft_order.rs`）、`meta.exec.before_propose`、`plugin.embedded-kv.meta_engine`（`failpoint_meta.rs`）。`meta.reply.drop` 随 M4 的去重演示加入。
   实现注记（M4）：`meta.reply.drop` 在 `core/src/meta/service.rs`：带 seq 的修改型请求执行完、批次提交之后吞掉这一次回复（`Responder::drop_reply`：什么也不回，Drop 时也不自动回 EIO）；只读请求与会话的打开/关闭不受它影响（它们的重试本来就幂等，演示的是去重）。测试 `tests/it/failpoint_reply_drop.rs`（客户端等一个 RPC 超时后用同一个 seq 重试、去重命中、结果成功；fail point 一直开着时只读请求与会话的关闭、打开照常；一个请求卡在超时重试里、同一会话里别的线程做完 300 个修改，它的重试仍命中去重表——在途窗口按 seq 计，3.3.4 注记 ⑪）。另有每个新插件的 `plugin.posix-mode.authz`、`plugin.label-match.placement`（`failpoint_ns_plugins.rs`）。新指标：`wmfs_meta_dedup_hits_total`、`wmfs_posix_mode_decisions_total{result}`、`wmfs_label_match_ranked_total`。
+  实现注记（M5）：已埋好并各有测试：`chunk.pending.eio`、`chunk.commit.before_rename`、`chunk.read.eio`、`chunk.read.corrupt`、`chunk.sync.eio`（在 `plugins/local-fs`，`tests/it/failpoint_chunk.rs`）、`chunk.pending.torn`（写一半 pending 后 abort，子进程测：`failpoint_chunk_torn.rs`）、`bg.step.crash_after_effect`（`failpoint_bg.rs`），以及新插件的 `plugin.local-fs.chunk_store`、`plugin.crc32c.transform`、`plugin.replica.codec`、`plugin.fifo.qos`、`plugin.gc.bg_task`。**新登记一个**：`meta.uninline.before_commit`（ADR-0034 的服务端 uninline 写完 chunk、提交之前；`failpoint_uninline_crash.rs` 用 abort 测崩溃、`failpoint_uninline_race.rs` 用 sleep 拉长窗口测 CAS 重做）。新指标：`wmfs_chunk_read_bytes_total{target}`、`wmfs_chunk_write_bytes_total{target}`、`wmfs_chunk_corrupt_total{target}`、`wmfs_chunkstore_op_seconds{op}`、`wmfs_data_queue_depth`、`wmfs_crc32c_blocks_total{dir}`、`wmfs_crc32c_mismatches_total`、`wmfs_replica_read_orders_total`、`wmfs_fifo_depth`、`wmfs_fifo_served_total`、`wmfs_gc_epochs_deleted_total`、`wmfs_gc_orphans_deleted_total`、`wmfs_task_{items,bytes,errors}_total{task}`、`wmfs_task_backlog{task}`、`wmfs_task_step_seconds{task}`。
 - **时钟可注入**：`clock::mono_ms()` / `clock::wall_ms()` 是所有租约、超时与时间戳的唯一来源，fail point 可注入偏移与速率，用于租约安全性测试。（实现注记（M0）：运行中 set/clear 也安全——`rate_ppm` 只作用于设置之后的时间（以设置时刻的读数为基点），清除后多走或少走的部分保留；`skew_ms` 变大 = 立刻前跳，变小（含清除）= 停走直到真实时间追上；`mono_ms()` **永不倒退**，第一次读数是 1000 而不是 0。见 `core/src/base/clock.rs`。）数据节点用心跳回复里的 leader 墙钟估算偏差，导出 `wmfs_clock_skew_seconds`，超过 1 s 告警（cap 过期判断容忍 5 min）。
 
 
@@ -2383,6 +2412,16 @@ pub fn fail_point_hit(name: &str) -> bool;          // 只问"这次是否触发
 > - core/hooks：`PluginSet::{authz, placement, authz_plugins, placement_plugins}`。
 > - core/meta：`meta::{ns, changelog, cluster}`、`meta::schema::kv`（`get/put/next_id/bump_map_epoch/scan_tag/key_id`）、`meta::service::NOBODY`、`MetaService::live`、`meta::sessions::{usable, open, close, Live}`、`EmbeddedEngine::{cluster_map, stopped}`、`EffectiveAttrs::defaults`、`attrs::{CONSISTENCY_CTO, CONSISTENCY_STRONG, DEFAULT_ATTR_TTL_MS}`、`AttrResolver` 实现了 `Default`。
 > - core/init：`init::{parse_target, initial_warnings, default_class}`、`InitOpts.targets`、`InitialKv.targets`。
+> 实现注记（M5）：只增不改（新增字段都在 core 自己构造的结构体里）。新增（按模块）：
+> - core/base：`ReqCtx::internal()`（内部操作的请求上下文：Server 身份、uid 0、seq 0、now = 墙钟）。
+> - core/buf：`buf::POOL_WAIT`（服务端取缓冲最多等 100 ms，取不到回 `BUSY`）。
+> - core/proto：`cap::{sign, verify, peek, CapV1::allows, CapV1::check_time_and_right, RIGHT_*, CAP_MAC_LEN, CAP_SKEW_MS}`、`handshake::hmac_verify_prefix`、`MetaOp::Uninline`（ADR-0034）、`meta::{O_RDONLY, O_WRONLY, O_RDWR, O_ACCMODE}`。
+> - core/net：`RpcClient::pool()`。
+> - core/client：`DataClient::{with_refresh, with_timeouts, for_meta, pool}`（3.12 的五个方法照签名实现；`new` 的 `background` 参数不用，后台请求由 cap 的管理权限位标明）、`data_client::chunk_id(layout, ino, idx)`（第 idx 个 chunk 的身份，chains 为空 → `EINVAL`）。
+> - core/hooks：`PluginSet::{qos, codec, transform, chunk_store, bg_task, take_bg_tasks, qos_plugins, codec_plugins, transform_plugins, chunk_store_plugin}`、`Pipeline::{qos_call, codec_call, transform_call, chunk_store}` 与 `HookCall::call`（3.7.4 的调用包装），`traits::CODEC_REPLICA`，`policy::BuiltinPolicy`（M5 的 `Pipeline::policy` 一律回 `Default`，后台调度器也从这里拿求值器；WASM 求值点在二期）。
+> - core/meta：`OpCtx.cap_key` 与 `EngineOpts.cap_key`（执行器闭包与只读请求里签 cap 用）、`changelog::Change.extra`、`sessions::{Live::{is_open, covers}, may_sign_cap}`、`meta::{gc_meta, uninline}`（`uninline::InFlight`）、`meta::cluster::targets`、`meta::ns::file_ops`、`ns::common::{sign_cap, write_rights, max_file_size, kill_suid}`、`schema::keys::parse_gc`；`MetaService::set_data`（交进 Uninline 与后台任务共用的数据面客户端）；M4 的 `MetaService::live` 改为返回 `Arc<Live>`（后台调度器长期持有它；调用处写法不变）。
+> - core/data：`Target`（含 `phys_devs`）、`DataNode`（`store`、`transform` 经 3.7.4 的包装调插件，`report_corrupt`）、`open_targets`、`limit_capacity`、`data::{build, state, write, read, service, node_hb}`（`node_hb::MapHolder` 是本节点的集群图视图，`node_hb::HbDeps` 是 hb 线程要的东西）、`format::{checksum_name, compress_name, encrypt_name}`。
+> - core/bg：`bg::{scheduler, limiter}`、`TaskCtx.live`（3.10 的注记）。
 
 下面这些类型被 core/net、core/data、core/client、core/meta、cli/fuse、wmfs-mgr 同时使用，签名以这里为准（M0 的接口骨架原样落成文件）。
 
@@ -2551,6 +2590,7 @@ impl Router { pub fn add(&mut self, prefix: &str, h: Box<dyn Fn(&HttpIn) -> Http
 - **mclock**（410，≈ 330 行）。职责：数据节点入口调度（第 6 章第 1 层）。实现：每个 `QueueKey (tenant, qos_id, class_id)` 一个队列，队列内按 `job_id` 分子队列**轮转**（理念文档 6.2"作业 id 参与分类"）；mClock 三个标签：入队时 `R = max(R + cost/r, now)`、`L = max(L + cost/l, now)`、`P = max(P + cost/w, now)`；出队先取"R ≤ now 的最小 R"（保底，与优先级无关）；否则进入权重阶段：**先只在 `low_priority = false` 的队列里**找"L ≤ now 且字节令牌桶足够"的最小 P，**没有可派发的才看 `low_priority = true` 的队列**（存储类 `priority = low`，例如 vHDD 类；约 10 行），选中后把该队列的 R 标签回退 cost/r；都没有则返回最早可再问的时刻；空闲 60 s 的队列回收、重新激活时标签重置为 now。`cost = 1 + bytes / 128 KiB`（4 KiB IO = 1，1 MiB = 9，4 MiB = 33），`r/l` 的单位是"成本单位/秒"——所以存储类里写的 `iops_*` 实际是"成本单位/秒"，这个换算写进 ADR-0010 与 semantics.md，`wmfs class show` 也直接显示换算结果（例如"iops_max = 300 ≈ 4 MiB 写 9 次/秒 ≈ 36 MiB/s，按 3 个节点均分后每节点 100"）。规格 `QosSpec` 由 core 从集群图计算：目录 `qos` 属性（`QOS` 表）或存储类的 QoS 包络，**按该存储类当前有 Up target 的数据节点数静态均分**到每个节点（没有 dmClock 式跨节点协调，【ADR-0010】）。后台请求（`background = true`）进一个固定的低优先级队列（`w = 1`、`l = 节点后台限速`、`low_priority = true`）。插件内部只有一个 `Mutex<State>`，**不阻塞、不睡眠**；选择时线性扫描活跃队列（小集群队列数 ≤ 几百）。位置：每个数据节点。预算 2 µs/次。
 - **睡眠与唤醒归 core**（`core/data/service.rs`，两个插件共用）：core 持有一个 `Mutex<()> + Condvar` 和 `token → 请求` 的映射表；每次 `enqueue` 之后 `notify_one`；io 线程循环 `match qos.dequeue(now) { Ok(t) => 取出 t 对应的请求执行, Err(Some(t)) => cv.wait_timeout(t − now), Err(None) => cv.wait_timeout(100 ms) }`。所以插件写错也只会"派发不准"，不会忙等或丢失唤醒。
 - **fifo**（401，≈ 40 行）。最简单的先进先出，给不需要 QoS 的 profile（`minimal`）用；"只允许一个活跃"规则不变。
+- 实现注记（M5）：实际约 60 行（`plugins/fifo`）。M5 的数据节点只装 fifo（mclock 在 M13）；core 的 `QosSpec` 先只带存储类的低优先级标记，管理权限位的 cap（后台请求）进低优先级——fifo 不分优先级，照样先进先出。指标 `wmfs_fifo_depth`、`wmfs_fifo_served_total`。
 
 ### 4.6 placement
 
@@ -2559,6 +2599,7 @@ impl Router { pub fn add(&mut self, prefix: &str, h: Box<dyn Fn(&HttpIn) -> Http
 ### 4.7 codec
 
 - **replica**（610，≈ 50 行）。职责：数据 ↔ 分片。实现：`shards` = 每个成员一份 `Whole`；`read_order` = serving 成员，同节点优先（locality），其余按 `hash(chunk_id)` 轮转分散读负载。链式复制协议本身在 core（契约），codec 只决定"分几片、读哪个"。预算 1 µs。
+- 实现注记（M5）：实际约 50 行。M5 的链长 1：数据服务只用 `shards`（核对本成员存整块）；`read_order` 已实现并有单元测试，DataClient 在 M9 有多副本时接入（M5 按链序选第一个 Serving 成员）。指标 `wmfs_replica_read_orders_total`。
 
 ### 4.8 transform
 
@@ -2573,9 +2614,12 @@ impl Router { pub fn add(&mut self, prefix: &str, h: Box<dyn Fn(&HttpIn) -> Http
 
 数据加密密钥存在 KV `DATAKEY`，用 `K_wrap` 以 AES-256-GCM（随机 nonce）包裹，经集群图下发，数据节点解包后只放在内存里。同一个密钥用随机 nonce 的安全上限约 2^32 次加密（约 256 TiB 的 64 KiB 块），`docs/ops.md` 建议超过 64 TiB 后轮换为新 key id。位置：数据节点 head 的 io/repl 线程（写）与被读成员的 io 线程（读）。每个都有 `transform.<名>.corrupt` 用例（篡改输出一字节，验证解码端能发现）。
 
+实现注记（M5）：首发 M5 只有 crc32c（`plugins/crc32c`，`crc32c` crate 0.6，约 65 行）；transform 插件按类别的 altitude 子区间（校验 700–729、压缩 730–759、加密 760–789）与"同一类的算法编号唯一"由 `PluginSet::validate` 检查。core 按 chunk 头 / layout 里的算法编号找插件（`Pipeline::transform_call`），找不到 → `FEATURE_UNSUPPORTED`。指标 `wmfs_crc32c_blocks_total{dir}`、`wmfs_crc32c_mismatches_total`；`transform.crc32c.corrupt` 的用例是插件单元测试"翻转任意一个字节都被发现"（1000 字节的块逐个字节翻转）。
+
 ### 4.9 chunk_store
 
 - **local-fs**（≈ 420 行）。职责：把 core 编码好的 chunk 字节存成目录里的文件（ext4 或 XFS，本机 ext4【ADR-0008】）。实现：路径规则见 3.2.2；fd LRU 缓存 4096 个（同时缓存已提交版本的头 + 块表；本节点每次 commit/install/delete 时作废对应条目）；`write_pending` = `O_CREAT|O_TRUNC` 打开 `p/…p`、`pwrite` 各段、对 copies 用 `libc::copy_file_range`（`EXDEV/ENOSYS/EOPNOTSUPP` 时退回 `pread/pwrite`；在 XFS 上会变成 reflink）；`commit_pending` = （sync 时 `sync_data`）→ `rename` → 新建过目录时 `fsync` 目录；`install` = `t/` 临时文件 → `sync_data` → `rename` → `fsync` 目录；`sync` = `sync_data` + 目录 fsync；`list_chain` 按名字排序遍历；`delete_epoch` 删目录；`statfs` = `libc::statvfs` 与 `node.toml` 里的 `capacity` 上限取小（防止测试写满系统盘）。位置：io/repl 线程。预算 100 ms/次（3.7.4），`wmfs_chunkstore_op_seconds{op}`。fail point：`chunk.pending.eio`、`chunk.pending.torn`、`chunk.commit.before_rename`、`chunk.read.eio`、`chunk.read.corrupt`、`chunk.sync.eio`。写放大：小块随机覆盖写要复制该 chunk 其余块的存储字节（ext4 上是内核内拷贝，约 1 ms / 4 MiB）——首发接受并写进文档，客户端按 chunk 合并脏数据能消掉大多数【ADR-0021】；块级增量格式二期用 feature flag 引入。
+- 实现注记（M5）：实际约 340 行（`plugins/local-fs/{mod.rs, walk.rs}`，细则见它的 `docs.md`）。与上文不同的几处：① **没有 fd LRU 缓存**：每次调用打开文件（4 MiB 的 chunk 下打开文件的开销远小于读写本身；需要时再加，不改接口）；② `statfs` 的容量是文件系统大小（`statvfs`），已用 = 本 target 已提交文件实际占的块，与 node.toml 的 `capacity` 取小由 core 做（`data::limit_capacity`；`open_target` 拿不到配置）；③ `chunk.pending.torn` 写完一半就 abort 整个进程。
 
 ### 4.10 meta_engine
 
@@ -2597,6 +2641,8 @@ impl Router { pub fn add(&mut self, prefix: &str, h: Box<dyn Fn(&HttpIn) -> Http
 | gc（≈ 220 行） | MetaLeader + EveryDataNode | leader：GC 记录 kind 2（废弃 epoch）宽限 `epoch_gc_grace`（默认 60 s，演示时可调成 0）后对其链 `DeleteEpoch`、删记录；kind 1（孤儿）按 3.5.6 条件删除；被驱逐/已关闭会话的去重记录分批点删；`EVICTED` 过期删除；changelog 修剪。数据节点：`list_epochs` → 批量 `CheckEpochs` → 删除已死且目录 mtime 早于 1 h 的 `(chain, ino, epoch)`；删除本 target 已不是成员、且超过 `rejoin_window` 的链目录 |
 | trash-expire（≈ 70 行） | MetaLeader | 范围扫描 `TRASH_INDEX` 中 `expire_ms ≤ now` 的条目 → 以内部操作真正删除（进入普通孤儿/GC 流程） |
 | ttl（≈ 90 行） | MetaLeader | 遍历带 `ttl` 属性的子树，mtime 早于期限的文件 → unlink（若该处 `trash` 生效则进回收站），changelog 原因 = ttl |
+
+实现注记（M5）：gc 只做了 leader 部分的前两项（约 95 行，`plugins/gc`）：每轮分页读 GC 记录（每页 ≤ 100 条，游标 = 最后一条记录的 key），kind 2 过了 `due_ms`（写记录时 + `epoch_gc_grace`）就对记录里的每条链 `DeleteEpoch`（管理 cap）、删记录；kind 1 按 3.5.6 的条件（注记见那里）。去重记录与 `EVICTED` 的清理、changelog 修剪、数据节点上的本地孤儿扫描在 M11。每一步幂等（重放无害，`failpoint_bg.rs`）。
 
 ### 4.13 event_sink（进程外，`wmfs mgr` 内，`wmfs-mgr` crate）
 
@@ -2770,6 +2816,9 @@ when = "idle>30d"          # 等价于在绑定该类的目录上隐式设置 ti
   - ③ `--json`：成功时 `{ok, ino}`，`stat` 是属性 + `layout` + `chains`（每条链的 id、声明副本数、成员 target），`ls` 是 `{entries: [{name, ino, kind, mode, nlink, uid, gid, size, mtime_ms}]}`；失败时退出码 1、输出 `{error: "<错误码名>", errno, message, path}`。发请求之前的失败也输出 JSON（没有 `path`）：参数或密钥文件写错 `EINVAL`、client key 加 `--as-uid` 是 `EACCES`、30 s 内找不到元数据 leader 是 `ETIMEDOUT`、认证失败 `AUTH_FAILED`。`--verbose` 把重试（例如"超时重试 seq=… → 去重命中"）打印到 stderr。
   - ④ `wmfs init --target PATH[:label,label]`（3.4.3 的注记）；`wmfs init` 与 `wmfs dev up` 的输出里有集群警告。`wmfs dev up` 起好节点后取不到集群图（节点没有成为就绪的 leader——多半是旧里程碑建的开发集群、插件清单不一致）就打印原因与修法（`wmfs dev down --purge` 之后重新 `wmfs dev up`）并以非 0 退出；server.log 里插件清单不一致的错误、CLI 找 leader 超时（节点一直是 `candidate`）的报错也给出同样的修法。
   - ⑤ `wmfs debug kv` 与 `wmfs fs` 共用 `cli/src/leader.rs`（问 health 找 leader）。
+- 实现注记（M5）：
+  - ① `wmfs fs put <本地文件|-> <路径>`、`get <路径> <本地文件|->`、`cat <路径>`、`truncate <路径> <长度>`（`cli/src/fs/data.rs`，经 MetaClient + DataClient 直接读写，不经 FUSE）：put = Create（已存在且有内容先截断到 0，像 `cp` 覆盖）→ 内容 ≤ `inline_max` 且文件还是 inline → 一个带 inline 补丁的 CommitWrite；否则（还是 inline 时先 `Uninline`）逐个 chunk `WriteChunk` 到 head，最后 CommitWrite；不 fsync（与 close 相同）。get/cat = Open（只读）→ inline 直接用回复里的内容，否则逐个 chunk 读，`logical_len` 之后与 `CHUNK_NOT_FOUND`（先 GetAttr 确认 epoch 没变，C5）按 0 补齐；坏块 → `EIO`。truncate 到 s > 0 先对受影响的 chunk 发 `TruncateChunk` 再 `SetAttr`。`--json`：put `{ok, ino, size, inline, chunks}`、get `{ok, ino, size}`、truncate `{ok, ino, size}`；`cat` 与 `get … -` 把内容写到标准输出，不能再加 `--json`（`EINVAL`，免得内容与 JSON 混在一起）。`wmfs fs stat` 多一行 `inline=yes|no（阈值 64K）`，JSON 多一个 `inline`。
+  - ② `wmfs debug chunk-path <路径> <idx> [--node n] [--json]`（按集群图找到链与成员 target，按 local-fs 的路径规则拼出已提交版本的本地路径；不带 `--json` 只打印这一行，演示里 `$(…)` 直接用它）、`wmfs debug chunk-header <文件> [--json]`（3.2.4 的注记）、`wmfs debug corrupt-chunk <路径> <idx> --node n [--block b] [--json]`（翻转第 b 块存储字节正中的一个字节；第 b 块是洞时报错；`--node` 省略时取链的 head，即第一个 Serving 成员）。都只在本机直接读写 target 目录（开发集群的 target 都在本机），按 local-fs 的路径规则找文件——这三个子命令只在编进 local-fs 插件时有（路径规则经 `cli/src/registry.rs` 的 `chunk_path` 取，registry.rs 仍是唯一知道有哪些插件的文件）。
 
 ### 7.3 `/metrics`（节选，前缀 `wmfs_`）
 
@@ -2783,6 +2832,8 @@ when = "idle>30d"          # 等价于在绑定该类的目录上隐式设置 ti
 | 后台 | `task_items_total{task}`、`task_bytes_total{task}`、`task_backlog{task}`、`task_progress_ratio{task}`、`declared_mismatch_files{attr}`、`migration_skipped_open_files` |
 | 插件 | `hook_calls_total{hook,plugin}`、`hook_seconds{hook,plugin}`、`hook_over_budget_total{hook,plugin}`、`hook_errors_total{hook,plugin}` |
 | 基座 | `bufpool_free{class,lane}`、`bufpool_wait_seconds`、`failpoint_hits_total{name}`、`clock_skew_seconds`、`slow_requests_total{family}`、`threads` |
+
+实现注记（M5）："数据"一行实现了 `chunk_read_bytes_total{target}`、`chunk_write_bytes_total{target}`、`chunkstore_op_seconds{op}`，另加 `chunk_corrupt_total{target}`、`data_queue_depth`；链与 CRAQ 的指标在 M9，`target_used_bytes/target_capacity_bytes` 随 M11 的 dashboard 加（M5 的用量在心跳里报给 leader，StatFs 可见）。"后台"一行实现了 `task_items_total`、`task_bytes_total`、`task_backlog`、`task_step_seconds`、`task_errors_total`（`task_progress_ratio` 在 M11）。
 
 ### 7.4 dashboard、alert、event_sink 的运行方式
 
@@ -2830,11 +2881,13 @@ open 流程：`Open(ino, flags)`（只读请求，不写 raft）→ 得到最新
 - `STALE_LAYOUT` → 重新 `Open` 取新 layout → 把仍在脏区里的数据按新 layout 重写 → 再次 `CommitWrite`（C4）。
 - 失败处理：可重试错误在 `--op-timeout` 内重试；彻底失败时**保留脏数据并记下错误**，下一次 `write/flush/fsync/close` 返回该错误（类似内核的 errseq），不会悄悄丢弃。
 - **inline**：layout 是 inline 时，文件最终大小 ≤ `layout.inline_max` → `CommitWrite` 携带 `inline_patches`（按区间打补丁，两个客户端写不相交区间互不覆盖；补丁越过当前长度时服务端中间补 0）；超过时 → `GetInline` 取最新内容 → 与脏数据合并写进 chunk（create 时链已分配好）→ `CommitWrite{uninline_expect_change_id}`（CAS 失败则重来）。
+- 实现注记（M5）：按 ADR-0034，超过 `inline_max` 时**不再**由客户端 `GetInline` + 合并：客户端先发 `MetaOp::Uninline{ino}`（服务端把 INLINE 内容写进 chunk 并清除 F_INLINE，3.3.4 的 M5 注记 ②），再把脏数据当普通 chunk 文件写出、`CommitWrite`。所以只有写权限的人也能把小文件写大，`GetInline` 仍只给能读的人。M5 的 `wmfs fs put` 已经这样做（`cli/src/fs/data.rs`），FUSE 写回在 M6。
 - 截断：`setattr(size=s)` → 先丢弃脏区里 s 之后的数据并刷出其余 → s == 0：直接 `SetAttr{size:0}`（服务端换 epoch 并按当前属性重建 layout）；s > 0：对受影响的 chunk 发 `TruncateChunk`（3.4.2.9；inline 文件没有 chunk，跳过这一步）后 `SetAttr{size: s}`。两种情况的回复都是 `Opened(OpenOut)`，用它更新 InodeState。
 
 ### 8.5 strong 模式
 
 - open 回 `FOPEN_DIRECT_IO`，该子树的 entry/attr TTL = 0，不进 cache_store，不写回。strong 目录里新建的文件不 inline（新 layout 的 `inline_max = 0`）；**以写方式打开一个已有的 inline 文件时，先走 8.4 的 uninline 流程**（`GetInline` → 写进 chunk → `CommitWrite{uninline_expect_change_id}`），之后一律按 chunk 写——所以 strong 的写路径、`AppendReserve` 永远不会遇到 F_INLINE 文件（协调器也会把 strong 目录里残留的 inline 文件转成 chunk，3.10）。
+- 实现注记（M5）：按 ADR-0034，"以写方式打开一个已有的 inline 文件时，先走 8.4 的 uninline 流程"改为先发 `MetaOp::Uninline{ino}`（服务端完成，不取旧内容），之后一律按 chunk 写（M12）。只读打开的 inline 文件仍用 `GetInline`（只给能读的人）。
 - read：先 `GetAttr`（线性一致，拿 size 与 epoch；epoch 变了先刷新 layout）→ 按 CRAQ 规则读 chunk（只读打开的 inline 文件：`GetInline`，同样是线性一致读）。
 - write：同步 `WriteChunk` 到链 → 同步 `CommitWrite`（校验 epoch、更新 size/mtime）→ 才返回；`STALE_LAYOUT` → 重新 `Open`，用本次 write 回调里仍持有的数据按新 layout 重写。代价：每次 write 一次元数据提交（本机 fsync 约 2–5 ms），写进文档；适合"协调为主"的负载（日志、共享状态），不适合大量小块随机写。
 - `O_APPEND`：fuser 的 `write()` 能看到打开标志；strong 下忽略内核给的 offset，改为 `AppendReserve(ino, epoch, len)` 拿到 offset → 写数据 → `CommitWrite`；同一 inode 的追加在本客户端串行（一个 Mutex）。cto 下 `O_APPEND` 由内核用其缓存的大小计算偏移，跨节点不保证顺序（理念文档 8.2 原文）。M12 验收包含"strong 目录里两个挂载点并发追加同一个小文件"。
@@ -2894,9 +2947,13 @@ open 流程：`Open(ino, flags)`（只读请求，不写 raft）→ 得到最新
 
 在一个进程里起 3 个数据服务，通过 `plugin-mem-transport` 或回环 TCP 互连，集群图由测试直接下发（不需要元数据服务）。target 用测试专用的内存版 `MemTargetStore`（testkit，实现 `TargetStore` 这个插件边界）：文件内容、rename、目录项都先进"易失层"，`commit_pending(sync)`/`install`/`sync` 与目录 fsync 才让它们落盘，崩溃时丢掉易失层——用来验证 R1–R6 的 fdatasync 与目录 fsync 顺序。另有一组同样的用例跑在真实的 local-fs 上（只验证功能，不验证掉电）。注入：转发丢弃/延迟、链变更、重复转发、NeedFull、head 写完 pending 后崩溃、唯一幸存者重启（incarnation）、整链重启、同步期间并发写。不变式检查器：静止后所有 Serving 副本对每个 chunk 的已提交版本与内容哈希相同；读历史无回退。
 
+> 实现注记（M5）：`MemTargetStore` 在 `tests/harness/mem_target.rs`（易失层 + 落盘层：`commit_pending(sync)`、`install`、`sync` 与目录 fsync 才落盘；`crash()` 丢掉易失层（`p/` 里的 pending 文件原样留下，等启动清理）、`crash_torn()` 让未落盘的文件只留下一部分、`flip_bit()` 翻转任意比特）。M5 的单节点部分在 `tests/it/data_chunk.rs`：随机的写/截断/读与参考模型逐字节比对（MemTargetStore 与真实 local-fs 各跑一遍，种子个数 `WMFS_DATA_SEEDS`，默认 40，`scripts/accept.sh M5` 跑 1000 个）、头与版本号、pending 在任意字节处截断、已提交文件只落盘一部分、任意比特翻转、Corrupt 规则、掉电只留下 fsync 过的数据。完整节点上的端到端测试在 `data_e2e.rs`、`data_gc.rs`（`tests/harness/node.rs`：一个进程里 `init_node` + `server::start`，端口随机）；target 一级的检查（cluster_id、ro_compat、容量上限）在 `data_target.rs`。三个数据服务的 CRAQ 组件测试在 M9。
+
 ### 9.4 fail point 测试
 
 3.11 列出的每个 fail point 至少一个测试（理念文档 4.3.4、9 章"内建 fail points 覆盖每个钩子"）。重点：`raft.persist.before_commit=abort`（重启后不丢已确认写）、`meta.reply.drop`（客户端重试恰好一次）、`chunk.pending.torn`、`chain.head.crash_after_pending`（pending 前滚，链不分叉）、`chain.ack.drop`（重新驱动）、`sync.fetch.midway`、`clock.mono.rate_ppm`（租约在 20% 速率偏差内仍安全）、`client.heartbeat.stop`（驱逐两阶段：锁在数据节点确认后才释放、被驱逐客户端的写被拒绝）。
+
+> 实现注记（M5）：`chunk.*`、`bg.step.crash_after_effect`、`meta.uninline.before_commit` 与 M5 新插件的 `plugin.<名字>.<钩子>` 各有用例（3.11 的 M5 注记）；会 abort 的（`chunk.pending.torn`、`meta.uninline.before_commit=abort`）照 `failpoint_raft_abort.rs` 的做法由子进程来做，父进程确认它死于 SIGABRT 后在同一个目录上重启检查。fail point 是进程级的，每个 fail point 测试程序是单独的 `[[test]]`。
 
 ### 9.5 单机多进程集群测试框架（`tests/harness/`）
 
@@ -2912,6 +2969,8 @@ c.rstat_check("/")?;
 ```
 
 "多节点" = 本机多进程（不同端口、不同数据目录），不需要 docker。每个测试一个独立根目录，端口从测试名哈希出基址并用锁文件防冲突；**失败时保留目录与日志**，成功时清理。同样的能力以 `wmfs dev` 暴露给人。工作负载检查器：① 已确认写不丢（写入已知内容并 fsync，随机 kill -9，结束后逐一校验）；② rename 原子性（两个名字之间并发 rename，另一挂载点在 strong 子树循环 stat，永远恰好看到一个）；③ strong 追加（两挂载点各写 N 条 `(writer, seq)`，无重叠、无丢失；崩溃导致的零洞单独计数，符合文档）；④ 锁互斥（两挂载点在 F_SETLKW 下对同一计数器各加 1000 次，结果恰好 2000）；⑤ 配额（多写者并发写配额目录，后台每 100 ms 采样 RSTAT，永不超过 hard + quantum × 写者数）；⑥ 单点故障无错误（理念文档第 9 章成功标准：3 节点、replicas=3，写入中依次 kill 每个节点，客户端侧零错误）；⑦ Jepsen-lite：寄存器负载（8 字节读写）+ 随机 kill/SIGSTOP/分区/时钟偏移，WGL 线性一致性检查——M9 的版本由 testkit 直接用 `DataClient` 读写单个 chunk（绕过 FUSE 与各级缓存，那时还没有 strong）；M12 起再加 strong 目录里单文件当寄存器的 FUSE 版本。
+
+> 实现注记（M5）：单节点版在 `tests/harness/node.rs`（同一个进程里 `init_node` + `server::start`）。与"测试一律监听 127.0.0.1:0"的偏离：节点的 rpc 与管理端口要在 init 时就写进 node.toml 与 NodeRecV1（客户端按集群图连数据节点），所以测试工具先绑 `127.0.0.1:0` 拿到一个空闲端口再放掉、交给 init；同一测试程序里并行的用例之间有极小的撞端口窗口（撞上时 `server::start` 报"监听失败"，重跑即可）。多进程的 `Cluster` 在 M8 起按本节的"端口基址 + 锁文件"做。
 
 **本机验证不了的事**（写进 ADR-0015）：真实设备上的掉电持久性（`fdatasync` 与目录 `fsync` 的顺序在 ext4/XFS 上是否真的够）需要 root 才能用的 dm-log-writes 或 LazyFS 环境补测；本机只能用上面两个模拟后端验证"我们按约定调用了 fsync"。
 
@@ -2989,7 +3048,7 @@ CI（`scripts/ci.sh`）：`cargo fmt --check` → `cargo clippy --all-targets --
 | 19 | 5.2 `compress`、`encrypt` 生效方式"新数据 + 协调器"，`checksum`、`locality`"新数据" | 变换参数与放置属于 layout：属性改动对**新文件与截断到 0 的文件**立即生效；已有文件的新写入沿用旧 layout，直到协调器迁移（写打开的文件被跳过、单独计数、24 h 告警）；checksum、locality 不迁移 | 按块切换 layout 需要块级元数据与混合解码，复杂度高；截断到 0 重建 layout 覆盖了最常见的"覆盖写" | 0021 chunk 文件格式 v1（附带的偏离） | 需确认 |
 | 20 | 理念文档 4.3.1 只要求 manifest；首发另加"集群插件清单" | 不是偏离，是对原则 7 的落实：各节点会影响策略的插件集合必须一致，否则退出 | 否则 leader 切换会静默跳过授权/配额/QoS 策略 | 0025 | 随 0025 |
 
-另有 11 条**不是偏离、但属于契约层首次定义**的设计 ADR（理念文档 10.1："这是契约吗？是 → 先写 ADR，等人类批准"），除 0026 外全部在 M0 开工前（批次 0）一次确认：0018 线上协议 v1、0019 元数据引擎与执行模型、0020 元数据 KV 布局 v1、0021 chunk 文件格式 v1 与数据侧崩溃一致性、0022 缓冲池与零拷贝所有权、0023 租约 / 能力令牌 / 两阶段驱逐、0024 CRAQ 链式复制（成员、版本、incarnation、重同步）、0025 钩子清单与插件 ABI 规则、0027 后台任务框架与可观测基座、0028 命名空间语义与 cto 缓存失效协议 v1。0026 目录属性与递归用量 / 配额 quantum 模型在 M7 开工前确认（它的实现从 M7 开始；其中"配额允许短暂超限"是要你决定的产品取舍）。实现中补齐的技术缺口（2026-10-21 起，主管按本文开头的例外条款决定）：0029 changelog 操作码表 v1、0030 M1 补齐的握手与管理 API 细节、0031 M2 补齐的 RDMA 插件细节、0032 M3 补齐的元数据引擎细节、0033 M4 补齐的命名空间与会话细节。实现中由人类拍板的：0034 inline 小文件转 chunk 由服务端完成（2026-10-22，改 8.4、8.5 的 uninline 流程）。
+另有 11 条**不是偏离、但属于契约层首次定义**的设计 ADR（理念文档 10.1："这是契约吗？是 → 先写 ADR，等人类批准"），除 0026 外全部在 M0 开工前（批次 0）一次确认：0018 线上协议 v1、0019 元数据引擎与执行模型、0020 元数据 KV 布局 v1、0021 chunk 文件格式 v1 与数据侧崩溃一致性、0022 缓冲池与零拷贝所有权、0023 租约 / 能力令牌 / 两阶段驱逐、0024 CRAQ 链式复制（成员、版本、incarnation、重同步）、0025 钩子清单与插件 ABI 规则、0027 后台任务框架与可观测基座、0028 命名空间语义与 cto 缓存失效协议 v1。0026 目录属性与递归用量 / 配额 quantum 模型在 M7 开工前确认（它的实现从 M7 开始；其中"配额允许短暂超限"是要你决定的产品取舍）。实现中补齐的技术缺口（2026-10-21 起，主管按本文开头的例外条款决定）：0029 changelog 操作码表 v1、0030 M1 补齐的握手与管理 API 细节、0031 M2 补齐的 RDMA 插件细节、0032 M3 补齐的元数据引擎细节、0033 M4 补齐的命名空间与会话细节、0035 M5 补齐的数据路径细节。实现中由人类拍板的：0034 inline 小文件转 chunk 由服务端完成（2026-10-22，改 8.4、8.5 的 uninline 流程）、0036 已打开的句柄在权限被去掉之后学 NFS（2026-10-22，semantics.md 放松第 17 条；`AuthzOp::Handle`、`MetaOp::TruncateHandle` 只增，随 M6 实现）。
 
 ---
 

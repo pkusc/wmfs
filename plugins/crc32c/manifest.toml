@@ -1,0 +1,13 @@
+# crc32c transform 插件的 manifest（design.md 3.7.1、4.8）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "crc32c"
+version = "0.1.0"
+hooks = ["transform"]
+altitude = 701
+hot_path = true
+abi_version = 1
+attrs = ["checksum"]
+budget_ns = 20000
+fail_points = ["plugin.crc32c.transform"]
+
+[config_schema]
+# 没有部署参数：用哪种校验和是目录属性 checksum（M7 起可设置；默认 crc32c）

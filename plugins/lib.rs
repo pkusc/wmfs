@@ -22,3 +22,23 @@ pub mod posix_mode;
 #[cfg(feature = "label-match")]
 #[path = "label-match/mod.rs"]
 pub mod label_match;
+
+#[cfg(feature = "local-fs")]
+#[path = "local-fs/mod.rs"]
+pub mod local_fs;
+
+#[cfg(feature = "crc32c")]
+#[path = "crc32c/mod.rs"]
+pub mod crc32c;
+
+#[cfg(feature = "replica")]
+#[path = "replica/mod.rs"]
+pub mod replica;
+
+#[cfg(feature = "fifo")]
+#[path = "fifo/mod.rs"]
+pub mod fifo;
+
+#[cfg(feature = "gc")]
+#[path = "gc/mod.rs"]
+pub mod gc;

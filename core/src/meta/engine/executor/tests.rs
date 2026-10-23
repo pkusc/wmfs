@@ -28,7 +28,7 @@ fn db_with(kv: &[(Vec<u8>, Vec<u8>)]) -> Database {
 }
 
 fn env() -> OpEnv {
-    OpEnv::new(Arc::new(Pipeline::new(PluginSet::new(&[]))))
+    OpEnv::new(Arc::new(Pipeline::new(PluginSet::new(&[]))), [0; 32])
 }
 
 fn ctx(session: u64, seq: u64) -> ReqCtx {

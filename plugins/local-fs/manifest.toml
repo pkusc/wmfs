@@ -1,0 +1,21 @@
+# local-fs chunk_store 插件的 manifest（design.md 3.7.1、4.9）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "local-fs"
+version = "0.1.0"
+hooks = ["chunk_store"]
+altitude = 0
+hot_path = true
+abi_version = 1
+attrs = []
+budget_ns = 100000000
+fail_points = [
+    "plugin.local-fs.chunk_store",
+    "chunk.pending.eio",
+    "chunk.pending.torn",
+    "chunk.commit.before_rename",
+    "chunk.read.eio",
+    "chunk.read.corrupt",
+    "chunk.sync.eio",
+]
+
+[config_schema]
+# 没有部署参数：target 的目录与容量上限写在 node.toml 的 [[target]]（本体读），不在插件配置里

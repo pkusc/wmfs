@@ -23,6 +23,7 @@ pub struct Change<'a> {
     pub new_parent: u64,
     pub new_name: &'a [u8],
     pub size: u64,
+    pub extra: Vec<(String, String)>, // 实现注记（M5）：例如 SetSize 的 via=CommitWrite（ADR-0029 的码表注释）
 }
 
 /// 追加一条成功的事件。操作名不在 ADR-0029 的表里 = 程序写错了（不变量破坏）。
@@ -47,7 +48,7 @@ pub fn append(v: &mut dyn KvTxn, c: &OpCtx, ch: Change) -> Result<(), ErrCode> {
         new_parent: ch.new_parent,
         new_name: ch.new_name.to_vec(),
         size: ch.size,
-        extra: vec![],
+        extra: ch.extra,
         audited: false, // audit 属性在 M12
     };
     kv::put(v, &keys::changelog(seq), &rec);

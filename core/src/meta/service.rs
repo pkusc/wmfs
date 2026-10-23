@@ -17,8 +17,14 @@
 //! - fail point `meta.reply.drop`（3.11）：带 seq 的修改型请求执行完、批次提交之后，吞掉这一次回复（Responder 什么也不回）——
 //!   客户端等一个 RPC 超时（10 s）后用同一个 seq 重试，去重表返回原结果（演示"重试不会冒出假错误"）。只读请求与会话的
 //!   打开/关闭不受它影响（它们的重试本来就幂等，演示的是去重）。去重命中计入 `wmfs_meta_dedup_hits_total`。
+//!
+//! 实现注记（M5）：NodeCall 加了 target 心跳（`meta/cluster/targets.rs`）；MetaCall 的 `StatFs`（要心跳报上来的容量，同一个文件）与
+//! `Uninline`（ADR-0034：按只读请求的方式处理、seq 0，在 meta-read 线程上经数据面写 chunk，`meta/uninline.rs`）也在 meta-read 线程
+//! 上做；`Uninline` 要的数据面客户端由服务端装配时 [`MetaService::set_data`] 交进来（没有 → `NOT_READY`）。同一个 inode 同时最多
+//! 一个 Uninline、全部加起来最多 `READ_THREADS / 2` = 4 个（`uninline::InFlight`，超出 → `BUSY`）：它们在 meta-read 线程上同步等
+//! 数据面，至少要留一半线程给心跳、集群图与普通读——数据节点正是经它们拉到新集群图，Uninline 才写得成。
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::{Sender, TrySendError, bounded};
 use wmfs_api::failpoint::fail_point_hit;
@@ -26,16 +32,19 @@ use wmfs_api::metrics::{self, Counter};
 
 use crate::base::types::{Principal, ReqCtx, Role};
 use crate::base::{ErrCode, clock, lock, log};
+use crate::client::data_client::DataClient;
 use crate::hooks::traits::ConnIdentity;
 use crate::meta::cluster::map::filtered;
+use crate::meta::cluster::targets::{self, TargetUsage};
 use crate::meta::engine::txn::{MetaEngine, TxnOp, TxnRequest};
 use crate::meta::ns;
 use crate::meta::schema::keys;
 use crate::meta::sessions::{self, Live};
+use crate::meta::uninline::{self, InFlight};
 use crate::net::server::{Responder, Service};
 use crate::proto::frame::{InFrame, MSG_NODE_CALL};
 use crate::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
-use crate::proto::peer::{NodeOp, NodeReply};
+use crate::proto::peer::{NodeHeartbeat, NodeOp, NodeReply};
 use crate::proto::{decode_body, encode_body};
 
 /// meta-read 线程数与它们的输入队列长度（1.2）。
@@ -55,6 +64,18 @@ struct ReadJob {
 enum ReadOp {
     Meta(MetaOp),
     Map { since: u64, full: bool }, // NodeOp::GetClusterMap；full = 带 keys、datakeys（只给 server 角色）
+    Heartbeat(NodeHeartbeat),       // NodeOp::Heartbeat（M5）
+    StatFs,                         // MetaOp::StatFs（M5）
+    Uninline(u64),                  // MetaOp::Uninline（M5，ADR-0034）
+}
+
+/// meta-read 线程与服务共用的状态。
+struct Shared {
+    eng: Arc<dyn MetaEngine>,
+    live: Arc<Live>,
+    usage: TargetUsage,
+    data: OnceLock<Arc<DataClient>>, // Uninline 用的数据面客户端（服务端装配时交进来）
+    uninlining: InFlight,            // 正在做的 Uninline（见文件头）
 }
 
 /// 修改型请求成功之后，要不要更新 leader 内存里的会话状态（[`Live`]）。
@@ -70,7 +91,7 @@ pub struct MetaService {
     reads: Sender<ReadJob>,
     debug_ops: bool,
     stats: Arc<OpStats>,
-    live: Arc<Live>,
+    shared: Arc<Shared>,
 }
 
 impl MetaService {
@@ -79,24 +100,37 @@ impl MetaService {
         let (tx, rx) = bounded::<ReadJob>(READ_QUEUE);
         let stats = Arc::new(OpStats::default());
         let live = Arc::new(Live::default());
+        let uninlining = InFlight::new(READ_THREADS / 2);
+        let shared = Arc::new(Shared {
+            eng: eng.clone(),
+            live,
+            usage: TargetUsage::default(),
+            data: OnceLock::new(),
+            uninlining,
+        });
         for i in 0..READ_THREADS {
-            let (rx, eng, stats, live) = (rx.clone(), eng.clone(), stats.clone(), live.clone());
+            let (rx, stats, shared) = (rx.clone(), stats.clone(), shared.clone());
             std::thread::Builder::new()
                 .name(format!("meta-read-{i}"))
                 .spawn(move || {
                     while let Ok(j) = rx.recv() {
                         let name = j.op.name();
-                        stats.reply_raw(j.r, name, read_job(&*eng, &live, &j.ctx, j.op));
+                        stats.reply_raw(j.r, name, read_job(&shared, &j.ctx, j.op));
                     }
                 })
                 .map_err(|e| format!("起 meta-read 线程失败：{e}"))?;
         }
-        Ok(Arc::new(MetaService { eng, reads: tx, debug_ops, stats, live }))
+        Ok(Arc::new(MetaService { eng, reads: tx, debug_ops, stats, shared }))
     }
 
-    /// leader 内存里的会话状态（测试用）。
-    pub fn live(&self) -> &Live {
-        &self.live
+    /// leader 内存里的会话状态（后台调度器的孤儿 GC 长期持有它；测试也看它）。
+    pub fn live(&self) -> Arc<Live> {
+        self.shared.live.clone()
+    }
+
+    /// 交进 `Uninline` 用的数据面客户端（服务端装配时，只第一次有效；与后台任务共用一个）。
+    pub fn set_data(&self, data: Arc<DataClient>) {
+        let _ = self.shared.data.set(data);
     }
 
     /// 调试操作只给 admin key，且服务端打开了 `debug_ops`（3.3.4）。
@@ -113,7 +147,7 @@ impl MetaService {
     }
 
     fn txn(&self, ctx: ReqCtx, name: &'static str, op: TxnOp, after: AfterOk, r: Responder) {
-        let (stats, live, eng) = (self.stats.clone(), self.live.clone(), self.eng.clone());
+        let (stats, live, eng) = (self.stats.clone(), self.shared.live.clone(), self.eng.clone());
         let (session, seq) = (ctx.session, ctx.seq);
         let done = Box::new(move |res: Result<MetaReply, ErrCode>| {
             if res.is_ok() {
@@ -147,7 +181,11 @@ impl MetaService {
                 let ctx = base_ctx(&ReqHead::default(), id, f.hdr.trace_id, NOBODY, NOBODY, vec![]);
                 self.read(ctx, ReadOp::Map { since: since_epoch, full }, r);
             }
-            other => self.stats.reply(r, other.name(), Err(ErrCode::FEATURE_UNSUPPORTED)), // 心跳 M5、Join M8……
+            NodeOp::Heartbeat(hb) => {
+                let ctx = base_ctx(&ReqHead::default(), r.identity(), f.hdr.trace_id, 0, 0, vec![]);
+                self.read(ctx, ReadOp::Heartbeat(hb), r); // 角色表已保证只有 Server 能发（3.3.3）
+            }
+            other => self.stats.reply(r, other.name(), Err(ErrCode::FEATURE_UNSUPPORTED)), // Join M8、SyncDone M9……
         }
     }
 }
@@ -157,6 +195,9 @@ impl ReadOp {
         match self {
             ReadOp::Meta(op) => op.name(),
             ReadOp::Map { .. } => "GetClusterMap",
+            ReadOp::Heartbeat(_) => "Heartbeat",
+            ReadOp::StatFs => "StatFs",
+            ReadOp::Uninline(_) => "Uninline",
         }
     }
 }
@@ -203,6 +244,11 @@ impl Service for MetaService {
                 Err(e) => self.stats.reply(r, name, Err(e)),
             },
             op @ MetaOp::SessionHeartbeat { .. } => self.read(ctx, ReadOp::Meta(op), r),
+            MetaOp::StatFs => self.read(ctx, ReadOp::StatFs, r),
+            MetaOp::Uninline { ino } => {
+                ctx.seq = 0; // 幂等，按只读请求的方式处理（ADR-0034 第 2 条）
+                self.read(ctx, ReadOp::Uninline(ino), r);
+            }
             op if ns::is_read(&op) => self.read(ctx, ReadOp::Meta(op), r),
             op => {
                 let Some(op) = ns::txn_op(op) else {
@@ -220,8 +266,18 @@ impl Service for MetaService {
 }
 
 /// meta-read 线程上执行一个只读请求：线性一致读（先过读闸门）。返回编码好的回复。
-fn read_job(eng: &dyn MetaEngine, live: &Live, ctx: &ReqCtx, op: ReadOp) -> Result<Vec<u8>, ErrCode> {
+fn read_job(sh: &Shared, ctx: &ReqCtx, op: ReadOp) -> Result<Vec<u8>, ErrCode> {
+    let (eng, live) = (&*sh.eng, &*sh.live);
     match op {
+        ReadOp::Heartbeat(hb) => targets::heartbeat(eng, ctx, &sh.usage, hb),
+        ReadOp::StatFs => targets::statfs(eng, ctx, &sh.usage).map(|r| encode_body(&r)),
+        ReadOp::Uninline(ino) => {
+            let data = sh.data.get().ok_or(ErrCode::NOT_READY)?;
+            sh.uninlining.begin(ino)?; // 这个 inode 已经在做、或已经有 4 个在做 → BUSY（见文件头）
+            let r = uninline::run(eng, data, ctx, ino);
+            sh.uninlining.end(ino);
+            r.map(|r| encode_body(&r))
+        }
         ReadOp::Meta(MetaOp::DebugGet { key }) => {
             let r = eng.read(ctx, &mut |v, _c| Ok(MetaReply::DebugValue { value: v.get(&keys::debug(&key))? }))?;
             Ok(encode_body(&r))

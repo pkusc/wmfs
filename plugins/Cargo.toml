@@ -11,11 +11,17 @@ path = "lib.rs"
 
 [features]
 # 每个插件一个 feature（design.md 2.1），默认全开；插件从 M1 起逐个加入。
-default = ["tcp", "shared-key", "rdma", "posix-mode", "label-match"]
+default = ["tcp", "shared-key", "rdma", "posix-mode", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc"]
 tcp = []
 shared-key = []
 posix-mode = []
 label-match = []
+# M5：单节点数据路径
+local-fs = []
+crc32c = ["dep:crc32c"]
+replica = []
+fifo = []
+gc = []
 # M2：RDMA 传输（sideway；rdma-mummy-sys 在运行时 dlopen libibverbs，没有 RDMA 的机器也能编译、运行；
 # 编译它要 cmake 与 libclang，design.md 2.3）。插件私有的 RdmaSetup 帧与 core 的帧一样：postcard body（serde）+ crc32c。
 rdma = ["dep:sideway", "dep:crc32c", "dep:serde"]

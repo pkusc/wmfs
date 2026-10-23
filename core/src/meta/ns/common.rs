@@ -3,7 +3,9 @@
 //! mtime/ctime/size/nlink/change_id、硬链接列表、孤儿标记。命名空间代码只用这些函数碰 KV（全部是点查，3.4.1.4 规则 1）。
 //!
 //! 实现注记（M4）：`AttrOut` 的 `consistency`、`ttl_ms` 取内置默认值（cto、attr_ttl 1 s）——按目录属性给出在 M7；
-//! `OpenOut.cap` 为空（cap 的签发在 M5），`quota_end = u64::MAX`（配额在 M10）。`OpenOut.inline`（文件的完整内容）只给
+//! `quota_end = u64::MAX`（配额在 M10）。实现注记（M5）：`OpenOut.cap` 在闭包里签（[`sign_cap`]，有效期 `cap_ttl`）：权限位
+//! 按这次打开的方式给（Open 按 O_ACCMODE；Create 新建的文件读写都给，打开已有的文件给写、能读才再给读；改了长度的 SetAttr
+//! 同后者）；`qos_id` 先填 0（qos 属性在 M13）。`OpenOut.inline`（文件的完整内容）只给
 //! 能读这个文件的人：Open 按这次是否读打开，Create 打开已有的文件、改了 size 的 SetAttr 按调用者有没有读权限（[`may_read`]）；
 //! 不带时为 None，要内容就 GetInline（M5）。递归计数 RSTAT 的增量在 M7（roadmap M7 的 `meta/rstat`），配额检查在 M10，
 //! 所以这里的操作还不碰它们。
@@ -11,7 +13,7 @@
 use crate::base::ErrCode;
 use crate::base::types::Principal;
 use crate::data::format::{ENC_AES256GCM, ENC_NONE};
-use crate::hooks::traits::{AuthzInput, AuthzOp, InodeView, PlacementInput};
+use crate::hooks::traits::{AuthzInput, AuthzOp, CODEC_REPLICA, InodeView, PlacementInput};
 use crate::meta::attrs::{CONSISTENCY_CTO, CONSISTENCY_STRONG, DEFAULT_ATTR_TTL_MS, EffectiveAttrs};
 use crate::meta::cluster::chains::{gen_chains, view_of};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
@@ -21,6 +23,7 @@ use crate::meta::schema::kv;
 use crate::meta::schema::records::{
     DentryV1, F_HAS_ACL, F_INLINE, F_ORPHAN, GcRecV1, InodeV1, KIND_DIR, KIND_FILE, LayoutV1,
 };
+use crate::proto::cap::{self, CapV1, RIGHT_READ, RIGHT_WRITE};
 use crate::proto::meta::{AttrOut, OpenOut};
 
 pub const S_ISUID: u32 = 0o4000;
@@ -190,9 +193,9 @@ pub fn attr_out(n: &Node) -> AttrOut {
     }
 }
 
-/// Open、Create、改了 size 的 SetAttr 共用的回复：属性、layout；`with_inline` 时再带上 inline 文件的完整内容
-/// （只给能读它的人，见文件头的实现注记）。
-pub fn open_out(v: &dyn KvRead, n: &Node, with_inline: bool) -> Result<OpenOut, ErrCode> {
+/// Open、Create、改了 size 的 SetAttr 共用的回复：属性、layout、带 `rights` 权限位的 cap（普通文件才有）；`with_inline`
+/// 时再带上 inline 文件的完整内容（只给能读它的人，见文件头的实现注记）。
+pub fn open_out(v: &dyn KvRead, c: &OpCtx, n: &Node, with_inline: bool, rights: u8) -> Result<OpenOut, ErrCode> {
     let inline = if with_inline && n.rec.flags & F_INLINE != 0 {
         Some(v.get(&keys::inline(n.ino))?.unwrap_or_default())
     } else {
@@ -201,11 +204,57 @@ pub fn open_out(v: &dyn KvRead, n: &Node, with_inline: bool) -> Result<OpenOut, 
     Ok(OpenOut {
         attr: attr_out(n),
         layout: n.rec.layout.clone(),
-        cap: vec![],
+        cap: sign_cap(c, n, rights, c.req.session),
         inline,
         quota_end: u64::MAX,
         atime_due: false,
     })
+}
+
+/// 写权限 + （`can_read` 时）读权限：打开已有的文件来写（Create 不带 O_EXCL、改长度的 SetAttr、Uninline）的 cap 权限位。
+pub fn write_rights(can_read: bool) -> u8 {
+    RIGHT_WRITE | if can_read { RIGHT_READ } else { 0 }
+}
+
+/// 单个文件的最大长度（实现注记（M5），规格没写）：chunk 号 `ChunkId.idx` 是 u32，所以 ≤ chunk_size × 2³²（4 MiB 的 chunk 是
+/// 16 PiB）；`st_size` 是有符号 64 位，所以 ≤ i64::MAX。改长度、CommitWrite、Fallocate 超过它 → `EFBIG`。
+pub fn max_file_size(l: &LayoutV1) -> u64 {
+    ((l.chunk_size as u64) << 32).min(i64::MAX as u64)
+}
+
+/// 给普通文件 `n` 签一张 cap（3.3.5）：layout 的链与变换参数、调用者的租户与作业、过期时间 = now + `cap_ttl`。
+/// 没有 layout（目录等）或 `rights` 为 0 → 空。
+pub fn sign_cap(c: &OpCtx, n: &Node, rights: u8, session: u64) -> Vec<u8> {
+    let Some(l) = n.rec.layout.as_ref().filter(|_| rights != 0) else { return vec![] };
+    let cap = CapV1 {
+        ino: n.ino,
+        epoch: l.epoch,
+        rights,
+        session,
+        tenant: c.req.who.tenant,
+        job_id: c.req.who.job_id,
+        chains: l.chains.clone(),
+        class_id: n.rec.class_id,
+        qos_id: 0, // qos 属性在 M13
+        chunk_size: l.chunk_size,
+        block_size: l.block_size,
+        checksum: l.checksum,
+        compress: l.compress,
+        compress_level: l.compress_level,
+        encrypt: l.encrypt,
+        encrypt_key: l.encrypt_key,
+        expires_ms: c.req.now_ms.saturating_add(c.settings.cap_ttl_ms),
+    };
+    cap::sign(c.cap_key, &cap)
+}
+
+/// 去掉 setuid，以及带组执行位时的 setgid（不带组执行位的 setgid 表示强制锁，Linux 保留它）。chown 之后、非属主改长度或
+/// 写入（CommitWrite）时调用（"非属主写入时清除 suid/sgid"）。
+pub fn kill_suid(n: &mut Node) {
+    n.rec.mode &= !S_ISUID;
+    if n.rec.mode & S_IXGRP != 0 {
+        n.rec.mode &= !S_ISGID;
+    }
 }
 
 /// 调用者能不能读 `n` 的内容（只用来决定回复里带不带 inline 内容，不拒绝请求）。
@@ -277,7 +326,7 @@ pub fn new_layout(
         block_size: BLOCK_SIZE.min(eff.chunk),
         chains: ranked[..k].iter().map(|c| c.id).collect(),
         replicas,
-        codec: 1, // replica
+        codec: CODEC_REPLICA,
         checksum: eff.checksum,
         compress: eff.compress,
         compress_level: eff.compress_level,

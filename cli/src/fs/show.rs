@@ -90,13 +90,13 @@ pub fn stat(path: &str, a: &AttrOut, layout: Option<&LayoutV1>, map: &ClusterMap
             .iter()
             .filter_map(|id| chain(*id).map(|c| format!("chain {id} 实际 {} 个成员", c.members.len())))
             .collect();
-        let inline = if a.flags & F_INLINE != 0 { "（现在内联在元数据里）" } else { "" };
+        let inline = if a.flags & F_INLINE != 0 { "yes（内容存在元数据里）" } else { "no" };
         text += &format!(
-            "\n  layout：{} 条链（{}），epoch {}，chunk {}，声明 {} 副本（{}）；inline ≤ {}{inline}",
+            "\n  layout：chunk={}、epoch={}、{} 条链（{}），声明 {} 副本（{}）\n  inline={inline}（阈值 {}）",
+            fmt_size(l.chunk_size as u64),
+            l.epoch,
             l.chains.len(),
             ids.join("、"),
-            l.epoch,
-            fmt_size(l.chunk_size as u64),
             l.replicas,
             actual.join("，"),
             fmt_size(l.inline_max as u64),
@@ -112,7 +112,7 @@ pub fn stat(path: &str, a: &AttrOut, layout: Option<&LayoutV1>, map: &ClusterMap
     });
     let j = json!({
         "path": path, "ino": a.ino, "kind": kind, "mode": a.mode, "nlink": a.nlink, "uid": a.uid, "gid": a.gid,
-        "size": a.size, "change_id": a.change_id, "flags": a.flags, "rdev": a.rdev,
+        "size": a.size, "change_id": a.change_id, "flags": a.flags, "rdev": a.rdev, "inline": a.flags & F_INLINE != 0,
         "mtime_ms": ts_ms(a.mtime), "ctime_ms": ts_ms(a.ctime), "btime_ms": ts_ms(a.btime),
         "layout": layout_json, "chains": chains_json,
     });

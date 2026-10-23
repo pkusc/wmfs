@@ -7,6 +7,11 @@
 //! `/metrics` 里 `wmfs_meta_batch_ops` 直方图在压测前后的 `_sum`/`_count` 增量（单飞批次在负载高时自然攒批，3.4.1.4）；
 //! 压测期间 leader 换过（term 变了，计数器从 0 重新开始）就不报批大小。可重试的失败按 3.3.8 退避：故障时一起失败的
 //! 那一批在途请求只退避一次，退避期间不发新请求。
+//!
+//! - [`chunk`]：`wmfs debug chunk-path / chunk-header / corrupt-chunk`（M5；只在编进 local-fs 插件时有）
+
+#[cfg(feature = "local-fs")]
+pub mod chunk;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;

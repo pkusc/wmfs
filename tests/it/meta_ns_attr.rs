@@ -10,7 +10,9 @@ use wmfs_core::meta::schema::keys::{self, GC_EPOCH, ROOT_INO};
 use wmfs_core::meta::schema::records::{
     ChainRecV1, F_HAS_ACL, F_INLINE, GcRecV1, StorageClassV1, decode_v1, encode_v1,
 };
-use wmfs_core::proto::meta::{MetaOp, MetaReply, SetAttrIn, TimeSet, XATTR_CREATE, XATTR_REPLACE};
+use wmfs_core::proto::meta::{
+    MetaOp, MetaReply, O_RDONLY, O_RDWR, O_WRONLY, SetAttrIn, TimeSet, XATTR_CREATE, XATTR_REPLACE,
+};
 use wmfs_testkit::harness::ns::{Ns, OWNER, ROOT, Who, user};
 
 fn set() -> SetAttrIn {
@@ -104,7 +106,8 @@ fn truncate_to_zero_rebuilds_the_layout_from_the_current_attributes() {
     let gc: GcRecV1 = decode_v1(&ns.kv.0[&keys::gc(GC_EPOCH, f, 1)]).unwrap();
     assert_eq!((gc.chains, gc.due_ms - gc.created_ms), (vec![1], 60_000), "旧 epoch 写 GC 记录，宽限 epoch_gc_grace");
     sa(&mut ns, &OWNER, f, SetAttrIn { size: Some(0), ..set() }).unwrap();
-    assert!(!ns.kv.0.contains_key(&keys::gc(GC_EPOCH, f, 2)), "旧 inode 是 inline 的：没有 chunk，不写 GC 记录");
+    let inline_gc = ns.kv.0.contains_key(&keys::gc(GC_EPOCH, f, 2));
+    assert!(inline_gc, "旧 inode 是 inline 的也写：ADR-0034 之后它的 epoch 下面也可能有 chunk（没做完的 Uninline）");
     assert_eq!(ns.inode(f).unwrap().layout.unwrap().epoch, 3);
 }
 
@@ -245,12 +248,12 @@ fn inline_content_goes_only_to_readers() {
         Ok(MetaReply::Opened(o)) => o.inline,
         other => panic!("应回 Opened：{other:?}"),
     };
-    assert_eq!(ns.read(&other, MetaOp::Open { ino: f, flags: 0 }), Err(ErrCode::EACCES), "没有读权限");
-    assert_eq!(inline(ns.read(&other, MetaOp::Open { ino: f, flags: 1 })), None, "只写打开：不带内容");
+    assert_eq!(ns.read(&other, MetaOp::Open { ino: f, flags: O_RDONLY }), Err(ErrCode::EACCES), "没有读权限");
+    assert_eq!(inline(ns.read(&other, MetaOp::Open { ino: f, flags: O_WRONLY })), None, "只写打开：不带内容");
     let again = MetaOp::Create { parent: ROOT_INO, name: b"f".to_vec(), mode: 0o644, umask: 0, excl: false };
     assert_eq!(inline(ns.op(&other, again.clone())), None, "Create 打开已有的文件：没有读权限就不带");
     assert_eq!(inline(sa(&mut ns, &other, f, SetAttrIn { size: Some(6), ..set() })), None, "截断的回复也不带");
-    assert_eq!(inline(ns.read(&OWNER, MetaOp::Open { ino: f, flags: 2 })), Some(b"secret".to_vec()), "读写打开");
+    assert_eq!(inline(ns.read(&OWNER, MetaOp::Open { ino: f, flags: O_RDWR })), Some(b"secret".to_vec()), "读写打开");
     assert_eq!(inline(ns.op(&OWNER, again)), Some(b"secret".to_vec()), "属主有读权限");
 }
 

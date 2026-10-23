@@ -9,6 +9,8 @@
 //! - [`changelog`]：changelog 写入（M4）
 //! - [`cluster`]：集群图与集群警告、链的生成、cluster-mgr 线程（M4 起）
 //! - [`attrs`]：目录属性解析（M4 只有内置默认值；继承在 M7）
+//! - [`uninline`]：服务端把 inline 小文件转成 chunk（M5，ADR-0034）
+//! - [`gc_meta`]：GC 记录的元数据一侧（gc 任务用，M5）
 //!
 //! 递归用量与配额（rstat、quota，M7、M10）、锁（M12）随里程碑加入。
 
@@ -16,8 +18,10 @@ pub mod attrs;
 pub mod changelog;
 pub mod cluster;
 pub mod engine;
+pub mod gc_meta;
 pub mod ns;
 pub mod raft;
 pub mod schema;
 pub mod service;
 pub mod sessions;
+pub mod uninline;

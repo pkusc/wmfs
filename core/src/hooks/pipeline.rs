@@ -6,6 +6,10 @@
 //! 传输插件自己计时（读到帧头之后开始，读完 body + bulk 时调用 [`HookCall::exit`]，不过 fail point，3.7.4）。
 //!
 //! 实现：M1 有 authn、plugin_list 与 transport 的包装；M4 有 authz 与 placement；其余钩子随各自的里程碑实现（函数体里写着里程碑号）。
+//! 实现注记（M5）：qos、codec、transform、chunk_store 的插件连同各自的调用包装（[`HookCall`]）在这里登记好；骨架里的
+//! `qos()`、`codec()`、`transform()` 照旧返回插件本身，调用方要经包装时用 `*_call()` 拿到 (插件, 包装)，再用
+//! [`HookCall::call`] 调一次插件方法（enter 过 fail point `plugin.<名字>.<钩子>` → 调用 → exit 计数计时）。`policy()` 先回一个
+//! 只给"默认"答案的 [`BuiltinPolicy`]（第 5 章的表达式在 M7；后台调度器也经它拿求值器，只有这一个来源）。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,12 +19,12 @@ use wmfs_api::metrics::{self, Counter, Histogram};
 
 use crate::base::ErrCode;
 use crate::hooks::manifest::{Hook, Manifest};
-use crate::hooks::policy::PolicyEvaluator;
+use crate::hooks::policy::{BuiltinPolicy, PolicyEvaluator};
 use crate::hooks::registry::PluginSet;
 use crate::hooks::traits::{
-    AuthnInput, AuthnPlugin, AuthnResult, AuthzInput, AuthzPlugin, ChainView, CodecPlugin, ConnIdentity, Decision,
-    KeyLookup, PlacementInput, PlacementPlugin, QosPlugin, QuotaDecision, QuotaInput, TransformKind, TransformPlugin,
-    Transport,
+    AuthnInput, AuthnPlugin, AuthnResult, AuthzInput, AuthzPlugin, ChainView, ChunkStore, CodecPlugin, ConnIdentity,
+    Decision, KeyLookup, PlacementInput, PlacementPlugin, QosPlugin, QuotaDecision, QuotaInput, TransformKind,
+    TransformPlugin, Transport,
 };
 use crate::meta::schema::records::PluginListV1;
 
@@ -68,6 +72,15 @@ impl HookCall {
             self.errs.inc();
         }
     }
+
+    /// 经这层包装调一次插件方法：[`enter`](HookCall::enter)（fail point 触发时不调用 `f`，直接返回注入的码）→ `f` →
+    /// [`exit`](HookCall::exit)。实现注记（M5）：新增（只增）。
+    pub fn call<T>(&self, f: impl FnOnce() -> Result<T, ErrCode>) -> Result<T, ErrCode> {
+        let t0 = self.enter()?;
+        let r = f();
+        self.exit(t0, r.is_ok());
+        r
+    }
 }
 
 /// 按 altitude 排好的插件；每次调用都经过 3.7.4 的包装。
@@ -76,6 +89,11 @@ pub struct Pipeline {
     authn: Vec<(Arc<dyn AuthnPlugin>, HookCall)>, // altitude 升序；每个插件配好自己的调用包装
     authz: Vec<(Arc<dyn AuthzPlugin>, HookCall)>,
     placement: Vec<(Arc<dyn PlacementPlugin>, HookCall)>,
+    qos: Option<(Arc<dyn QosPlugin>, HookCall)>,
+    codecs: Vec<(Arc<dyn CodecPlugin>, HookCall)>,
+    transforms: Vec<(Arc<dyn TransformPlugin>, HookCall)>,
+    chunk_store: Option<(Arc<dyn ChunkStore>, HookCall)>,
+    policy: BuiltinPolicy,
 }
 
 impl Pipeline {
@@ -85,7 +103,13 @@ impl Pipeline {
         let authz = set.authz_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Authz))).collect();
         let placement =
             set.placement_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Placement))).collect();
-        Pipeline { set, authn, authz, placement }
+        let qos = set.qos_plugins().first().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Qos)));
+        let codecs =
+            set.codec_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Codec))).collect();
+        let transforms =
+            set.transform_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Transform))).collect();
+        let chunk_store = set.chunk_store_plugin().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::ChunkStore)));
+        Pipeline { set, authn, authz, placement, qos, codecs, transforms, chunk_store, policy: BuiltinPolicy }
     }
 
     pub fn transports(&self) -> &[Arc<dyn Transport>] {
@@ -144,17 +168,34 @@ impl Pipeline {
         }
         Ok(candidates)
     }
+    /// 唯一活跃的 qos 插件。只在数据节点上调用：服务端装配时已检查恰好有一个（没有 = 不变量破坏）。
     pub fn qos(&self) -> &Arc<dyn QosPlugin> {
-        unimplemented!("M5：Pipeline::qos")
+        self.qos_call().unwrap_or_else(|| panic!("不变量破坏：服务端装配时已检查恰好有一个 qos 插件")).0
     }
-    pub fn codec(&self, _id: u8) -> Option<&Arc<dyn CodecPlugin>> {
-        unimplemented!("M5：Pipeline::codec")
+    /// qos 插件连同它的调用包装（没有 qos 插件 → None）。
+    pub fn qos_call(&self) -> Option<(&Arc<dyn QosPlugin>, &HookCall)> {
+        self.qos.as_ref().map(|(p, h)| (p, h))
     }
-    pub fn transform(&self, _kind: TransformKind, _alg: u8) -> Option<&Arc<dyn TransformPlugin>> {
-        unimplemented!("M5：Pipeline::transform")
+    pub fn codec(&self, id: u8) -> Option<&Arc<dyn CodecPlugin>> {
+        self.codec_call(id).map(|(p, _)| p)
+    }
+    /// 按编号找 codec 插件，连同它的调用包装。
+    pub fn codec_call(&self, id: u8) -> Option<(&Arc<dyn CodecPlugin>, &HookCall)> {
+        self.codecs.iter().find(|(p, _)| p.codec_id() == id).map(|(p, h)| (p, h))
+    }
+    pub fn transform(&self, kind: TransformKind, alg: u8) -> Option<&Arc<dyn TransformPlugin>> {
+        self.transform_call(kind, alg).map(|(p, _)| p)
+    }
+    /// 按类别与算法编号（chunk 头 / layout 里的值）找 transform 插件，连同它的调用包装。
+    pub fn transform_call(&self, kind: TransformKind, alg: u8) -> Option<(&Arc<dyn TransformPlugin>, &HookCall)> {
+        self.transforms.iter().find(|(p, _)| p.kind() == kind && p.alg_id() == alg).map(|(p, h)| (p, h))
+    }
+    /// 唯一的 chunk_store 插件连同它的调用包装（没有 → None；服务端装配时检查）。
+    pub fn chunk_store(&self) -> Option<(&Arc<dyn ChunkStore>, &HookCall)> {
+        self.chunk_store.as_ref().map(|(p, h)| (p, h))
     }
     pub fn policy(&self) -> &dyn PolicyEvaluator {
-        unimplemented!("M7：Pipeline::policy")
+        &self.policy
     }
     /// 3.7.2
     pub fn plugin_list(&self) -> PluginListV1 {

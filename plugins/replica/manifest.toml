@@ -1,0 +1,13 @@
+# replica codec 插件的 manifest（design.md 3.7.1、4.7）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "replica"
+version = "0.1.0"
+hooks = ["codec"]
+altitude = 610
+hot_path = true
+abi_version = 1
+attrs = ["replicas"]
+budget_ns = 2000
+fail_points = ["plugin.replica.codec"]
+
+[config_schema]
+# 没有部署参数：副本数是目录属性 replicas（链的长度由放置与链管理器决定）

@@ -19,7 +19,7 @@ use wmfs_core::hooks::registry::PluginSet;
 use wmfs_core::init::initial_kv;
 use wmfs_core::meta::engine::{EmbeddedEngine, EngineOpts};
 use wmfs_core::meta::raft::storage;
-use wmfs_testkit::harness::meta::{dkey, get_raw, plugins, put_raw, quiet_logs, sample_init, wait_ready};
+use wmfs_testkit::harness::meta::{CAP_KEY, dkey, get_raw, plugins, put_raw, quiet_logs, sample_init, wait_ready};
 
 const CHILD: &str = "WMFS_FP_CHILD";
 const CONFIRMED_BEFORE_FP: u64 = 100;
@@ -32,8 +32,8 @@ fn db_path(dir: &Path) -> PathBuf {
 fn open_engine(dir: &Path) -> Arc<EmbeddedEngine> {
     quiet_logs();
     let pipeline = Arc::new(Pipeline::new(PluginSet::new(&[])));
-    let eng = EmbeddedEngine::open(&db_path(dir), EngineOpts { node_id: 1, plugins: plugins(), pipeline })
-        .expect("打开元数据库");
+    let opts = EngineOpts { node_id: 1, plugins: plugins(), pipeline, cap_key: CAP_KEY };
+    let eng = EmbeddedEngine::open(&db_path(dir), opts).expect("打开元数据库");
     wait_ready(&eng);
     eng
 }
