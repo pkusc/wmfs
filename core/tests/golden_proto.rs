@@ -148,6 +148,7 @@ fn meta_ops() -> Vec<(&'static str, MetaOp)> {
         ("DebugPut", MetaOp::DebugPut { key: b"hello".to_vec(), value: b"world".to_vec() }),
         ("DebugGet", MetaOp::DebugGet { key: b"hello".to_vec() }),
         ("Uninline", MetaOp::Uninline { ino: 0x1_0000_0012 }), // M5 追加（ADR-0034）
+        ("TruncateHandle", MetaOp::TruncateHandle { ino: 0x1_0000_0013, size: 6, epoch_seen: 3 }), // M6 追加（ADR-0036）
     ]
 }
 
@@ -160,7 +161,7 @@ fn golden_meta() {
     for (name, op) in &ops {
         assert_eq!(op.name(), *name, "MetaOp::name() 应等于变体名");
     }
-    variants(&mut g, "MetaOp", ops, 34);
+    variants(&mut g, "MetaOp", ops, 35);
     assert_no_more_variants::<TimeSet>("TimeSet", 2); // TimeSet 的两个变体都出现在 SetAttr 的样本里
     let open = OpenOut {
         attr: attr_out(),

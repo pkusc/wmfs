@@ -4,7 +4,7 @@
 //! 只读系统信息（/proc、/sys、/etc、环境变量），不改任何系统配置，也不提示任何 sudo 操作。
 //! 有 ✗ 时退出码为 1，否则为 0。`--json` 输出给 scripts/accept.sh 解析。解析文本的纯函数在 [`parse`]。
 
-mod parse;
+pub(crate) mod parse;
 mod rdma;
 
 use std::ffi::OsStr;

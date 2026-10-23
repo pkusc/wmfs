@@ -162,6 +162,11 @@ impl MetaClient {
         self.session
     }
 
+    /// 一个操作连同重试的总期限（`--op-timeout`）。实现注记（M6）：新增（只增），写回缓冲等槽位的背压用同一个期限。
+    pub fn op_timeout(&self) -> Duration {
+        self.opts.op_timeout
+    }
+
     /// 只读请求（seq = 0）
     pub fn read(&self, who: &Caller, op: MetaOp) -> Result<MetaReply, ErrCode> {
         self.call(who, 0, &op)

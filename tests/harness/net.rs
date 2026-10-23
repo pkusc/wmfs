@@ -101,10 +101,13 @@ pub fn rdma() -> Option<TestServer> {
     Some(start(Arc::new(RdmaTransport::new(&cfg, net.write_timeout_ms).unwrap()), &net, rdma_pool()))
 }
 
-/// 包一层的传输（单飞建连的测试用）：服务端一侧数一数 accept 了几条连接；客户端一侧每次建连先等 `connect_delay`。
+/// 包一层的传输（单飞建连的测试用）：服务端一侧数一数 accept 了几条连接；客户端一侧数一数**自己**建了几次连接（每次建连先等
+/// `connect_delay`）。实现注记（M6）：单飞的判据用客户端一侧的计数——监听在 127.0.0.1 上的端口谁都能连（同一台机器上并行跑的
+/// 别的测试进程、端口扫描），服务端一侧的计数偶尔会多出不是这个客户端的连接（M5 验证时见过一次 2 ≠ 1）。
 pub struct Counting {
     inner: Arc<dyn Transport>,
-    accepted: Arc<AtomicUsize>,
+    accepted: Arc<AtomicUsize>, // 服务端一侧：accept 了几条连接（listen 的回调里加）
+    dials: Arc<AtomicUsize>,    // 客户端一侧：调了几次 connect
     connect_delay: Duration,
 }
 
@@ -133,6 +136,7 @@ impl Transport for Counting {
         )
     }
     fn connect(&self, addr: &str, pool: MemPool, timeout: Duration) -> Result<Box<dyn Conn>, ErrCode> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(self.connect_delay);
         self.inner.connect(addr, pool, timeout)
     }
@@ -145,15 +149,22 @@ pub fn counting(scheme: &str, name: &str) -> (TestServer, Arc<AtomicUsize>) {
         _ => Arc::new(MemTransport::listening(name)),
     };
     let accepted = Arc::new(AtomicUsize::new(0));
-    let t = Arc::new(Counting { inner, accepted: accepted.clone(), connect_delay: Duration::ZERO });
+    let t =
+        Arc::new(Counting { inner, accepted: accepted.clone(), dials: Arc::default(), connect_delay: Duration::ZERO });
     (start(t, &NetConfig::default(), pool()), accepted)
 }
 
 /// 同 [`client`]，但每次建连先等 `delay`：同时发起第一次调用的线程一定都在建连进行中到达（单飞建连的测试用）。
-pub fn slow_client(scheme: &str, key: KeyFile, role: Role, delay: Duration) -> Arc<RpcClient> {
-    let t: Arc<dyn Transport> =
-        Arc::new(Counting { inner: transport(scheme), accepted: Arc::default(), connect_delay: delay });
-    RpcClient::new_with_role(pool(), vec![t], key, role, net(scheme)).unwrap()
+/// 另交出这个客户端建连（调传输插件 `connect`）的次数。
+pub fn slow_client(scheme: &str, key: KeyFile, role: Role, delay: Duration) -> (Arc<RpcClient>, Arc<AtomicUsize>) {
+    let dials = Arc::new(AtomicUsize::new(0));
+    let t: Arc<dyn Transport> = Arc::new(Counting {
+        inner: transport(scheme),
+        accepted: Arc::default(),
+        dials: dials.clone(),
+        connect_delay: delay,
+    });
+    (RpcClient::new_with_role(pool(), vec![t], key, role, net(scheme)).unwrap(), dials)
 }
 
 fn start(t: Arc<dyn Transport>, net: &NetConfig, pool: MemPool) -> TestServer {

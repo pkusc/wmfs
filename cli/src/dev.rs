@@ -12,27 +12,33 @@
 //! 集群图，把集群警告打印出来（ADR-0016：例如"default 类声明 3 副本，只有 1 个故障域……"）。取不到集群图（节点没有成为
 //! 就绪的 leader，多半是旧里程碑建的开发集群、插件清单不一致）→ 打印原因与修法（`wmfs dev down --purge`）并以非 0 退出。
 //! `up --rdma` 改写 node.toml 的部分在 `dev/rdma.rs`。
+//! M6：`dev mount/umount/client-pid` 与 `down` 先清理挂载（`dev/mount.rs`）；`up --profile minimal`（design.md 9.7、3.4.3 的部署
+//! 模板）：初始化新节点时按 `wmfs init --profile minimal` 建（default 类 1 副本、不写 replicas 属性、node.toml 停用 quota 与
+//! mclock）；已有的开发集群是按别的 profile 建的 → 报错并提示 `wmfs dev down --purge`（profile 写在初始 KV 里，不能事后改写）。
+//! `env`/`status` 拆到 `dev/info.rs`；后台起进程、等就绪、认 pid、等退出的几步与 `dev mount` 共用（`dev/proc.rs`）。
 
+use std::ffi::OsStr;
 use std::net::Ipv4Addr;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde::Serialize;
 use wmfs_core::api::types::{Health, KeyFile};
 use wmfs_core::base::config::{NodeConfig, TargetConfig};
-use wmfs_core::base::{clock, sys};
+use wmfs_core::base::sys;
 use wmfs_core::buf::PoolConfig;
 use wmfs_core::client::meta_client::fetch_map;
-use wmfs_core::init::{InitOpts, NodeFile, init_node};
+use wmfs_core::init::{InitOpts, NodeFile, Profile, init_node};
 use wmfs_mgr::api::ApiClient;
 
 use crate::{fail, home, out};
 
+mod info;
+mod mount;
+mod proc;
 mod rdma;
 mod wait;
 
+use proc::{live_pid, spawn_logged, wait_exit, wait_ready};
 use rdma::set_rdma;
 
 #[derive(clap::Subcommand)]
@@ -45,8 +51,12 @@ pub enum DevCmd {
         /// 每次 up 都按这次的参数改写 node.toml：不带 --rdma 就改回只用 tcp；节点已在运行时要先 wmfs dev down 再 up 才生效
         #[arg(long, value_name = "IP")]
         rdma: Option<Ipv4Addr>,
+        /// 按某个 profile 的部署模板建新节点（design.md 9.7、3.4.3）：default 或 minimal（1 节点、TCP、default 类 1 副本、停用 quota 与
+        /// mclock）；nas-safe、hpc-rdma 在 M9 起。已有的开发集群是按别的 profile 建的 → 报错（先 wmfs dev down --purge）
+        #[arg(long, default_value = "default")]
+        profile: String,
     },
-    /// 停掉全部开发节点（SIGTERM，5 s 后 SIGKILL）；--purge 再删除开发目录
+    /// 先卸载全部开发挂载点，再停掉全部开发节点（SIGTERM，5 s 后 SIGKILL）；--purge 再删除开发目录
     Down {
         #[arg(long)]
         purge: bool,
@@ -64,6 +74,20 @@ pub enum DevCmd {
     Start { n: u32 },
     /// 打印第 n 个节点的日志
     Logs { n: u32 },
+    /// 后台挂载一个客户端（wmfs mount，用 node1 的 client key），等它挂上；会打印集群警告
+    Mount {
+        mountpoint: PathBuf,
+        /// client key（默认 <开发目录>/n1/keys/client.key）
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// 块缓存：memory[:SIZE] 或 none（传给 wmfs mount --cache）
+        #[arg(long)]
+        cache: Option<String>,
+    },
+    /// 卸载 wmfs dev mount 挂上的挂载点，等挂载进程写完数据退出
+    Umount { mountpoint: PathBuf },
+    /// 打印某个开发挂载点的挂载进程号
+    ClientPid { mountpoint: PathBuf },
     /// 等某个条件成立（满足立即返回 0；超时返回 1 并打印当前状态）。M3 只有 leader（有就绪的元数据 leader）
     Wait {
         /// 条件（及其参数），例如 leader
@@ -89,16 +113,19 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
     }
     let d = std::fs::canonicalize(&d).unwrap_or(d);
     let r = match cmd {
-        DevCmd::Up { nodes, rdma } => up(&d, nodes, rdma),
+        DevCmd::Up { nodes, rdma, profile } => Profile::parse(&profile).and_then(|p| up(&d, nodes, rdma, p)),
         DevCmd::Down { purge } => down(&d, purge),
-        DevCmd::Env => env(&d),
-        DevCmd::Status { json } => status(&d, json),
+        DevCmd::Env => info::env(&d),
+        DevCmd::Status { json } => info::status(&d, json),
         DevCmd::Kill { n } => kill(&d, n),
         DevCmd::Start { n } => start(&d, n).map(|line| vec![line]),
         DevCmd::Logs { n } => std::fs::read_to_string(log_path(&d, n))
             .map(|t| vec![t])
             .map_err(|e| format!("读 {} 失败：{e}", log_path(&d, n).display())),
         DevCmd::Wait { what, timeout } => wait::wait(&d, &what, timeout),
+        DevCmd::Mount { mountpoint, key_file, cache } => mount::mount(&d, &mountpoint, &key_file, &cache),
+        DevCmd::Umount { mountpoint } => mount::umount(&d, &mountpoint),
+        DevCmd::ClientPid { mountpoint } => mount::client_pid(&d, &mountpoint),
     };
     match r {
         Ok(lines) => out(lines.iter().map(|l| l.trim_end_matches('\n')).collect::<Vec<_>>().join("\n")),
@@ -137,11 +164,7 @@ fn mgmt_addr(d: &Path, n: u32) -> Result<String, String> {
 /// 正在运行的 server 进程号：pid 文件里的进程还活着，且命令行确实是这个节点的 `wmfs server`（防止 pid 被别的进程复用）。
 fn running_pid(d: &Path, n: u32) -> Option<i32> {
     let nd = node_dir(d, n);
-    let pid: i32 = std::fs::read_to_string(nd.join("run/server.pid")).ok()?.trim().parse().ok()?;
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-    let ours = args.contains(&&b"server"[..]) && args.contains(&nd.as_os_str().as_encoded_bytes());
-    (ours && sys::process_alive(pid)).then_some(pid)
+    live_pid(&nd.join("run/server.pid"), "server", &nd)
 }
 
 /// 第 n 个节点的 admin key（`<节点目录>/keys/admin.key`）。
@@ -162,42 +185,41 @@ fn health(d: &Path, n: u32) -> Result<Health, String> {
     Ok(h)
 }
 
-fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>) -> Result<Vec<String>, String> {
+fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>, profile: Profile) -> Result<Vec<String>, String> {
     if nodes != 1 {
         return Err("M1 的 wmfs dev up 只支持 --nodes 1（多节点要 wmfs join，M8 起）".into());
     }
     std::fs::create_dir_all(d).map_err(|e| format!("建目录 {} 失败：{e}", d.display()))?;
-    sys::atomic_write(
-        &d.join(MARKER),
-        "wmfs dev 的开发目录（wmfs dev down --purge 只删除带这个标记的目录）\n".as_bytes(),
-    )
-    .map_err(|e| e.to_string())?;
+    let marker = d.join(MARKER);
+    sys::atomic_write(&marker, "wmfs dev 的开发目录（wmfs dev down --purge 只删除带这个标记的目录）\n".as_bytes())
+        .map_err(|e| format!("写 {} 失败：{e}", marker.display()))?;
     let mut lines = Vec::new();
     for n in 1..=nodes {
         let nd = node_dir(d, n);
-        if !nd.join("NODE").exists() {
+        if nd.join("NODE").exists() {
+            check_profile(&nd, profile)?;
+        } else {
             let (rpc_port, mgmt_port) = ports(n);
-            let host_id = Some(format!("host-{n}"));
-            let plugins = crate::registry::init_plugin_list()?;
             let o = InitOpts {
-                data_dir: nd,
+                data_dir: nd.clone(),
                 addr: "127.0.0.1".into(),
                 rpc_port,
                 mgmt_port,
                 mem: PoolConfig::dev_server(),
                 failpoints_api: true,
                 debug_ops: true, // wmfs debug kv（M3 演示）
-                host_id,
-                plugins,
+                host_id: Some(format!("host-{n}")),
+                plugins: crate::registry::init_plugin_list(&profile.disabled_plugins())?,
                 targets: vec![TargetConfig {
-                    path: node_dir(d, n).join("targets/1").display().to_string(),
+                    path: nd.join("targets/1").display().to_string(),
                     labels: vec![],
                     capacity: "20G".into(),
                 }],
+                profile,
             };
             init_node(&o)?;
         }
-        if set_rdma(&node_dir(d, n), n, rdma)? && running_pid(d, n).is_some() {
+        if set_rdma(&nd, n, rdma)? && running_pid(d, n).is_some() {
             lines.push(format!(
                 "node{n} 已在运行：node.toml 里的 RDMA 设置改了，要先 wmfs dev down、再 wmfs dev up 才生效"
             ));
@@ -211,6 +233,22 @@ fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>) -> Result<Vec<String>, Strin
         lines.extend(ws.iter().map(|w| format!("警告：{w}")));
     }
     Ok(lines)
+}
+
+/// 已有的节点是按 `want` 这个 profile 建的吗（看 node.toml 的 `[plugins] disable`：profile 的初始 KV 写进了元数据库，不能事后
+/// 改写）？不是 → 报错并给出修法。
+fn check_profile(nd: &Path, want: Profile) -> Result<(), String> {
+    let p = nd.join("node.toml");
+    let cfg = NodeConfig::parse(&std::fs::read_to_string(&p).map_err(|e| format!("读 {} 失败：{e}", p.display()))?)?;
+    if cfg.plugins.disable == want.disabled_plugins() {
+        return Ok(());
+    }
+    let was = if cfg.plugins.disable == Profile::Minimal.disabled_plugins() { "minimal" } else { "default" };
+    Err(format!(
+        "{} 是按 --profile {was} 建的开发集群，这次要的是 --profile {}：先 wmfs dev down --purge，再 wmfs dev up",
+        nd.display(),
+        want.name()
+    ))
 }
 
 /// 集群警告（ADR-0016：`wmfs dev up` 的输出里也要看得到）：用这个节点的 admin key 取一次集群图（等 leader 最多 30 s）。
@@ -230,41 +268,12 @@ fn start(d: &Path, n: u32) -> Result<String, String> {
     if running_pid(d, n).is_some() {
         return Ok(format!("node{n} 已在运行（{}）", describe(&health(d, n).unwrap_or_default())));
     }
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(log_path(d, n)).map_err(|e| e.to_string())?;
-    let exe = std::env::current_exe().map_err(|e| format!("找不到 wmfs 可执行文件：{e}"))?;
-    let mut child = Command::new(exe)
-        .arg("server")
-        .arg("--data-dir")
-        .arg(&nd)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log)
-        .process_group(0) // 自己的进程组：终端里的 Ctrl-C 不会带走它
-        .spawn()
-        .map_err(|e| format!("启动 node{n} 失败：{e}"))?;
-    let deadline = clock::mono_ms() + READY_TIMEOUT_MS;
-    loop {
-        if let Ok(h) = health(d, n)
-            && running_pid(d, n) == Some(child.id() as i32)
-        {
-            return Ok(format!("node{n} started（{}）", describe(&h)));
-        }
-        // 用 try_wait 而不是 kill(pid, 0)：退出了但还没被回收的子进程（僵尸）在 kill(pid, 0) 看来仍然"活着"
-        let exited = child.try_wait().ok().flatten().is_some();
-        if exited || clock::mono_ms() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let why = if exited {
-                "启动后退出了".to_string()
-            } else {
-                format!("没能在 {} s 内就绪（已停止它）", READY_TIMEOUT_MS / 1000)
-            };
-            let log = log_path(d, n);
-            let last = std::fs::read_to_string(&log).ok().and_then(|t| t.lines().last().map(str::to_string));
-            return Err(format!("node{n} {why}，请看日志 {}（最后一行：{}）", log.display(), last.unwrap_or_default()));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let args = [OsStr::new("server"), OsStr::new("--data-dir"), nd.as_os_str()];
+    let mut child = spawn_logged(&args, &log_path(d, n))?;
+    let pid = child.id() as i32;
+    let ready = || health(d, n).is_ok() && running_pid(d, n) == Some(pid);
+    wait_ready(&mut child, READY_TIMEOUT_MS, &log_path(d, n), &format!("node{n}"), ready)?;
+    Ok(format!("node{n} started（{}）", describe(&health(d, n).unwrap_or_default())))
 }
 
 fn describe(h: &Health) -> String {
@@ -276,14 +285,7 @@ fn describe(h: &Health) -> String {
 fn signal_and_wait(d: &Path, n: u32, sig: i32, wait_ms: u64) -> bool {
     let Some(pid) = running_pid(d, n) else { return true };
     let _ = sys::send_signal(pid, sig);
-    let deadline = clock::mono_ms() + wait_ms;
-    while clock::mono_ms() < deadline {
-        if !sys::process_alive(pid) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    !sys::process_alive(pid)
+    wait_exit(pid, wait_ms)
 }
 
 fn kill(d: &Path, n: u32) -> Result<Vec<String>, String> {
@@ -301,7 +303,7 @@ fn down(d: &Path, purge: bool) -> Result<Vec<String>, String> {
     if !d.exists() {
         return Ok(vec![format!("没有开发集群（{} 不存在）", d.display())]);
     }
-    let mut lines = Vec::new();
+    let mut lines = mount::stop_all(d); // 先挂载、后节点：节点停了以后挂载点上的命令会卡到 --op-timeout（7.2 的清理顺序）
     for n in nodes(d) {
         let Some(pid) = running_pid(d, n) else { continue };
         let _ = sys::send_signal(pid, sys::SIGCONT); // 被冻住（SIGSTOP）的进程收到 SIGTERM 也不会退出：先让它继续运行
@@ -325,54 +327,6 @@ fn down(d: &Path, purge: bool) -> Result<Vec<String>, String> {
         lines.push("没有在运行的开发节点".into());
     }
     Ok(lines)
-}
-
-fn env(d: &Path) -> Result<Vec<String>, String> {
-    let ns = nodes(d);
-    let first = ns.first().ok_or_else(|| format!("{} 里还没有开发集群：先 wmfs dev up", d.display()))?;
-    let mgmt: Result<Vec<String>, String> = ns.iter().map(|n| mgmt_addr(d, *n)).collect();
-    let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
-    Ok(vec![
-        format!("export WMFS_CLUSTER={}", mgmt?.join(",")),
-        format!("export WMFS_KEY_FILE={}", q(&node_dir(d, *first).join("keys/admin.key"))),
-        format!("export WMFS_MGR_DIR={}", q(&d.join("mgr"))),
-        format!("export WMFS_DEV_DIR={}", q(d)),
-    ])
-}
-
-#[derive(Serialize)]
-struct NodeStatus {
-    node: u32,
-    running: bool,
-    pid: Option<i32>,
-    healthy: bool,
-    rpc: Vec<(String, String)>,
-    mgmt: String,
-    log: String,
-}
-
-fn status(d: &Path, json: bool) -> Result<Vec<String>, String> {
-    let mut v = Vec::new();
-    for n in nodes(d) {
-        let (pid, h) = (running_pid(d, n), health(d, n).ok());
-        let mgmt = mgmt_addr(d, n).unwrap_or_default();
-        let rpc = h.as_ref().map(|h| h.node.addrs.clone()).unwrap_or_default();
-        let log = log_path(d, n).display().to_string();
-        v.push(NodeStatus { node: n, running: pid.is_some(), pid, healthy: h.is_some(), rpc, mgmt, log });
-    }
-    if json {
-        let j = serde_json::json!({"dir": d.display().to_string(), "nodes": v});
-        return Ok(vec![j.to_string()]);
-    }
-    if v.is_empty() {
-        return Ok(vec![format!("{} 里没有开发节点（wmfs dev up 起一个）", d.display())]);
-    }
-    let state = |s: &NodeStatus| match (s.running, s.healthy) {
-        (true, true) => "运行中".to_string(),
-        (true, false) => "运行中（health 没有响应）".to_string(),
-        _ => "已停止".to_string(),
-    };
-    Ok(v.iter().map(|s| format!("node{}：{}，http {}，日志 {}", s.node, state(s), s.mgmt, s.log)).collect())
 }
 
 #[cfg(test)]

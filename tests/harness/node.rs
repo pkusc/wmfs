@@ -4,9 +4,10 @@
 //! NodeRecV1，客户端按集群图连数据节点；所以不能像别的测试那样直接监听 127.0.0.1:0，见 design.md 9.5 的实现注记（M5））。
 //! fail point 是进程级的：用到 fail point 的测试各自单独一个测试程序。
 
+use std::collections::BTreeSet;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wmfs_core::api::types::KeyFile;
@@ -15,9 +16,10 @@ use wmfs_core::base::types::{ChunkId, Ts};
 use wmfs_core::base::{ErrCode, log};
 use wmfs_core::buf::{Lane, MemPool, PoolConfig};
 use wmfs_core::client::data_client::{DataClient, chunk_id};
+use wmfs_core::client::files::FileClient;
 use wmfs_core::client::meta_client::{Caller, MetaClient, MetaClientOpts, SessionInfo};
 use wmfs_core::hooks::registry::PluginSet;
-use wmfs_core::init::{InitOpts, init_node};
+use wmfs_core::init::{InitOpts, Profile, init_node};
 use wmfs_core::meta::engine::EmbeddedEngine;
 use wmfs_core::meta::engine::txn::{TxnOp, txn_blocking};
 use wmfs_core::meta::schema::keys;
@@ -30,9 +32,16 @@ use wmfs_plugins::{crc32c, fifo, gc, label_match, local_fs, posix_mode, replica,
 
 use super::meta::admin_ctx;
 
-/// 一个当前空闲的本机端口（绑定 :0 再放掉：端口要在 init 时写进 node.toml 与 NodeRecV1；并行的用例之间撞上的概率很小）。
+/// 一个当前空闲的本机端口（绑定 :0 再放掉：端口要在 init 时写进 node.toml 与 NodeRecV1）。同一个测试进程里并行的用例各自起节点：
+/// 记下已经给出去的端口，不给第二次——内核可能把刚放掉的端口又分给下一次 bind(:0)，两个节点就撞在同一个端口上（EADDRINUSE）。
 pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    static GIVEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    loop {
+        let p = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        if GIVEN.lock().unwrap_or_else(|e| e.into_inner()).insert(p) {
+            return p;
+        }
+    }
 }
 
 /// 与 `cli/src/registry.rs` 默认装的同一组插件。
@@ -50,6 +59,21 @@ pub fn plugins(cfg: &NodeConfig) -> PluginSet {
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST);
     s.validate(&cfg.plugin).unwrap();
     s
+}
+
+/// 测试用的临时目录 `<tmp>/wmfs-<名字>-<pid>`：丢弃时（包括测试失败 panic 时）删掉，不在 /tmp 留下垃圾。
+pub struct TempDir(pub PathBuf);
+
+impl TempDir {
+    pub fn new(name: &str) -> TempDir {
+        TempDir(std::env::temp_dir().join(format!("wmfs-{name}-{}", std::process::id())))
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// 节点目录 `<dir>/n1`，target 在 `<dir>/n1/targets/1`。
@@ -80,6 +104,7 @@ pub fn init(dir: &Path) {
             labels: vec![],
             capacity: "0".into(),
         }],
+        profile: Profile::Default,
     };
     init_node(&o).unwrap();
 }
@@ -105,8 +130,19 @@ pub struct Client {
 
 /// 用 `<节点>/keys/<key>.key` 连上 `run`。
 pub fn client(dir: &Path, run: &Running, key: &str) -> Client {
+    connect(dir, run, key, PoolConfig { s_mb: 8, m_slots: 6, l_slots: 1, repl_lane: false })
+}
+
+/// 连到 `run` 的文件层（M6 的 `FileClient`，与 `wmfs mount` 里的一样，只是不经 FUSE；不带 cache_store），用 client key。
+/// 内存池比 [`client`] 的大：写回缓冲按池的槽位计（3.6.1）。
+pub fn file_client(dir: &Path, run: &Running) -> Arc<FileClient> {
+    let c = connect(dir, run, "client", PoolConfig { s_mb: 16, m_slots: 30, l_slots: 2, repl_lane: false });
+    FileClient::start(c.meta, c.data, None)
+}
+
+fn connect(dir: &Path, run: &Running, key: &str, pool: PoolConfig) -> Client {
     let kf = KeyFile::parse(&std::fs::read_to_string(node_dir(dir).join(format!("keys/{key}.key"))).unwrap()).unwrap();
-    let pool = MemPool::new(&PoolConfig { s_mb: 8, m_slots: 6, l_slots: 1, repl_lane: false }).unwrap();
+    let pool = MemPool::new(&pool).unwrap();
     let t = tcp::TcpTransport::new(&Default::default(), 5000).unwrap();
     let rpc = RpcClient::new(pool, vec![Arc::new(t)], kf, Default::default()).unwrap();
     let ep = Endpoint { node: 1, addrs: run.addrs.clone() };

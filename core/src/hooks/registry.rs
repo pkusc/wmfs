@@ -16,6 +16,7 @@
 //! 那一类的子区间（checksum 700–729、compress 730–759、encrypt 760–789），同一类里算法编号不重复；codec 编号不重复；
 //! qos 只允许一个活跃、chunk_store 最多一个（服务端装配时再查"恰好一个"）。后台任务（`BgTask` 只是 `Send`）放在锁里，
 //! 服务端装配时整批取走交给调度器（[`PluginSet::take_bg_tasks`]），它们的 manifest 另存一份给清单与校验用。
+//! 实现注记（M6）：加了客户端的 cache_store（`wmfs mount --cache` 选一个装进来；最多一个；不进集群插件清单）。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -25,8 +26,8 @@ use crate::base::lock;
 use crate::bg::task::BgTask;
 use crate::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
 use crate::hooks::traits::{
-    AuthnPlugin, AuthzPlugin, ChunkStore, CodecPlugin, PlacementPlugin, QosPlugin, TransformKind, TransformPlugin,
-    Transport,
+    AuthnPlugin, AuthzPlugin, CacheStore, ChunkStore, CodecPlugin, PlacementPlugin, QosPlugin, TransformKind,
+    TransformPlugin, Transport,
 };
 use crate::meta::schema::records::PluginListV1;
 
@@ -45,6 +46,7 @@ pub struct PluginSet {
     chunk_stores: Vec<Arc<dyn ChunkStore>>,
     bg_tasks: Mutex<Vec<Box<dyn BgTask>>>, // 服务端装配时整批取走（调度器独占它们）
     bg_manifests: Vec<&'static Manifest>,  // 取走之后清单与校验仍要用
+    cache_stores: Vec<Arc<dyn CacheStore>>, // 客户端（M6）：挂载按 --cache 装一个
 }
 
 impl PluginSet {
@@ -124,6 +126,18 @@ impl PluginSet {
         }
     }
 
+    /// 客户端的 cache_store（M6，`wmfs mount --cache`；最多一个，不进集群插件清单）。
+    pub fn cache_store(&mut self, c: Arc<dyn CacheStore>) {
+        if self.enabled(c.manifest()) {
+            self.cache_stores.push(c);
+        }
+    }
+
+    /// 装进来的那个 cache_store（没有，或被 node.toml 停用了 → None）。
+    pub fn cache_store_plugin(&self) -> Option<&Arc<dyn CacheStore>> {
+        self.cache_stores.first()
+    }
+
     /// 取走全部后台任务（服务端装配时交给调度器；只能取一次，之后是空的）。
     pub fn take_bg_tasks(&self) -> Vec<Box<dyn BgTask>> {
         std::mem::take(&mut *lock(&self.bg_tasks))
@@ -179,7 +193,8 @@ impl PluginSet {
         let tf = self.transforms.iter().map(|p| (Hook::Transform, p.manifest()));
         let cs = self.chunk_stores.iter().map(|p| (Hook::ChunkStore, p.manifest()));
         let bg = self.bg_manifests.iter().map(|m| (Hook::BgTask, *m));
-        t.chain(a).chain(z).chain(pl).chain(me).chain(q).chain(c).chain(tf).chain(cs).chain(bg).collect()
+        let cc = self.cache_stores.iter().map(|p| (Hook::CacheStore, p.manifest()));
+        t.chain(a).chain(z).chain(pl).chain(me).chain(q).chain(c).chain(tf).chain(cs).chain(bg).chain(cc).collect()
     }
 
     /// 启动时校验（3.7.2）：每个插件的 manifest（[`check_one`]）；同一钩子内不重名、altitude 不相同；不同的插件不同名；
@@ -247,6 +262,7 @@ impl PluginSet {
         };
         one(self.qos.len(), Hook::Qos)?;
         one(self.chunk_stores.len(), Hook::ChunkStore)?;
+        one(self.cache_stores.len(), Hook::CacheStore)?;
         for (i, t) in self.transforms.iter().enumerate() {
             let (m, kind) = (t.manifest(), t.kind());
             let (lo, hi) = transform_range(kind);

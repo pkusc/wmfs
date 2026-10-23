@@ -6,7 +6,12 @@
 //!   也写——ADR-0034 之后 inline 文件的 epoch 下面也可能有 chunk（Uninline 写完 chunk、提交之前崩溃，或 CAS 因截断失败）。
 //! - 新长度超过单个文件的最大长度（`common::max_file_size`）→ `EFBIG`。
 //! - **截断到 s > 0**：数据面的截断已由客户端先完成（3.4.2.9），这里只改 size；F_INLINE 文件把 INLINE 截到 `min(len, s)`
-//!   （`len(INLINE) ≤ size` 不变式）；`epoch_seen` 与当前 layout 的 epoch 不同 → `STALE_LAYOUT`（客户端截断的是旧 epoch）。
+//!   （`len(INLINE) ≤ size` 不变式）；已经不是 inline 的文件，`epoch_seen` 与当前 layout 的 epoch 不同 → `STALE_LAYOUT`（客户端
+//!   截断的是旧 epoch）。实现注记（M6，ADR-0035 第 9 条）：`epoch_seen = 0` 表示"我看到的是 inline、没有发 TruncateChunk"（epoch 从
+//!   1 起，0 不会是真的 epoch），对已经不是 inline 的文件**同样**回 `STALE_LAYOUT`（客户端重新 Open、按 chunk 截断）——否则按旧的
+//!   inline 视图截断一个刚被 Uninline 的文件，chunk 里 s 之后的旧数据没清零，之后扩长就会冒出来。
+//! - 经已打开的写句柄改长度（ADR-0036 的 `TruncateHandle`，[`truncate_handle`]）：同一段代码，只是授权用 `AuthzOp::Handle`
+//!   （属主不看权限位）；按路径的 truncate 仍是 SetAttr，照常按当前权限检查。
 //! - 改了 size 的 SetAttr 回 `Opened(OpenOut)`（新 attr、layout，3.1.4 C4；调用者能读这个文件时才带 inline 内容），
 //!   否则回 `Entry`。实现注记（M5）：OpenOut 带一张写 cap（能读时也带读权限），截断到 0 之后的写直接用它进新 epoch。
 //! - chmod：只有属主或 root（authz 钩子查）；不在文件所属组里的非 root 设不了 setgid（静默去掉，与 Linux 相同）；有 ACL 时
@@ -75,16 +80,33 @@ pub fn setattr(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, set: &SetAttrIn) -> Resul
     if set.mode.is_some() && n.rec.flags & F_HAS_ACL != 0 {
         sync_acl_mode(v, &n)?;
     }
+    finish(v, c, n, set.size.is_some())
+}
+
+/// `TruncateHandle`（ADR-0036）：经已打开的写句柄改长度——与 SetAttr{size} 同一段代码，授权用 `AuthzOp::Handle { write }`。
+pub fn truncate_handle(
+    v: &mut dyn KvTxn,
+    c: &OpCtx,
+    ino: u64,
+    size: u64,
+    epoch_seen: u32,
+) -> Result<MetaReply, ErrCode> {
+    let mut n = get(v, ino)?;
+    authz(v, c, AuthzOp::Handle { read: false, write: true }, Some(&n), None, None)?;
+    truncate(v, c, &mut n, size, epoch_seen)?;
+    finish(v, c, n, true)
+}
+
+/// 改完属性：ctime、change_id、写回、changelog；改了长度回 `Opened`（调用者能读时才带 inline 内容），否则回 `Entry`。
+fn finish(v: &mut dyn KvTxn, c: &OpCtx, mut n: Node, sized: bool) -> Result<MetaReply, ErrCode> {
     bump_ctime(&mut n, c);
     save(v, &n);
-    changelog::append(v, c, Change { op: "SetAttr", ino, size: n.rec.size, ..Default::default() })?;
-    match set.size {
-        Some(_) => {
-            let r = may_read(v, c, &n);
-            Ok(MetaReply::Opened(open_out(v, c, &n, r, write_rights(r))?))
-        }
-        None => Ok(MetaReply::Entry { attr: attr_out(&n) }),
+    changelog::append(v, c, Change { op: "SetAttr", ino: n.ino, size: n.rec.size, ..Default::default() })?;
+    if !sized {
+        return Ok(MetaReply::Entry { attr: attr_out(&n) });
     }
+    let r = may_read(v, c, &n);
+    Ok(MetaReply::Opened(open_out(v, c, &n, r, write_rights(r))?))
 }
 
 /// 改普通文件的长度（见文件头）。
@@ -113,8 +135,8 @@ fn truncate(v: &mut dyn KvTxn, c: &OpCtx, n: &mut Node, size: u64, epoch_seen: u
             d.truncate(size as usize);
             v.put(&keys::inline(n.ino), d);
         }
-    } else if epoch_seen != 0 && n.rec.layout.as_ref().map(|l| l.epoch) != Some(epoch_seen) {
-        return Err(ErrCode::STALE_LAYOUT);
+    } else if n.rec.layout.as_ref().map(|l| l.epoch) != Some(epoch_seen) {
+        return Err(ErrCode::STALE_LAYOUT); // 包括 epoch_seen = 0（客户端以为还是 inline，ADR-0035 第 9 条）
     }
     if c.req.who.uid != n.rec.uid && c.req.who.uid != 0 {
         kill_suid(n);

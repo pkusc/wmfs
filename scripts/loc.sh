@@ -51,9 +51,13 @@ LIMIT=36000
 # M5（design.md 2.2 的 M5 注记）：新增约 3,150 行（预算约 2,950）。重估两个：core 540 → 720（server.rs + init.rs 已约 580，
 # 余下 M7 管理面、M8 join 的本地侧约 150）、cli 2950 → 3700（已约 2,300，`wmfs fs` 实际约 560 行而原估 180；余下 fuse/ 约 1,150、
 # 挂载路径映射约 70、其余子命令约 180）。
+# M6（design.md 2.2 的 M6 注记）：连同审查修复新增约 2,620 行（预算约 2,955）。重估两个：core/client 1800 → 2200（已约 1,860：
+# inode、files、writeback、flusher、read、strong、session；余下 M10 的配额额度、M12 的 locks.rs 与 strong 的读和 O_APPEND、驱逐后的
+# 处理约 330）、cli 3700 → 3800（已约 3,330：fuse/ 约 830、dev 的 mount/proc 约 200；余下挂载路径映射约 70、M12 的 getlk/setlk 与
+# lock-wait 约 120、M7–M15 的其余子命令约 180）。
 MODULES="wmfs-api:900 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1180 core/hooks:1060
 core/meta/raft:1570 core/meta/engine:760 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
-core/data:3000 core/client:1800 core/bg:850 core/mgmt:790 core:720 plugins:5380 cli:3700 dashboard:880
+core/data:3000 core/client:2200 core/bg:850 core/mgmt:790 core:720 plugins:5380 cli:3800 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

@@ -9,7 +9,7 @@ mod common;
 use common::Golden;
 use redb::{Database, ReadableTable};
 use wmfs_core::api::hex::hex;
-use wmfs_core::init::{InitialKv, initial_kv};
+use wmfs_core::init::{InitialKv, Profile, initial_kv};
 use wmfs_core::meta::raft::storage::{self, RAFT_STATE};
 use wmfs_core::meta::schema::records::{PluginListV1, TargetRecV1};
 
@@ -36,6 +36,7 @@ fn input() -> InitialKv {
             last_up_ms: 1_792_454_400_123,
             read_only: false,
         }],
+        profile: Profile::Default,
     }
 }
 

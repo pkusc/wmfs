@@ -10,7 +10,8 @@
 //! （`meta::engine::KvKeys`）；[`InitKeys`] 是 M1 的临时 key 表，现在只给不带元数据库的组件测试用。
 //! **NODE 最后写**，它是 init 的提交点：NODE 存在 = init 已经完成（`wmfs dev` 靠它判断"已初始化"）；init 中途失败或
 //! 被杀时目录里没有 NODE，删掉重来即可。实现注记（M3）：`--profile`/`--owner` 随用到它们的里程碑加入（只写 default
-//! profile，根目录的属主是运行 init 的用户）。实现注记（M4）：`--target PATH[:label,label]` 写进 node.toml 的 `[[target]]`
+//! profile，根目录的属主是运行 init 的用户）。实现注记（M6）：`--profile default|minimal`（[`Profile`]，3.4.3 的表）：minimal 的
+//! default 类 replica = 1、不写 replicas 属性，node.toml 停用 quota 与 mclock；nas-safe、hpc-rdma 在 M9 起。实现注记（M4）：`--target PATH[:label,label]` 写进 node.toml 的 `[[target]]`
 //! 与初始 KV 的 TargetRecV1（id 1..=n，gen_chains 用它们生成链）；同一个路径给两次、或一个 target 在另一个里面 → 拒绝
 //! （两个 target 的超级块与 chunk 目录会互相踩到）。实现注记（M5）：init 给每个 target 建目录、写 TARGET 超级块（3.2.3：
 //! cluster_id、target_id = 1..=n、node_id 1，`atomic_write`，在 NODE 之前）；任何一个 target 目录里已经有超级块（属于别的集群）
@@ -74,6 +75,46 @@ impl NodeFile {
     }
 }
 
+/// init 的部署模板（3.4.3 第 3 步的表）。M6 有 default 与 minimal；nas-safe、hpc-rdma 在 M9 起。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    Default,
+    Minimal,
+}
+
+impl Profile {
+    pub fn parse(s: &str) -> Result<Profile, String> {
+        match s {
+            "default" => Ok(Profile::Default),
+            "minimal" => Ok(Profile::Minimal),
+            _ => Err(format!("--profile {s:?}：现在只有 default、minimal（其余的部署模板在 M9 起）")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Profile::Default => "default",
+            Profile::Minimal => "minimal",
+        }
+    }
+
+    /// node.toml 里 `[plugins] disable` 的插件：minimal 停用 quota 与 mclock（于是 quota 属性无人消费、qos 用 fifo，9.7）。
+    pub fn disabled_plugins(self) -> Vec<String> {
+        match self {
+            Profile::Default => vec![],
+            Profile::Minimal => vec!["quota".into(), "mclock".into()],
+        }
+    }
+
+    /// default 存储类的副本数：default 3（理念文档第 7 章）、minimal 1（单节点不出现降级警告）。
+    pub fn class_replica(self) -> u8 {
+        match self {
+            Profile::Default => 3,
+            Profile::Minimal => 1,
+        }
+    }
+}
+
 /// init 的参数（CLI 的 `wmfs init` 与 `wmfs dev up` 都用它）。
 pub struct InitOpts {
     pub data_dir: PathBuf,
@@ -86,6 +127,7 @@ pub struct InitOpts {
     pub host_id: Option<String>,    // wmfs dev 用它给每个节点模拟不同的"主机"（1.1）
     pub plugins: PluginListV1,      // 本节点按 node.toml 装出来的插件清单：写进 GLOBAL plugins（3.4.3、3.7.2）
     pub targets: Vec<TargetConfig>, // `--target`：写进 node.toml 的 [[target]] 与初始 KV 的 TargetRecV1（M4）
+    pub profile: Profile,           // 部署模板（M6）：初始 KV 与 node.toml 的 `[plugins] disable`
 }
 
 /// 建一个新的单节点数据目录。目录必须不存在或为空（防止覆盖已有集群，坑 P14）。
@@ -110,6 +152,7 @@ pub fn init_node(o: &InitOpts) -> Result<(), String> {
     cfg.plugin.insert("tcp".into(), tcp);
     cfg.debug.host_id = o.host_id.clone();
     cfg.targets = o.targets.clone();
+    cfg.plugins.disable = o.profile.disabled_plugins();
     let node_toml = toml::to_string(&node).map_err(|e| format!("NODE 编码失败：{e}"))?;
     let key = |id| KeyFile { key_id: id, secret: derive_secret(&master, id) }.to_line();
     let write = |name: &str, bytes: &[u8]| {
@@ -147,6 +190,7 @@ fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile) -> Result<(), String> {
         hostname: read("/proc/sys/kernel/hostname"),
         plugins: o.plugins.clone(),
         targets: o.targets.iter().map(|t| target_rec(t, node.node_id, node.created_ms)).collect::<Result<_, _>>()?,
+        profile: o.profile,
     };
     let db = redb::Database::create(&path).map_err(|e| format!("建元数据库 {} 失败：{e}", path.display()))?;
     let private = std::fs::Permissions::from_mode(0o600); // 与 NODE、密钥文件一样只给本用户读写（3.2.1 的实现注记）
@@ -199,7 +243,7 @@ pub fn initial_warnings(o: &InitOpts) -> Vec<String> {
     let targets = o.targets.iter().filter_map(|t| target_rec(t, 1, 0).ok());
     let m = ClusterMap {
         targets: (1u32..).zip(targets).collect(),
-        classes: vec![default_class()],
+        classes: vec![default_class(o.profile.class_replica())],
         ..ClusterMap::default()
     };
     crate::meta::cluster::map::warnings(&m)

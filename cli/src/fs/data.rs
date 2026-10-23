@@ -6,8 +6,10 @@
 //!   semantics.md 2.5）。
 //! - `get <路径> <本地文件|->` / `cat <路径>`：Open（只读）→ inline 文件直接用回复里的内容；否则逐个 chunk `ReadChunk`，chunk 的
 //!   `logical_len` 之后与 `CHUNK_NOT_FOUND`（先 GetAttr 确认 epoch 没变，C5）都按 0 补齐到文件长度。坏块 → `EIO`（单副本修不了）。
-//! - `truncate <路径> <长度>`：Open（写）→ 截到 s > 0 时先对 `[⌊s/chunk⌋, ⌈旧长度/chunk⌉)` 的每个 chunk 发 `TruncateChunk`（inline
-//!   文件没有 chunk，跳过），再 `SetAttr{size}`（先数据、后元数据，放松 ⑦）；截到 0 只发 `SetAttr`（服务端换 epoch）。
+//! - `truncate <路径> <长度>`：Open（写：照常检查写权限，也拿到线性一致的最新长度）→ 截到 s > 0 时先对 `[⌊s/chunk⌋, ⌈旧长度/chunk⌉)`
+//!   的每个 chunk 发 `TruncateChunk`（inline 文件没有 chunk，跳过；与 FUSE 的截断共用 `client::strong::truncate_chunks`），再
+//!   `SetAttr{size}`（先数据、后元数据，放松 ⑦）；截到 0 只发 `SetAttr`（服务端换 epoch）。实现注记（M6，ADR-0035 第 9 条）：跳过了
+//!   TruncateChunk（看到的是 inline）时 `epoch_seen = 0`；回 `STALE_LAYOUT` 就重来（最多 `client::STALE_RETRIES` 次）。
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -16,8 +18,10 @@ use serde_json::json;
 use wmfs_core::base::ErrCode;
 use wmfs_core::base::types::{ChunkId, Ts};
 use wmfs_core::buf::{Buf, Lane};
+use wmfs_core::client::STALE_RETRIES;
 use wmfs_core::client::data_client::{DataClient, chunk_id};
 use wmfs_core::client::meta_client::{Caller, MetaClient};
+use wmfs_core::client::strong::truncate_chunks;
 use wmfs_core::meta::schema::records::{F_INLINE, LayoutV1};
 use wmfs_core::proto::meta::{MetaOp, MetaReply, O_RDONLY, O_WRONLY, OpenOut, SetAttrIn};
 
@@ -196,20 +200,25 @@ pub fn get(x: &Ctx, ino: u64, src: &str, dst: &str) -> Result<Done, Failed> {
     Ok(Done { text, json: json!({"ok": true, "ino": ino, "size": size}) })
 }
 
-/// `truncate`：见文件头。
+/// `truncate`：见文件头。看到的是 inline 文件（跳过 TruncateChunk）时 `epoch_seen = 0`，否则是看到的 epoch；文件在这期间被别人
+/// 转成了 chunk（或换了 epoch）→ `STALE_LAYOUT`：重新 Open、按 chunk 截断再 SetAttr（ADR-0035 第 9 条）。
 pub fn truncate(x: &Ctx, ino: u64, path: &str, size: u64) -> Result<Done, Failed> {
-    let o = x.opened(path, x.meta.read(x.who, MetaOp::Open { ino, flags: O_WRONLY }))?;
-    let l = layout(path, &o)?;
-    if size > 0 && o.attr.flags & F_INLINE == 0 {
-        let cs = l.chunk_size as u64;
-        for idx in size / cs..o.attr.size.div_ceil(cs) {
-            let new_len = size.saturating_sub(idx * cs).min(cs) as u32;
-            x.data.truncate(&o.cap, chunk_of(path, &o, l, idx)?, new_len).map_err(|e| failed(path, e))?;
+    let mut last = failed(path, ErrCode::ESTALE);
+    for _ in 0..STALE_RETRIES {
+        let o = x.opened(path, x.meta.read(x.who, MetaOp::Open { ino, flags: O_WRONLY }))?;
+        let l = layout(path, &o)?;
+        let inline = o.attr.flags & F_INLINE != 0;
+        if size > 0 && !inline {
+            truncate_chunks(x.data, &o.cap, l, ino, o.attr.size, size).map_err(|e| failed(path, e))?;
+        }
+        match x.set_size(path, ino, size, if inline { 0 } else { l.epoch }) {
+            Ok(o) => {
+                let text = format!("已把 {path} 截断到 {size} 字节");
+                return Ok(Done { text, json: json!({"ok": true, "ino": ino, "size": o.attr.size}) });
+            }
+            Err(f) if f.code == ErrCode::STALE_LAYOUT => last = f,
+            Err(f) => return Err(f),
         }
     }
-    let o = x.set_size(path, ino, size, l.epoch)?;
-    Ok(Done {
-        text: format!("已把 {path} 截断到 {size} 字节"),
-        json: json!({"ok": true, "ino": ino, "size": o.attr.size}),
-    })
+    Err(last)
 }

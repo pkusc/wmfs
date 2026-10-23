@@ -18,7 +18,7 @@ use wmfs_core::base::types::{Principal, ReqCtx, Role, Ts};
 use wmfs_core::hooks::pipeline::Pipeline;
 use wmfs_core::hooks::registry::PluginSet;
 use wmfs_core::hooks::traits::ConnIdentity;
-use wmfs_core::init::{InitialKv, initial_kv};
+use wmfs_core::init::{InitialKv, Profile, initial_kv};
 use wmfs_core::meta::engine::txn::{MetaEngine, TxnOp, txn_blocking};
 use wmfs_core::meta::engine::{EmbeddedEngine, EngineOpts};
 use wmfs_core::meta::raft::driver::{Driver, DriverOpts, ProposeOutcome, RaftInput};
@@ -63,6 +63,7 @@ pub fn sample_init() -> InitialKv {
             last_up_ms: 1_792_454_400_123,
             read_only: false,
         }],
+        profile: Profile::Default,
     }
 }
 

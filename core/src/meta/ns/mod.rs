@@ -7,14 +7,15 @@
 //! - [`create`]：create、mkdir、mknod、symlink、link
 //! - [`remove`]：unlink、rmdir（孤儿标记）
 //! - [`rename`]：rename（含 RENAME_NOREPLACE、RENAME_EXCHANGE）
-//! - [`setattr`]：chmod、chown、utimensat、truncate（截断到 0 按当前属性重建 layout）
+//! - [`setattr`]：chmod、chown、utimensat、truncate（截断到 0 按当前属性重建 layout）、TruncateHandle（M6，经写句柄改长度）
 //! - [`xattr`]：扩展属性与 POSIX ACL 的存储（mode 与 F_HAS_ACL 同步）
 //! - [`acl`]：ACL 的二进制格式、新文件继承默认 ACL（umask 规则）
-//! - [`file_ops`]：CommitWrite、Fallocate、GetInline、RenewCap，以及服务端 uninline 的只读前半段（M5）
+//! - [`file_ops`]：CommitWrite、Fallocate、GetInline、RenewCap，以及服务端 uninline 的只读前半段（M5）；SetAtime（M6，relatime 批量）
 //!
-//! 实现注记（M4）：`SetAtime`（M6）、`GetLock`/`SetLock`/`AppendReserve`（M12）还没有实现，回 `FEATURE_UNSUPPORTED`；回收站
-//! （M12）、递归计数（M7）、配额（M10）、目录属性的继承（M7）随各自的里程碑加入。实现注记（M5）：`StatFs`（要心跳报上来的
-//! target 容量，`meta/cluster/targets.rs`）与 `Uninline`（要经数据面写 chunk，`meta/uninline.rs`）由元数据服务另外处理。
+//! 实现注记（M4）：`GetLock`/`SetLock`/`AppendReserve`（M12）还没有实现，回 `FEATURE_UNSUPPORTED`；回收站（M12）、递归计数（M7）、
+//! 配额（M10）、目录属性的继承（M7）随各自的里程碑加入。实现注记（M5）：`StatFs`（要心跳报上来的 target 容量，
+//! `meta/cluster/targets.rs`）与 `Uninline`（要经数据面写 chunk，`meta/uninline.rs`）由元数据服务另外处理。实现注记（M6）：
+//! `SetAtime` 与 ADR-0036 的 `TruncateHandle`（与 SetAttr{size} 同一段代码，授权用 `AuthzOp::Handle`）加入。
 
 pub mod acl;
 pub mod common;
@@ -72,6 +73,10 @@ pub fn txn_op(op: MetaOp) -> Option<TxnOp> {
             };
             Box::new(move |v, c| file_ops::commit_write(v, c, &w))
         }
+        MetaOp::TruncateHandle { ino, size, epoch_seen } => {
+            Box::new(move |v, c| setattr::truncate_handle(v, c, ino, size, epoch_seen))
+        }
+        MetaOp::SetAtime { items } => Box::new(move |v, c| file_ops::set_atime(v, c, &items)),
         MetaOp::Fallocate { ino, offset, len, mode } => {
             Box::new(move |v, c| file_ops::fallocate(v, c, ino, offset, len, mode))
         }

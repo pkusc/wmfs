@@ -11,7 +11,7 @@ use wmfs_core::base::config::NodeConfig;
 #[cfg(feature = "local-fs")]
 use wmfs_core::base::types::ChunkId;
 use wmfs_core::hooks::registry::PluginSet;
-use wmfs_core::hooks::traits::Transport;
+use wmfs_core::hooks::traits::{CacheStore, Transport};
 use wmfs_core::meta::schema::records::PluginListV1;
 
 /// 按 node.toml 装出本节点的插件集合并校验（altitude、唯一性、abi_version、预算、fail point 声明、配置键）。
@@ -54,14 +54,38 @@ pub fn chunk_path(root: &Path, id: &ChunkId) -> PathBuf {
     wmfs_plugins::local_fs::committed_path(root, id)
 }
 
+/// `wmfs mount --cache` 的取值（design.md 4.11、7.2）：`memory[:SIZE]`（默认 512 MiB）→ cache-memory；`none` → 不缓存；
+/// `local-nvme:DIR:SIZE` 在 M13。装进一个只有它的 PluginSet 校验 manifest（fail point 声明、预算），再从集合里交出去。
+pub fn cache_store(spec: &str) -> Result<Option<Arc<dyn CacheStore>>, String> {
+    let (kind, arg) = spec.split_once(':').unwrap_or((spec, ""));
+    match kind {
+        "none" if arg.is_empty() => Ok(None),
+        #[cfg(feature = "cache-memory")]
+        "memory" => {
+            use wmfs_plugins::cache_memory::{CacheMemory, DEFAULT_CAPACITY};
+            let size = if arg.is_empty() { DEFAULT_CAPACITY } else { wmfs_core::base::units::parse_size(arg)? };
+            let mut s = PluginSet::new(&[]);
+            s.cache_store(Arc::new(CacheMemory::new(size)));
+            s.validate(&Default::default())?;
+            Ok(s.cache_store_plugin().cloned())
+        }
+        #[cfg(not(feature = "cache-memory"))]
+        "memory" => Err("这个 wmfs 没有编进 cache-memory 插件：用 --cache none".into()),
+        "local-nvme" => Err("--cache local-nvme 在 M13 才有（现在可以用 memory[:SIZE] 或 none）".into()),
+        _ => Err(format!("--cache 应写成 memory[:SIZE] 或 none：{spec:?}")),
+    }
+}
+
 /// 一次性命令（`wmfs ping` 等）用的传输：同一组传输插件，只用来连别人、不监听。
 pub fn client_transports() -> Result<Vec<Arc<dyn Transport>>, String> {
     build_plugins(&NodeConfig::default()).map(|s| s.transports().to_vec())
 }
 
-/// init 写进 GLOBAL plugins 的集群插件清单（3.4.3 第 3 步、3.7.2）= 按 init 写出的 node.toml 装出来的插件清单。
-/// 用默认配置算就是对的：init 写的 node.toml 只改了监听地址等部署参数，没有 `[plugins] disable`；而且清单里不含传输插件
-/// （`plugin_list` 只列会影响策略的钩子）。`wmfs init` 与 `wmfs dev up` 都用它。
-pub fn init_plugin_list() -> Result<PluginListV1, String> {
-    build_plugins(&NodeConfig::default()).map(|s| s.plugin_list())
+/// init 写进 GLOBAL plugins 的集群插件清单（3.4.3 第 3 步、3.7.2）= 按 init 写出的 node.toml 装出来的插件清单：init 写的
+/// node.toml 只改了监听地址等部署参数与 profile 停用的插件（`disable`），清单里也不含传输插件（`plugin_list` 只列会影响策略的
+/// 钩子），所以用默认配置加上 `disable` 算就是对的。`wmfs init` 与 `wmfs dev up` 都用它。
+pub fn init_plugin_list(disable: &[String]) -> Result<PluginListV1, String> {
+    let mut cfg = NodeConfig::default();
+    cfg.plugins.disable = disable.to_vec();
+    build_plugins(&cfg).map(|s| s.plugin_list())
 }

@@ -21,7 +21,7 @@ use wmfs_core::proto::features::*;
 use wmfs_core::proto::frame::*;
 use wmfs_core::proto::meta::{
     DEDUP_WINDOW, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT,
-    XATTR_CREATE, XATTR_REPLACE,
+    SET_ATIME_MAX_ITEMS, XATTR_CREATE, XATTR_REPLACE,
 };
 
 #[test]
@@ -224,5 +224,7 @@ fn golden_constants() {
         g.add(n, v.to_le_bytes().to_vec());
     }
     g.add("CODEC_REPLICA", vec![wmfs_core::hooks::traits::CODEC_REPLICA]);
+    // M6 追加：一次 SetAtime 最多几项
+    g.add("SET_ATIME_MAX_ITEMS", (SET_ATIME_MAX_ITEMS as u32).to_le_bytes().to_vec());
     g.check();
 }

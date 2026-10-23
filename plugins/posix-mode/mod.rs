@@ -8,6 +8,8 @@
 //! - 换了父目录的目录（rename 的 target）：要能写它自己（更新它的 `..`）；
 //! - chmod、chown、把时间设成指定值：只有属主或 root（`EPERM`）；设成"现在"：属主，或有写权限；改长度：要有写权限。
 //!   chown 的取值规则（只有 root 能改 uid、属主只能把 gid 改成自己所在的组）由 core 检查——插件看不到新值。
+//! - 经已打开的句柄读写（`Handle`，ADR-0036：CommitWrite、Fallocate、Uninline、RenewCap、TruncateHandle）：root 放行；**属主放行、
+//!   不看权限位**（学 NFS：git、cp 先建 0444 文件再往里写）；其他人与 open 相同；带扩展 ACL 的 inode 照旧弃权。
 //!
 //! 指标 `wmfs_posix_mode_decisions_total{result}`；fail point `plugin.posix-mode.authz`（由 core 包在调用外层，触发 = 以注入的码拒绝）。
 
@@ -128,10 +130,7 @@ fn decide(i: &AuthzInput) -> Decision {
         AuthzOp::Lookup => need(w, i.parent, X),
         AuthzOp::GetAttr | AuthzOp::ReadLink | AuthzOp::ListXattr | AuthzOp::Lock => Decision::Allow,
         AuthzOp::ReadDir => need(w, i.target, R),
-        AuthzOp::Open { read, write } => {
-            let want = (if read { R } else { 0 }) | (if write { W } else { 0 });
-            need(w, i.target, want)
-        }
+        AuthzOp::Open { read, write } => need(w, i.target, rw(read, write)),
         AuthzOp::Create | AuthzOp::Mkdir | AuthzOp::Mknod | AuthzOp::Symlink | AuthzOp::Link => {
             need(w, i.parent, W | X)
         }
@@ -158,7 +157,17 @@ fn decide(i: &AuthzInput) -> Decision {
         AuthzOp::GetXattr => need(w, i.target, R),
         AuthzOp::SetXattr | AuthzOp::RemoveXattr => need(w, i.target, W),
         AuthzOp::Admin => Decision::Abstain, // 管理操作的权限由管理 API 按 key 的角色检查，不是权限位的事
+        AuthzOp::Handle { read, write } => match i.target {
+            // ADR-0036：属主经已打开的句柄读写不看权限位（学 NFS）；root、扩展 ACL 与其他人照旧交给 need
+            Some(t) if w.uid == t.uid && t.acl_access.is_none() => Decision::Allow,
+            t => need(w, t, rw(read, write)),
+        },
     }
+}
+
+/// 打开方式要的权限位：读 → r，写 → w。
+fn rw(read: bool, write: bool) -> u32 {
+    (if read { R } else { 0 }) | (if write { W } else { 0 })
 }
 
 #[cfg(test)]

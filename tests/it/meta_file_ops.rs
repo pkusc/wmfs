@@ -139,6 +139,7 @@ fn commit_write_needs_write_permission_kills_suid_and_logs_set_size() {
         (r.op == 14).then_some(r)
     });
     let r = last.expect("CommitWrite 写 changelog SetSize");
+    // CommitWrite.close 服务端还不用（3.3.4 的 M6 注记 ③：等主管决定），changelog 里只有 via
     assert_eq!((r.ino, r.size, r.extra), (f, 1, vec![("via".to_string(), "CommitWrite".to_string())]));
 }
 
@@ -248,4 +249,35 @@ fn truncating_an_inline_file_to_0_records_its_old_epoch_for_gc() {
     assert_eq!(epoch(&z), epoch(&o) + 1);
     let gc = keys::gc(GC_EPOCH, f, epoch(&o));
     assert!(ns.kv.0.contains_key(&gc), "inline 文件的旧 epoch 下面也可能有 chunk（没做完的 Uninline 留下的）：交给 gc");
+}
+
+/// M6 的 SetAtime（relatime 批量、尽力而为）：读打开时按 relatime 给出 atime_due；SetAtime 只把 atime 往后改（不超过 leader 的
+/// 现在）、不改 ctime 与 change_id（不让别的客户端的缓存失效）；读不了的、已经删掉的项跳过；一批超过 1024 项 → EINVAL。
+#[test]
+fn set_atime_is_best_effort_and_keeps_change_id() {
+    let mut ns = Ns::new();
+    let f = ns.create(&OWNER, ROOT_INO, "f").unwrap();
+    let o = open(&mut ns, &OWNER, f, O_RDONLY).unwrap();
+    assert!(o.atime_due, "atime 不晚于 mtime：relatime 该更新");
+    assert!(!open(&mut ns, &OWNER, f, O_WRONLY).unwrap().atime_due, "写打开不更新 atime");
+    let before = ns.attr(f);
+    let later = Ts { secs: ns.now + 100, nanos: 0 };
+    let set = |items| MetaOp::SetAtime { items };
+    assert_eq!(ns.op(&OWNER, set(vec![(f, later), (999_999, later)])), Ok(MetaReply::Ok), "已经删掉的项跳过");
+    let after = ns.attr(f);
+    assert!(after.atime > before.atime && after.atime < later, "往后改，但不超过 leader 的现在：{:?}", after.atime);
+    assert_eq!((after.change_id, after.ctime), (before.change_id, before.ctime), "atime 不是内容变化");
+    assert!(!open(&mut ns, &OWNER, f, O_RDONLY).unwrap().atime_due, "atime 晚于 mtime 与 ctime：不必再更新");
+    let old = Ts { secs: 1, nanos: 0 };
+    ns.op(&OWNER, set(vec![(f, old)])).unwrap();
+    assert_eq!(ns.attr(f).atime, after.atime, "只往后走");
+    let chmod = MetaOp::SetAttr {
+        ino: f,
+        set: SetAttrIn { mode: Some(0o600), uid: None, gid: None, size: None, atime: None, mtime: None, epoch_seen: 0 },
+    };
+    ns.op(&OWNER, chmod).unwrap();
+    let a = ns.attr(f).atime;
+    ns.op(&user(2000, 2000), set(vec![(f, Ts { secs: ns.now, nanos: 0 })])).unwrap();
+    assert_eq!(ns.attr(f).atime, a, "读不了这个文件的人：跳过");
+    assert_eq!(ns.op(&OWNER, set(vec![(f, old); 1025])), Err(ErrCode::EINVAL), "一批最多 1024 项");
 }

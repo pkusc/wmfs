@@ -6,7 +6,7 @@ use wmfs_core::api::types::KeyFile;
 use wmfs_core::base::config::NodeConfig;
 use wmfs_core::base::{ErrCode, rand, sys};
 use wmfs_core::buf::PoolConfig;
-use wmfs_core::init::{CLIENT_KEY, InitOpts, NodeFile, init_node, initial_warnings, parse_target};
+use wmfs_core::init::{CLIENT_KEY, InitOpts, NodeFile, Profile, init_node, initial_warnings, parse_target};
 
 use crate::{fail, home, out, registry};
 
@@ -25,6 +25,10 @@ pub struct InitArgs {
     /// 一个 target（一块盘或一个目录）：PATH[:标签,标签]，可以给多次；不给就没有地方放文件数据（新建文件报 ENOSPC）
     #[arg(long, value_name = "PATH[:label,label]")]
     target: Vec<String>,
+    /// 部署模板（design.md 3.4.3）：default（/home replicas=3、/scratch replicas=2）或 minimal（default 类 1 副本、不写 replicas
+    /// 属性、停用 quota 与 mclock）；nas-safe、hpc-rdma 在 M9 起
+    #[arg(long, default_value = "default")]
+    profile: String,
     /// 只初始化，不在前台运行 server
     #[arg(long)]
     pub no_start: bool,
@@ -36,6 +40,10 @@ pub fn init(a: InitArgs) -> i32 {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
+    let profile = match Profile::parse(&a.profile) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
     let o = InitOpts {
         data_dir: a.data_dir.clone(),
         addr: a.addr,
@@ -45,11 +53,12 @@ pub fn init(a: InitArgs) -> i32 {
         failpoints_api: false,
         debug_ops: false,
         host_id: None,
-        plugins: match registry::init_plugin_list() {
+        plugins: match registry::init_plugin_list(&profile.disabled_plugins()) {
             Ok(p) => p,
             Err(e) => return fail(e),
         },
         targets,
+        profile,
     };
     if let Err(e) = init_node(&o) {
         return fail(e);

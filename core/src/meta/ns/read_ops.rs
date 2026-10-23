@@ -6,9 +6,11 @@
 //! 实现注记（M4）：`Open` 先只回属性、layout 与 inline 内容（只在读打开时带，`common` 的实现注记；`wmfs fs stat` 用它看
 //! layout）；配额额度在 M10。实现注记（M5）：cap 按打开方式带读/写权限位（`common::sign_cap`）；签之前先核对会话
 //! （`sessions::may_sign_cap`：只读路径不经执行器的会话检查）。
+//! 实现注记（M6）：读打开普通文件时按 relatime 规则给出 `atime_due`（`file_ops::atime_due`），客户端据此排队 `SetAtime`。
 //! `ResolvePath` 不跟随中间的符号链接（中间的一段是符号链接 → `ENOTDIR`），最后一段是符号链接时返回它本身（像 lstat）。
 
-use super::common::{Node, attr_out, authz, check_name, child, dir, get, open_out, searchable_dir};
+use super::common::{Node, attr_out, authz, check_name, child, dir, get, is_file, open_out, searchable_dir};
+use super::file_ops::atime_due;
 use crate::base::ErrCode;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::engine::txn::{KvRead, KvScan, OpCtx};
@@ -113,5 +115,7 @@ pub fn open(v: &dyn KvRead, c: &OpCtx, ino: u64, flags: u32) -> Result<MetaReply
     authz(v, c, AuthzOp::Open { read, write }, Some(&n), None, None)?;
     sessions::may_sign_cap(v, c.req)?;
     let rights = if read { RIGHT_READ } else { 0 } | if write { RIGHT_WRITE } else { 0 };
-    Ok(MetaReply::Opened(open_out(v, c, &n, read, rights)?))
+    let mut o = open_out(v, c, &n, read, rights)?;
+    o.atime_due = read && is_file(&n) && atime_due(&n, c.req.now); // relatime：客户端排队一次 SetAtime（M6）
+    Ok(MetaReply::Opened(o))
 }

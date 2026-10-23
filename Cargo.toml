@@ -17,6 +17,7 @@ wmfs-core = { path = "core" }
 wmfs-plugins = { path = "plugins", default-features = false }   # 启用哪些插件由使用者的 feature 决定（cli/Cargo.toml）
 wmfs-mgr = { path = "dashboard" }
 plugin-mem-transport = { path = "examples/plugin-mem-transport" }
+wmfs-testkit = { path = "tests" }   # 只做 dev-dependency（cli 的 FUSE 端到端测试用它起节点）
 # 外部依赖（design.md 2.3；全部已在本机编译核对）
 raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
 protobuf = "2.28"

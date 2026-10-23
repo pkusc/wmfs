@@ -153,3 +153,13 @@ path = "it/failpoint_uninline_crash.rs"
 [[test]]
 name = "failpoint_uninline_race"
 path = "it/failpoint_uninline_race.rs"
+
+# M6：M5 的两处遗留（ADR-0035 第 9 条、ADR-0036 的元数据侧）。
+[[test]]
+name = "meta_handle_authz"
+path = "it/meta_handle_authz.rs"
+
+# M6 审查后补的客户端文件层回归用例（FileClient 直接连完整节点，不经 FUSE）。
+[[test]]
+name = "client_files"
+path = "it/client_files.rs"

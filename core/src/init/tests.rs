@@ -1,11 +1,11 @@
 //! init 的单元测试：写出的文件、拒绝非空目录、元数据库的 index = 1 初始状态（3.4.1.9、3.4.3）、`--target` 的解析与
-//! 重复/嵌套的 target、init 的集群警告。
+//! 重复/嵌套的 target、init 的集群警告、minimal profile（M6）。
 
 use super::*;
 use crate::meta::raft::storage::{KV, RedbStorage, read_applied};
 use crate::meta::schema::keys;
 use crate::meta::schema::raft_state::Applied;
-use crate::meta::schema::records::{InodeV1, NodeRecV1, TargetRecV1, decode_v1};
+use crate::meta::schema::records::{InodeV1, NodeRecV1, StorageClassV1, TargetRecV1, decode_v1};
 
 fn opts(d: &Path) -> InitOpts {
     InitOpts {
@@ -22,6 +22,7 @@ fn opts(d: &Path) -> InitOpts {
             capacity: "20G".into(),
             ..parse_target(&format!("{}/t1:nvme,fast", d.display())).unwrap()
         }],
+        profile: Profile::Default,
     }
 }
 
@@ -123,5 +124,26 @@ fn targets_on_the_command_line_and_the_initial_warnings() {
     );
     o.targets.clear();
     assert!(initial_warnings(&o)[0].contains("没有可用的 target"), "没有 target：新文件建不出来");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// 3.4.3 的 profile 表：minimal = default 类 replica 1、不写 replicas 属性（单节点不出现降级警告）、node.toml 停用 quota 与 mclock。
+#[test]
+fn minimal_profile_has_one_replica_and_no_replicas_attrs() {
+    assert_eq!(Profile::parse("minimal"), Ok(Profile::Minimal));
+    assert!(Profile::parse("nas-safe").unwrap_err().contains("M9"), "其余的部署模板在 M9 起");
+    let d = crate::base::test_dir("init-minimal");
+    let o = InitOpts { profile: Profile::Minimal, ..opts(&d) };
+    assert!(initial_warnings(&o).is_empty(), "单节点 1 副本：没有降级警告");
+    init_node(&o).unwrap();
+    let cfg = NodeConfig::parse(&std::fs::read_to_string(o.data_dir.join("node.toml")).unwrap()).unwrap();
+    assert_eq!(cfg.plugins.disable, ["quota", "mclock"]);
+    let db = redb::Database::open(o.data_dir.join("meta/meta.redb")).unwrap();
+    let rtx = db.begin_read().unwrap();
+    let kv = rtx.open_table(KV).unwrap();
+    let get = |k: Vec<u8>| kv.get(k.as_slice()).unwrap().map(|v| v.value().to_vec());
+    let class: StorageClassV1 = decode_v1(&get(keys::class(1)).unwrap()).unwrap();
+    assert_eq!((class.name.as_str(), class.replica), ("default", 1));
+    assert!(get(keys::dirattr(HOME_INO)).is_none() && get(keys::dirattr(SCRATCH_INO)).is_none(), "不写 replicas 属性");
     std::fs::remove_dir_all(&d).unwrap();
 }

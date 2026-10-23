@@ -9,6 +9,8 @@
 //! 实现注记（M5）：`MetaOp::Uninline { ino }` 按 ADR-0034 追加在末尾（金样 `tests/golden/meta.golden` 的 `MetaOp.Uninline`）：
 //! inline 小文件这次会长过 `inline_max` 时，客户端请服务端把旧内容搬进 chunk（只有写权限的人也能把小文件写大，
 //! `GetInline` 仍只给能读的人）。
+//! 实现注记（M6）：`MetaOp::TruncateHandle { ino, size, epoch_seen }` 按 ADR-0036 追加在末尾（金样 `MetaOp.TruncateHandle`）：
+//! 经已打开的写句柄改长度（FUSE 的 setattr 带写句柄）；与 `SetAttr { size }` 走同一段代码，只是授权用 `AuthzOp::Handle`。
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +33,9 @@ pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
 pub const O_RDWR: u32 = 2;
 pub const O_ACCMODE: u32 = 3;
+/// 一次 `SetAtime` 最多几项（客户端每 5 s 发一批，超过 → `EINVAL`）。实现注记（M6）：规格没写上限，取 1024（新增、只增，钉在
+/// tests/golden/constants.golden）。
+pub const SET_ATIME_MAX_ITEMS: usize = 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ReqHead {
@@ -96,6 +101,8 @@ pub enum MetaOp {
     DebugGet { key: Vec<u8> },
     // ---- ADR-0034（M5 追加，只增不改）----
     Uninline { ino: u64 },                                               // 服务端把 inline 内容搬进 chunk：要写权限；幂等；只读路径、seq 0；回 Opened
+    // ---- ADR-0036（M6 追加，只增不改）----
+    TruncateHandle { ino: u64, size: u64, epoch_seen: u32 },             // 经已打开的写句柄改长度（ftruncate）：同 SetAttr{size}，授权用 AuthzOp::Handle；回 Opened
 }
 
 impl MetaOp {
@@ -136,6 +143,7 @@ impl MetaOp {
             MetaOp::DebugPut { .. } => "DebugPut",
             MetaOp::DebugGet { .. } => "DebugGet",
             MetaOp::Uninline { .. } => "Uninline",
+            MetaOp::TruncateHandle { .. } => "TruncateHandle",
         }
     }
 }

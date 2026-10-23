@@ -105,6 +105,10 @@ pub enum AuthzOp {
     RemoveXattr,
     Lock,
     Admin,
+    // ---- ADR-0036（M6 追加，只增不改；C ABI 编号表见 docs/plugin-abi.md）----
+    // 经已经打开的句柄读 / 写（CommitWrite、Fallocate、Uninline、RenewCap、TruncateHandle；M12 的 AppendReserve）：
+    // 学 NFS——属主不看权限位（posix-mode 的规则表）。打开本身照常用 `Open { read, write }`。
+    Handle { read: bool, write: bool },
 }
 
 pub struct InodeView<'a> {

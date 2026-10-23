@@ -12,7 +12,8 @@
 //! 实现注记（M5）：`new` 的 `background` 参数不用（后台请求由 cap 的管理权限位标明，`proto/cap.rs` 的注记）；读的 `into` 只在第一次
 //! 尝试时当 `recv_into` 用，重试时从 RpcClient 的池里另取一个（所以返回的缓冲不一定是 `into`——3.12 的签名本来就返回缓冲）；副本先按链序
 //! 选（codec 的 `read_order` 在 M9 有多副本时接入）。新增（只增不改）：[`DataClient::with_refresh`]、[`DataClient::with_timeouts`]、
-//! [`DataClient::for_meta`]、[`DataClient::pool`]、[`chunk_id`]。
+//! [`DataClient::for_meta`]、[`DataClient::pool`]、[`chunk_id`]。实现注记（M6）：DataClient 也给服务端用（Uninline、后台任务），
+//! 所以它自己取接收缓冲时仍用服务端的 `buf::POOL_WAIT`（100 ms）；客户端文件层取写回、读、同步写的缓冲用 `client::CLIENT_POOL_WAIT`。
 
 use std::sync::Arc;
 use std::time::Duration;

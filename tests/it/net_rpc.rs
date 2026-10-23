@@ -286,15 +286,18 @@ fn version_feature_role_and_cluster_negotiation() {
 }
 
 /// ADR-0031 第 11 条（M3 的 core 修复）：16 个线程同时对同一对端做第一次 call，只有一个线程建连、其余等它——
-/// 服务端只看到 1 条连接（tcp 与 mem 各一次），16 个调用全部成功；建连失败时（握手被拒）16 个调用拿到同一个错误，
-/// 服务端也只看到 1 次连接尝试。客户端的每次建连先等 250 ms：16 个线程一定都在建连进行中到达（否则调度晚到的线程
+/// 客户端只建 1 次连接（tcp 与 mem 各一次），16 个调用全部成功；建连失败时（握手被拒）16 个调用拿到同一个错误，
+/// 也只建了 1 次。客户端的每次建连先等 250 ms：16 个线程一定都在建连进行中到达（否则调度晚到的线程
 /// 在失败的建连结束之后会合法地再建一次，结果取决于时机）。
+/// 实现注记（M6）：判据从"服务端 accept 了几条连接"改为"这个客户端调了几次传输插件的 connect"——tcp 的计数服务端监听在
+/// 127.0.0.1 的随机端口上，同一台机器上别的进程（并行跑的另一组测试、端口扫描）连进来也会被数到（M5 验证时偶发过一次 2 ≠ 1，
+/// 只在 tcp 上；mem 是进程内的名字，别人连不进来）。服务端的计数仍然打印出来，只要求至少 1。
 #[test]
 fn first_calls_from_16_threads_share_one_connection() {
     for scheme in ["tcp", "mem"] {
         for (k, want) in [(key(2), Ok(())), (KeyFile { key_id: 2, secret: [0; 32] }, Err(ErrCode::AUTH_FAILED))] {
             let (s, accepted) = counting(scheme, &format!("rpc-single-flight-{}", want.is_ok()));
-            let c = slow_client(scheme, k, Role::Client, Duration::from_millis(250));
+            let (c, dials) = slow_client(scheme, k, Role::Client, Duration::from_millis(250));
             let go = Arc::new(Barrier::new(16));
             let threads: Vec<_> = (0..16u8)
                 .map(|i| {
@@ -308,8 +311,10 @@ fn first_calls_from_16_threads_share_one_connection() {
             for t in threads {
                 assert_eq!(t.join().unwrap(), want, "{scheme}：16 个调用的结果都一样");
             }
-            let n = accepted.load(Ordering::SeqCst);
-            assert_eq!(n, 1, "{scheme}（{want:?}）：16 个线程同时第一次调用，服务端只看到 1 条连接");
+            let (n, seen) = (dials.load(Ordering::SeqCst), accepted.load(Ordering::SeqCst));
+            println!("{scheme}（{want:?}）：客户端建连 {n} 次，服务端 accept {seen} 条");
+            assert_eq!(n, 1, "{scheme}（{want:?}）：16 个线程同时第一次调用，客户端只建 1 次连接");
+            assert!(seen >= 1, "{scheme}：服务端至少看到这一条");
         }
     }
 }

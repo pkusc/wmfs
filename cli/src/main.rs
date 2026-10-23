@@ -4,13 +4,14 @@
 //! （基础版）、`debug gen-key`；M3 加了 `dev wait`（leader）与 `debug kv put/get/bench`，`init` 写元数据的初始状态；
 //! M4 加了 `fs`（元数据命令与 `--as-uid`）、`init --target`。M5 加了 `fs put/get/cat/truncate` 与
 //! `debug chunk-path/chunk-header/corrupt-chunk`（按 local-fs 的路径规则找 chunk 文件：没编进 local-fs 插件就没有这三个子命令）。
-//! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
+//! M6 加了 `mount`/`umount`（FUSE，`fuse/`）与 `dev mount/umount/client-pid`。其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod debug;
 mod dev;
 mod doctor;
 mod failpoint;
 mod fs;
+mod fuse;
 mod leader;
 mod node;
 mod ping;
@@ -67,6 +68,10 @@ enum Cmd {
     },
     /// 不经 FUSE 的调试客户端：直接发元数据与数据请求（ls、stat、mkdir、rmdir、rm、mv、ln、touch、put、get、cat、truncate）
     Fs(fs::FsArgs),
+    /// 把 wmfs 挂成一个目录（前台运行；SIGTERM / Ctrl-C 写出全部数据后卸载）
+    Mount(fuse::MountArgs),
+    /// 卸载一个 wmfs 挂载点（fusermount3 -u）
+    Umount { mountpoint: PathBuf },
     /// 调试工具
     Debug {
         #[command(subcommand)]
@@ -111,7 +116,8 @@ enum DebugCmd {
 fn main() {
     let cli = Cli::parse();
     // 前台运行 server 的命令：在创建任何线程之前屏蔽 SIGTERM/SIGINT，最后由 main 线程 sigwait（design.md 0.2 第 4 条）
-    let serving = matches!(&cli.cmd, Cmd::Server { .. }) || matches!(&cli.cmd, Cmd::Init(a) if !a.no_start);
+    let serving =
+        matches!(&cli.cmd, Cmd::Server { .. } | Cmd::Mount(_)) || matches!(&cli.cmd, Cmd::Init(a) if !a.no_start);
     if serving && let Err(e) = sys::block_signals(&[sys::SIGTERM, sys::SIGINT]) {
         std::process::exit(fail(format!("屏蔽信号失败：{e}")));
     }
@@ -123,6 +129,8 @@ fn main() {
         Cmd::Failpoint { cmd } => failpoint::run(cmd),
         Cmd::Dev { cmd, dir } => dev::run(cmd, dir),
         Cmd::Fs(a) => fs::run(a),
+        Cmd::Mount(a) => fuse::run(a),
+        Cmd::Umount { mountpoint } => fuse::umount(&mountpoint),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),
         #[cfg(feature = "local-fs")]

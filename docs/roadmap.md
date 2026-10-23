@@ -252,9 +252,9 @@ scripts/accept.sh M5
 
 ```bash
 wmfs dev up --nodes 1 && eval "$(wmfs dev env)"
-mkdir -p ~/wmfs-mnt ~/wmfs-mnt2 && wmfs dev mount ~/wmfs-mnt && wmfs dev mount ~/wmfs-mnt2   # 两个挂载点 = 两个"客户端"；预期：打印"实际只有 1 份"的警告
-cp -r /usr/include ~/wmfs-mnt/include && diff -r /usr/include ~/wmfs-mnt/include && echo SAME   # 预期：SAME
-dd if=/dev/urandom of=~/wmfs-mnt/big bs=1M count=1024 status=progress && md5sum ~/wmfs-mnt/big
+mkdir -p ~/wmfs-mnt ~/wmfs-mnt2 && wmfs dev mount ~/wmfs-mnt && wmfs dev mount ~/wmfs-mnt2   # 两个挂载点 = 两个"客户端"；预期：打印"……新文件实际为 1 副本"的警告
+cp -r /usr/include ~/wmfs-mnt/include && diff -r --no-dereference /usr/include ~/wmfs-mnt/include && echo SAME   # 预期：SAME
+dd if=/dev/urandom of=$HOME/wmfs-mnt/big bs=1M count=1024 status=progress && md5sum ~/wmfs-mnt/big
 echo v1 > ~/wmfs-mnt/cto.txt && cat ~/wmfs-mnt2/cto.txt          # 预期：v1（另一个客户端：写者 close 之后 open 一定看得到）
 echo v2 > ~/wmfs-mnt/cto.txt && cat ~/wmfs-mnt2/cto.txt          # 预期：v2（即使还在 1 秒属性缓存窗口内）
 (umask 027; touch ~/wmfs-mnt/um && stat -c %a ~/wmfs-mnt/um)     # 预期：640
@@ -266,6 +266,7 @@ wmfs dev down
 scripts/accept.sh M6
 ```
 
+- 实现注记（M6）：`diff -r` 加了 `--no-dereference`：`/usr/include` 里有指向树外的相对符号链接（例如 `clang/18/include → ../../../lib/llvm-18/…`），拷到任何地方（包括本地磁盘）之后都会悬空，不加它时 `diff -r` 在本地拷贝上也报"No such file or directory"；加了之后符号链接按链接本身比较。"其中 135 个文件大于 64 KiB"在本机成立（`find /usr/include -type f -size +64k | wc -l` = 135）。
 - **本阶段你需要理解的概念**：
   - **FUSE**：Linux 允许一个普通程序"扮演"文件系统：内核把 `open/read/write` 等请求转给 `wmfs mount` 进程处理。所以 wmfs 不用写内核模块。
   - **页缓存与 close-to-open（cto）**：内核会把读过的文件内容缓存在内存里。cto 的约定是：别人 `close` 之后，你下一次 `open` 时我们会检查文件是否变过（change_id），变了就丢掉旧缓存——所以"写完关闭、再打开读"一定读到新内容。
@@ -374,7 +375,7 @@ scripts/accept.sh M9
 ```bash
 wmfs dev up --nodes 3 && eval "$(wmfs dev env)" && mkdir -p ~/wmfs-mnt ~/wmfs-mnt2 && wmfs dev mount ~/wmfs-mnt && wmfs dev mount ~/wmfs-mnt2
 mkdir ~/wmfs-mnt/home/q && wmfs set ~/wmfs-mnt/home/q quota=100M,soft=80M,grace=1m,files=1000,quantum=1M
-dd if=/dev/zero of=~/wmfs-mnt/home/q/f bs=1M count=300   # 预期：写到约 100 MiB 时报 "Disk quota exceeded"
+dd if=/dev/zero of=$HOME/wmfs-mnt/home/q/f bs=1M count=300   # 预期：写到约 100 MiB 时报 "Disk quota exceeded"
 wmfs usage ~/wmfs-mnt/home/q                        # 预期：用量 ≤ 100 MiB；软限已超，宽限剩余约 1 分钟
 mkdir ~/wmfs-mnt/home/private && chmod 700 ~/wmfs-mnt/home/private && echo secret > ~/wmfs-mnt/home/private/s
 wmfs fs --as-uid 2000 cat /home/private/s           # 预期：Permission denied
@@ -493,9 +494,9 @@ wmfs class create gold --file /tmp/gold.toml
 wmfs class show gold                                # 预期：iops_max=300 ≈ 每秒 9 次 4 MiB 写 ≈ 36 MiB/s，按 3 个节点均分后每节点 100；isolation: shared（只承诺份额，不承诺尾延迟）
 mkdir -p ~/wmfs-mnt && wmfs dev mount ~/wmfs-mnt --cache none
 mkdir ~/wmfs-mnt/fast && wmfs set ~/wmfs-mnt/fast class=gold   # 放在根目录下：根上没有 replicas 属性，副本数就取 gold 类的 2
-dd if=/dev/zero of=~/wmfs-mnt/fast/z bs=4M count=50 oflag=direct    # 预期：速度被限在约 10 MB/s 量级（一个文件只经过一个链头节点，每节点 100 成本单位/秒）
+dd if=/dev/zero of=$HOME/wmfs-mnt/fast/z bs=4M count=50 oflag=direct    # 预期：速度被限在约 10 MB/s 量级（一个文件只经过一个链头节点，每节点 100 成本单位/秒）
 wmfs set ~/wmfs-mnt/fast qos=r=0,w=1,l=3000
-dd if=/dev/zero of=~/wmfs-mnt/fast/z2 bs=4M count=50 oflag=direct   # 预期：明显变快（上限放大 10 倍）
+dd if=/dev/zero of=$HOME/wmfs-mnt/fast/z2 bs=4M count=50 oflag=direct   # 预期：明显变快（上限放大 10 倍）
 curl --noproxy '*' -s 127.0.0.1:19180/metrics | grep wmfs_qos_served_total
 wmfs status ~/wmfs-mnt/fast                         # 预期：class=gold，replicas 声明 2、实际 2
 wmfs dev down
@@ -524,7 +525,7 @@ grep -hE '"op":"(Create|Unlink)"' ~/wmfs-dev/mgr/audit/audit-*.log | tail -2   #
 wmfs status ~/wmfs-mnt/home --json | python3 -m json.tool | head -40          # 预期：每个属性一项 {key, declared, source, effect, actual, mismatched}
 wmfs dev kill 3 && wmfs dev wait alert target_offline firing --timeout 120    # 预期：约 60 秒后告警触发
 wmfs dev start 3 && wmfs dev wait alert target_offline resolved && wmfs dev wait chains-serving
-dd if=/dev/zero of=~/wmfs-mnt/home/t bs=4M count=4 conv=fsync
+dd if=/dev/zero of=$HOME/wmfs-mnt/home/t bs=4M count=4 conv=fsync
 wmfs trace --recent 5                               # 预期：最近 5 个请求的 trace_id、操作、耗时
 wmfs trace <上一步列出的某个 WriteChunk 的 trace_id>   # 预期：链头 → 中间 → 尾 各阶段耗时（客户端自己的耗时在客户端日志里）
 gcc -shared -fPIC -I core/include -o /tmp/deny_uid.so examples/dylib-deny-uid/deny_uid.c

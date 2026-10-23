@@ -42,3 +42,7 @@ pub mod fifo;
 #[cfg(feature = "gc")]
 #[path = "gc/mod.rs"]
 pub mod gc;
+
+#[cfg(feature = "cache-memory")]
+#[path = "cache-memory/mod.rs"]
+pub mod cache_memory;

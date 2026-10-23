@@ -4,6 +4,7 @@
 //!   各自的 DENTRY 与 RSTAT（RSTAT 覆盖子树、不含自身：根的 dirs = 2）。
 //! - default profile 的目录属性：`/home replicas=3`、`/scratch replicas=2`（理念文档第 7 章默认冗余）。
 //! - 存储类 default（id 1，`label = "*"`，replica 3，priority normal，weight 1，无 QoS 限制）与 CLASS_NAME。
+//! - 实现注记（M6）：minimal profile（3.4.3 的表）：default 类 replica = 1，不写 replicas 属性（单节点不出现降级警告）；其余相同。
 //! - NodeRecV1(1)（voter、Active；地址来自 node.toml 的监听地址）；KEYMETA：key 1 = admin，key 2 = 默认 client。
 //! - TargetRecV1：`--target` 给的每个 target 一条，id 1..=n（实现注记（M4）：node 1、状态 Up、`last_up_ms` = init 的时刻，
 //!   `phys_devs` 空、`boot_id` 0——两者由 target 心跳在 M5 填上；容量取 `[[target]] capacity`，0 = 不限）。
@@ -16,7 +17,7 @@
 //! 时间戳全部取 init 的时刻；`NodeRecV1.features` 为空、`host_id` 未指定时取 machine_id。
 
 use crate::base::types::Ts;
-use crate::init::initial_keymeta;
+use crate::init::{Profile, initial_keymeta};
 use crate::meta::schema::keys::{self, FIRST_INO, ROOT_INO};
 use crate::meta::schema::records::{
     AttrMapV1, ClassIdV1, ClusterInfoV1, ClusterSettingsV1, DentryV1, FeatureSetV1, InodeV1, KIND_DIR, NodeRecV1,
@@ -39,6 +40,7 @@ pub struct InitialKv {
     pub hostname: String,
     pub plugins: PluginListV1,
     pub targets: Vec<TargetRecV1>, // id 依次为 1..=n
+    pub profile: Profile,
 }
 
 /// 按 key 排好序的 (key, value)。
@@ -69,7 +71,7 @@ pub fn initial_kv(i: &InitialKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         symlink: vec![],
     };
     let attr = |k: &str, v: &str| AttrMapV1 { entries: [(k.to_string(), v.to_string())].into_iter().collect() };
-    let default_class = default_class();
+    let default_class = default_class(i.profile.class_replica());
     let node = NodeRecV1 {
         addrs: i.addrs.clone(),
         mgmt_addr: i.mgmt_addr.clone(),
@@ -90,8 +92,6 @@ pub fn initial_kv(i: &InitialKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         (keys::rstat(ROOT_INO), encode_v1(&RStatV1 { dirs: 2, ..Default::default() })),
         (keys::rstat(HOME_INO), encode_v1(&RStatV1::default())),
         (keys::rstat(SCRATCH_INO), encode_v1(&RStatV1::default())),
-        (keys::dirattr(HOME_INO), encode_v1(&attr("replicas", "3"))),
-        (keys::dirattr(SCRATCH_INO), encode_v1(&attr("replicas", "2"))),
         (keys::class(1), encode_v1(&default_class)),
         (keys::class_name("default"), encode_v1(&ClassIdV1 { id: 1 })),
         (keys::node(1), encode_v1(&node)),
@@ -114,20 +114,25 @@ pub fn initial_kv(i: &InitialKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         (keys::global(keys::G_SETTINGS), encode_v1(&ClusterSettingsV1::default())),
         (keys::global(keys::G_PLUGINS), encode_v1(&i.plugins)),
     ];
+    if i.profile == Profile::Default {
+        kv.push((keys::dirattr(HOME_INO), encode_v1(&attr("replicas", "3"))));
+        kv.push((keys::dirattr(SCRATCH_INO), encode_v1(&attr("replicas", "2"))));
+    }
     kv.extend(initial_keymeta(i.created_ms).into_iter().map(|(id, m)| (keys::keymeta(id), encode_v1(&m))));
     kv.extend(i.targets.iter().zip(1u32..).map(|(t, id)| (keys::target(id), encode_v1(t))));
     kv.sort();
     kv
 }
 
-/// init 预置的存储类 default（3.4.3、6.1）：id 1，`label = "*"` 匹配任何 target，replica 3，priority normal，没有 QoS 限制。
-pub fn default_class() -> StorageClassV1 {
+/// init 预置的存储类 default（3.4.3、6.1）：id 1，`label = "*"` 匹配任何 target，`replica` 份（default profile 3、minimal 1），
+/// priority normal，没有 QoS 限制。
+pub fn default_class(replica: u8) -> StorageClassV1 {
     StorageClassV1 {
         id: 1,
         name: "default".into(),
         label: "*".into(),
         dedicated: false,
-        replica: 3,
+        replica,
         iops_min: 0,
         iops_max: 0,
         bw_min: 0,

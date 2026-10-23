@@ -1,6 +1,7 @@
-//! `wmfs dev` 的单元测试：端口规则、`up --rdma` 的声明式改写。
+//! `wmfs dev` 的单元测试：端口规则、`up --rdma` 的声明式改写、`up --profile` 不改已有集群的 profile、`dev mount` 的就绪条件。
 
 use super::*;
+use wmfs_core::base::clock;
 
 #[test]
 fn dev_ports_follow_the_19n00_scheme() {
@@ -30,4 +31,30 @@ fn up_rdma_is_declarative() {
     assert_eq!(got, cfg, "与初始化时的 node.toml 一样");
     assert!(!set_rdma(&nd, 2, None).unwrap());
     std::fs::remove_dir_all(&nd).unwrap();
+}
+
+#[test]
+fn up_refuses_to_switch_the_profile_of_an_existing_cluster() {
+    let nd = std::env::temp_dir().join(format!("wmfs-dev-profile-{}-{}", std::process::id(), clock::mono_ms()));
+    std::fs::create_dir_all(&nd).unwrap();
+    let mut cfg = NodeConfig { mem: PoolConfig::dev_server(), ..NodeConfig::default() };
+    std::fs::write(nd.join("node.toml"), cfg.to_toml()).unwrap();
+    assert!(check_profile(&nd, Profile::Default).is_ok(), "default 建的：同样的 profile 再 up 一次");
+    let e = check_profile(&nd, Profile::Minimal).unwrap_err();
+    assert!(e.contains("--profile default") && e.contains("wmfs dev down --purge"), "{e}");
+    cfg.plugins.disable = Profile::Minimal.disabled_plugins();
+    std::fs::write(nd.join("node.toml"), cfg.to_toml()).unwrap();
+    assert!(check_profile(&nd, Profile::Minimal).is_ok());
+    assert!(check_profile(&nd, Profile::Default).unwrap_err().contains("--profile minimal"));
+    std::fs::remove_dir_all(&nd).unwrap();
+}
+
+#[test]
+fn dev_mount_is_ready_only_after_the_whole_mounted_line() {
+    use super::mount::announced;
+    assert!(!announced(""), "挂载已经出现在 mountinfo 里、挂载进程还没写日志：不算就绪（M6 验证时撞到的竞态）");
+    assert!(!announced("警告：……新文件实际为 1 副本\n已挂载 /m"), "\"已挂载\"这一行还没写完");
+    assert!(!announced("2026-10-23T03:27:31.000Z INFO fuse: 已挂载\n"), "日志行中间的字样不算");
+    assert!(announced("已挂载 /m（会话 1f）\n"), "没有警告时第一行就是它");
+    assert!(announced("警告：……新文件实际为 1 副本\n已挂载 /m（会话 1f）\n"));
 }

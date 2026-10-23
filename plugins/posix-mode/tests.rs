@@ -141,3 +141,23 @@ fn xattr_ops_use_read_and_write_bits() {
     assert_eq!(check(&g, AuthzOp::ListXattr, Some(&f), None, None), ALLOW);
     assert_eq!(check(&g, AuthzOp::Admin, None, None, None), Decision::Abstain);
 }
+
+/// ADR-0036：经已打开的句柄读写——root 放行；属主放行、不看权限位；其他人与 Open 相同；有扩展 ACL 的 inode 照旧弃权。
+#[test]
+fn handle_ops_trust_the_owner_like_nfs() {
+    let h = |r, w| AuthzOp::Handle { read: r, write: w };
+    let ro = node(0o444, 1000, 100); // 属主自己建的只读文件（git、cp 的做法）
+    let owner = who(1000, 1, &[]);
+    assert_eq!(check(&owner, h(false, true), Some(&ro), None, None), ALLOW, "属主经写句柄提交：不看权限位");
+    assert_eq!(check(&owner, h(true, false), Some(&node(0o000, 1000, 1)), None, None), ALLOW, "属主续读 cap");
+    assert_eq!(check(&owner, AuthzOp::Open { read: false, write: true }, Some(&ro), None, None), DENY, "打开照常检查");
+    let g = who(2000, 100, &[]);
+    assert_eq!(check(&g, h(false, true), Some(&node(0o464, 1000, 100)), None, None), ALLOW, "属组有 w");
+    assert_eq!(check(&g, h(false, true), Some(&ro), None, None), DENY, "其他人与 Open 相同：去掉 w 之后提交 EACCES");
+    assert_eq!(check(&who(3000, 3, &[]), h(true, false), Some(&ro), None, None), ALLOW, "其他人有 r");
+    assert_eq!(check(&who(0, 0, &[]), h(true, true), Some(&node(0, 1000, 1)), None, None), ALLOW, "root 放行");
+    let acl = [2u8, 0, 0, 0];
+    let a = InodeView { acl_access: Some(&acl), ..ro };
+    assert_eq!(check(&owner, h(false, true), Some(&a), None, None), Decision::Abstain, "扩展 ACL 照旧交给 posix-acl");
+    assert_eq!(check(&owner, h(false, true), None, None, None), DENY, "core 没给 inode：失败即关闭");
+}

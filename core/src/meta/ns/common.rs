@@ -21,7 +21,8 @@ use crate::meta::ns::xattr::{ACL_ACCESS, get_xattr};
 use crate::meta::schema::keys::{self, G_NEXT_INO, GC_ORPHAN};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{
-    DentryV1, F_HAS_ACL, F_INLINE, F_ORPHAN, GcRecV1, InodeV1, KIND_DIR, KIND_FILE, LayoutV1,
+    DentryV1, F_HAS_ACL, F_INLINE, F_ORPHAN, GcRecV1, InodeV1, KIND_BLK, KIND_CHR, KIND_DIR, KIND_FIFO, KIND_FILE,
+    KIND_SOCK, LayoutV1,
 };
 use crate::proto::cap::{self, CapV1, RIGHT_READ, RIGHT_WRITE};
 use crate::proto::meta::{AttrOut, OpenOut};
@@ -32,6 +33,20 @@ pub const S_ISVTX: u32 = 0o1000;
 pub const S_IXGRP: u32 = 0o010;
 /// InodeV1.mode 只存权限位 + suid/sgid/sticky（不含类型位）。
 pub const MODE_MASK: u32 = 0o7777;
+
+/// mknod 的 mode 里的类型位 → 记录里的种类（没给类型位 = 普通文件，与 mknod(2) 相同）；不认识 → None。实现注记（M6）：给 FUSE
+/// 适配层用，cli 因此不必直接依赖 libc。
+pub fn kind_from_mode(mode: u32) -> Option<u8> {
+    match mode & libc::S_IFMT {
+        0 => Some(KIND_FILE), // 没给类型位 = 普通文件（mknod(2)）
+        libc::S_IFREG => Some(KIND_FILE),
+        libc::S_IFIFO => Some(KIND_FIFO),
+        libc::S_IFSOCK => Some(KIND_SOCK),
+        libc::S_IFCHR => Some(KIND_CHR),
+        libc::S_IFBLK => Some(KIND_BLK),
+        _ => None,
+    }
+}
 /// 名字 1–255 字节；每个文件 ≤ 1000 个硬链接；符号链接目标 ≤ 4096 字节（3.1.1）。
 pub const MAX_NAME: usize = 255;
 pub const MAX_LINKS: u32 = 1000;

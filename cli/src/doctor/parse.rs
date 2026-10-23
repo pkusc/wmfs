@@ -21,16 +21,36 @@ pub fn parse_kernel(rel: &str) -> Option<(u32, u32)> {
     Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
 }
 
-/// /proc/self/mountinfo → [(挂载点, 文件系统类型)]
+/// /proc/self/mountinfo → [(挂载点, 文件系统类型)]。挂载点里的空格、制表符、换行、反斜杠在 mountinfo 里写成 `\040`、`\011`、
+/// `\012`、`\134`，这里解回来。
 pub fn parse_mountinfo(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| {
             let (left, right) = l.split_once(" - ")?;
             let mp = left.split(' ').nth(4)?;
             let fstype = right.split(' ').next()?;
-            Some((mp.to_string(), fstype.to_string()))
+            Some((unescape_octal(mp), fstype.to_string()))
         })
         .collect()
+}
+
+/// 把 `\ooo`（三位八进制）解成那个字节，其余原样。
+fn unescape_octal(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = b[i] == b'\\' && i + 4 <= b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c));
+        if octal {
+            let v = b[i + 1..i + 4].iter().fold(0u32, |v, c| v * 8 + (c - b'0') as u32);
+            out.push(v as u8);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// /proc/self/status 的 "Uid:" 行的第一个数（真实 uid）。

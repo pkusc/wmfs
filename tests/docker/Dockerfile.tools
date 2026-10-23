@@ -1,0 +1,30 @@
+# wmfs 的外部测试工具镜像 wmfs-tools（design.md 9.6）：本机没有 fio、pjdfstest、fsx、IOR/mdtest，`/etc/fuse.conf` 也没开
+# user_allow_other，所以这些测试在容器里以 root 挂载客户端来跑（服务端跑在宿主机，--network host）。
+# 构建：scripts/build-tools-image.sh（需要联网：ubuntu 基础镜像、apt、几个源码仓库；代理地址只从环境变量经 --build-arg 传进来，
+# 不写进这个文件）。版本都钉死，重建得到同样的工具。本机经代理联网时断时续，所以 apt 与 git clone 都带重试。
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+# 本机的代理经常对 apt 源回 502，而 apt 源直连是通的：apt 先直连（Acquire::http::Proxy=false），不行再走代理，各自整条重试
+RUN ok=0; for i in $(seq 1 15); do \
+        { apt-get -o Acquire::http::Proxy=false update || apt-get update; } && ok=1 && break; sleep 5; done; [ "$ok" = 1 ] \
+    && ok=0 && for i in $(seq 1 15); do apt-get -o Acquire::http::Proxy=false install -y --no-install-recommends \
+        ca-certificates git build-essential autoconf automake libtool pkg-config gawk \
+        fio fuse3 python3 perl \
+        xfslibs-dev uuid-dev libacl1-dev libaio-dev libattr1-dev libgdbm-dev liburing-dev libcap-dev \
+        openmpi-bin libopenmpi-dev && ok=1 && break; sleep 5; done; [ "$ok" = 1 ] \
+    && rm -rf /var/lib/apt/lists/*
+# 联网时断时续：git clone 最多试 10 次
+RUN printf '#!/bin/sh\nfor i in 1 2 3 4 5 6 7 8 9 10; do rm -rf "$2"; git clone "$@" && exit 0; sleep 5; done; exit 1\n' \
+        >/usr/local/bin/clone-retry && chmod +x /usr/local/bin/clone-retry
+# pjdfstest（POSIX 语义的门槛测试；只有 master，钉到一个提交）
+RUN clone-retry https://github.com/pjd/pjdfstest /opt/pjdfstest \
+    && cd /opt/pjdfstest && git checkout -q 85a8aea9e685999ef0540392fd80535f873d7ff7 \
+    && autoreconf -ifs && ./configure && make pjdfstest
+# fsx 与 fsstress（xfstests 里的那份）
+RUN clone-retry https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /opt/xfstests --depth 1 --branch v2026.10.15 \
+    && cd /opt/xfstests && make -j"$(nproc)" \
+    && test -x /opt/xfstests/ltp/fsx && test -x /opt/xfstests/ltp/fsstress
+# IOR 与 mdtest（MPI；单机多 rank 冒烟用）
+RUN clone-retry https://github.com/hpc/ior /opt/ior --depth 1 --branch 4.0.0 \
+    && cd /opt/ior && ./bootstrap && ./configure && make -j"$(nproc)" && make install
+# wmfs 本身不在镜像里：运行时把宿主机的 target/release/wmfs 与 client key 只读挂进来（scripts/container-tests.sh）
