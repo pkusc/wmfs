@@ -2,7 +2,7 @@
 //! `meta::ns` 的闭包——每个操作一个"批次"：从当前 KV 建集群图快照、执行、失败就整体丢弃它的写入（与执行器的操作层一样）。
 //! 不经 raft，所以快、可重复；raft 之上的行为（掉电重启、rename 的原子可见性、去重、会话）由 meta_ns_engine.rs 与
 //! fail point 测试覆盖。管线与 `wmfs server` 默认装的一样：posix-mode（authz）+ label-match（placement）。
-//! 根目录的属主是 (1000, 1001)（`sample_init`），/home 与 /scratch 是 1777。请求都带会话 7（key 1 打开的 Active 会话，KV 里有它的
+//! 根目录的属主是 (1000, 1001)（`sample_init`），/home 与 /scratch 是 1777（init 写了 `/home replicas=3`、`/scratch replicas=2`）。请求都带会话 7（key 1 打开的 Active 会话，KV 里有它的
 //! 记录：只读路径签 cap 之前要核对会话，`sessions::may_sign_cap`）。
 
 use std::collections::BTreeMap;
@@ -20,7 +20,7 @@ use wmfs_core::meta::ns;
 use wmfs_core::meta::schema::keys;
 use wmfs_core::meta::schema::records::{InodeV1, SessionRecV1, decode_v1, encode_v1};
 use wmfs_core::meta::sessions::SESSION_ACTIVE;
-use wmfs_core::proto::meta::{AttrOut, MetaOp, MetaReply};
+use wmfs_core::proto::meta::{AttrOut, MetaOp, MetaReply, SetAttrIn};
 
 use super::meta::{CAP_KEY, ns_pipeline, quiet_logs, sample_init};
 
@@ -120,12 +120,17 @@ impl Ns {
         ReqCtx { who: w, session: self.session, seq: 1, pid: 1, trace_id: 3, now, now_ms, internal: false }
     }
 
-    /// 一个修改型操作：在 KV 的副本上执行，成功才换上（失败整体丢弃，与执行器的操作层一样）。
-    pub fn op(&mut self, who: &Who, op: MetaOp) -> Result<MetaReply, ErrCode> {
+    /// 换一条管线（例如测试"没有插件消费的属性不能设置"，3.8）。
+    pub fn with_pipeline(pipeline: Pipeline) -> Ns {
+        Ns { pipeline, ..Ns::new() }
+    }
+
+    /// 在 KV 的副本上执行一个修改型闭包，成功（`Ok`）才换上——与执行器的操作层一样（失败整体丢弃）。M7：属性的设置等不是
+    /// MetaOp 的操作（管理 API 用的 `attr_ops`）也经它测。
+    pub fn txn<T, E>(&mut self, who: &Who, f: impl FnOnce(&mut dyn KvTxn, &OpCtx) -> Result<T, E>) -> Result<T, E> {
         let req = self.ctx(who);
-        let f = ns::txn_op(op).expect("ns::txn_op：这个操作 M4 应该已经实现了");
         let mut v = self.kv.clone();
-        let m = map::build(&self.kv, Some(1))?;
+        let m = map::build(&self.kv, Some(1)).expect("建集群图");
         let c = OpCtx {
             req: &req,
             pipeline: &self.pipeline,
@@ -141,10 +146,16 @@ impl Ns {
         r
     }
 
-    /// 一个只读操作。
-    pub fn read(&mut self, who: &Who, op: MetaOp) -> Result<MetaReply, ErrCode> {
+    /// 一个修改型操作：在 KV 的副本上执行，成功才换上（失败整体丢弃，与执行器的操作层一样）。
+    pub fn op(&mut self, who: &Who, op: MetaOp) -> Result<MetaReply, ErrCode> {
+        let f = ns::txn_op(op).expect("ns::txn_op：这个操作 M4 应该已经实现了");
+        self.txn(who, f)
+    }
+
+    /// 在当前 KV 上执行一个只读闭包。
+    pub fn view<T>(&mut self, who: &Who, f: impl FnOnce(&dyn KvScan, &OpCtx) -> T) -> T {
         let req = self.ctx(who);
-        let m = map::build(&self.kv, Some(1))?;
+        let m = map::build(&self.kv, Some(1)).expect("建集群图");
         let c = OpCtx {
             req: &req,
             pipeline: &self.pipeline,
@@ -153,7 +164,12 @@ impl Ns {
             settings: &m.settings,
             cap_key: &CAP_KEY,
         };
-        ns::read(&self.kv, &c, &op)
+        f(&self.kv, &c)
+    }
+
+    /// 一个只读操作。
+    pub fn read(&mut self, who: &Who, op: MetaOp) -> Result<MetaReply, ErrCode> {
+        self.view(who, |v, c| ns::read(v, c, &op))
     }
 
     /// 按路径解析出 inode 号（以 root 身份）。
@@ -202,6 +218,13 @@ impl Ns {
             MetaReply::Opened(o) => Ok(o.attr.ino),
             other => panic!("Create 的回复不对：{other:?}"),
         }
+    }
+
+    /// 改长度（`SetAttr{size}`，`epoch_seen` 为 0：只改元数据的测试用，例如递归计数、属性）。
+    pub fn set_size(&mut self, who: &Who, ino: u64, size: u64) -> Result<MetaReply, ErrCode> {
+        let set =
+            SetAttrIn { mode: None, uid: None, gid: None, size: Some(size), atime: None, mtime: None, epoch_seen: 0 };
+        self.op(who, MetaOp::SetAttr { ino, set })
     }
 
     /// 某个键空间里的全部 (key, value)。

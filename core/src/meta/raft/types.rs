@@ -2,7 +2,8 @@
 //! [`ProposeOutcome`]、raft 线程发布的只读快照 [`Published`]、打开 Driver 的参数 [`DriverOpts`]，以及 raft 参数 [`config`]。
 //! `driver` 模块原样转出它们。
 
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use raft::eraftpb::{ConfChangeV2, Message};
@@ -32,22 +33,42 @@ pub enum ProposeOutcome {
     Dropped,              // 没有进日志（不是同一任期的就绪 leader、超过 max_uncommitted_size……）
 }
 
-/// raft 线程发布给其他线程的快照：其他线程只读它，绝不碰 RawNode。
+/// raft 线程发布给其他线程的快照：其他线程只读它，绝不碰 RawNode。实现注记（M7）：另有一个"写了 changelog 的批次"计数，
+/// changelog 长轮询（3.11）在它上面等：raft 线程应用了写 0x0E 的批次（写事务提交之后）就加一并唤醒全部等待者。
 pub struct Published {
     pub(super) role: Mutex<RoleInfo>,
     pub(super) status: Mutex<EngineStatus>,
+    changelog: Mutex<u64>,
+    changelog_cv: Condvar,
 }
 
 impl Published {
     pub(super) fn new() -> Published {
         let role = RoleInfo { role: StateRole::Follower, term: 0, leader_id: 0, ready: false };
-        Published { role: Mutex::new(role), status: Mutex::new(EngineStatus::default()) }
+        let (changelog, changelog_cv) = (Mutex::new(0), Condvar::new());
+        Published { role: Mutex::new(role), status: Mutex::new(EngineStatus::default()), changelog, changelog_cv }
     }
     pub fn role(&self) -> RoleInfo {
         *lock(&self.role)
     }
     pub fn status(&self) -> EngineStatus {
         lock(&self.status).clone()
+    }
+    /// "写了 changelog 的批次"计数的当前值（长轮询先记下它，再读一页）。
+    pub fn changelog_seen(&self) -> u64 {
+        *lock(&self.changelog)
+    }
+    /// 等到计数不再是 `seen`（有新的 changelog 记录提交了）或超时；返回当前值。
+    pub fn wait_changelog(&self, seen: u64, timeout: Duration) -> u64 {
+        let g = lock(&self.changelog);
+        let (g, _) =
+            self.changelog_cv.wait_timeout_while(g, timeout, |n| *n == seen).unwrap_or_else(|e| e.into_inner());
+        *g
+    }
+    /// raft 线程：应用了写 changelog 的批次（写事务已提交）。
+    pub(super) fn changelog_applied(&self) {
+        *lock(&self.changelog) += 1;
+        self.changelog_cv.notify_all();
     }
 }
 

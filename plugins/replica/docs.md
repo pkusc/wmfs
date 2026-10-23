@@ -12,7 +12,7 @@ codec 插件。
 
 ## 配置
 
-没有部署参数：副本数是目录属性 `replicas`。
+没有部署参数：副本数是目录属性 `replicas`（M7 起可以 `wmfs set <目录> replicas=N`，1–8；这个插件与 label-match 都声明消费它）。
 
 ## 诚实说明
 

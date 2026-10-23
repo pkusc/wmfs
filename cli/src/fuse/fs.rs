@@ -59,7 +59,8 @@ impl Filesystem for WmfsFs {
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEntry) {
-        self.entry(reply, self.fc.meta.read(&self.who(req), MetaOp::Lookup { parent: parent.0, name: name(n) }));
+        let r = self.fc.meta.read(&self.who(req), MetaOp::Lookup { parent: parent.0, name: name(n) });
+        self.entry(reply, self.note_dir(parent.0, r));
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
@@ -124,7 +125,8 @@ impl Filesystem for WmfsFs {
     fn mkdir(&self, req: &Request, parent: INodeNo, n: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
         self.log_mode_umask("mkdir", n, mode, umask);
         let op = MetaOp::Mkdir { parent: parent.0, name: name(n), mode: mode & MODE_MASK, umask };
-        self.entry(reply, self.fc.meta.write(&self.who(req), op));
+        let r = self.fc.meta.write(&self.who(req), op);
+        self.entry(reply, self.note_dir(parent.0, r));
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, n: &OsStr, reply: ReplyEmpty) {
@@ -159,7 +161,15 @@ impl Filesystem for WmfsFs {
             new_name: name(newname),
             flags: flags.bits(),
         };
-        self.empty(reply, self.fc.meta.write(&self.who(req), op).map(|_| ()));
+        let who = self.who(req);
+        let r = self.fc.meta.write(&who, op).map(|_| ());
+        if r.is_ok() && newparent != parent {
+            self.note_moved_dir(&who, newparent.0, newname); // 换了父目录的目录：记下新的父目录（快照里的 ..）
+            if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+                self.note_moved_dir(&who, parent.0, n);
+            }
+        }
+        self.empty(reply, r);
     }
 
     fn link(&self, req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {

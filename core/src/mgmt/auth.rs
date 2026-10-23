@@ -20,7 +20,15 @@ pub struct Denied {
     pub message: String,
 }
 
-/// 校验一个请求的签名；成功返回这把 key 的角色。`need_admin` = 写操作。
+/// 通过了签名校验的调用者（实现注记（M7）：以前只返回角色；依赖元数据的端点还要 key 号与租户，写进 changelog 的身份）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caller {
+    pub key_id: u32,
+    pub role: Role,
+    pub tenant: u32,
+}
+
+/// 校验一个请求的签名；成功返回调用者。`need_admin` = 写操作。
 pub fn check(
     keys: &dyn KeyLookup,
     method: &str,
@@ -28,7 +36,7 @@ pub fn check(
     header: Option<&str>,
     body: &[u8],
     need_admin: bool,
-) -> Result<Role, Denied> {
+) -> Result<Caller, Denied> {
     let deny = |message: String| Denied { status: 401, code: "auth_failed", message };
     let h = header.ok_or_else(|| deny("缺少 Authorization 头（WMFS-HMAC key=…,ts=…,sig=…）".into()))?;
     let a = parse_auth_header(h).map_err(deny)?;
@@ -46,7 +54,7 @@ pub fn check(
     if need_admin && role != Role::Admin {
         return Err(Denied { status: 403, code: "eacces", message: "写操作需要 admin key".into() });
     }
-    Ok(role)
+    Ok(Caller { key_id: k, role, tenant: meta.tenant })
 }
 
 #[cfg(test)]
@@ -91,9 +99,10 @@ mod tests {
         let now = clock::wall_ms();
         let pq = "/api/v1/failpoints";
         let h = signed(1, "POST", pq, now, b"{}");
-        assert_eq!(check(&Keys, "POST", pq, Some(&h), b"{}", true), Ok(Role::Admin));
+        assert_eq!(check(&Keys, "POST", pq, Some(&h), b"{}", true).map(|c| (c.key_id, c.role)), Ok((1, Role::Admin)));
         let h = signed(2, "GET", pq, now, b"");
-        assert_eq!(check(&Keys, "GET", pq, Some(&h), b"", false), Ok(Role::Client), "读只要任一已认证 key");
+        let r = check(&Keys, "GET", pq, Some(&h), b"", false).map(|c| c.role);
+        assert_eq!(r, Ok(Role::Client), "读只要任一已认证 key");
         let h = signed(2, "POST", pq, now, b"{}");
         assert_eq!(check(&Keys, "POST", pq, Some(&h), b"{}", true).unwrap_err().status, 403, "写需要 admin");
     }

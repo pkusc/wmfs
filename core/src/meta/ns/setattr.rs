@@ -18,6 +18,7 @@
 //!   同步 `system.posix_acl_access` 的 USER_OBJ / MASK / OTHER。chown：只有 root 能改 uid；属主只能把 gid 改成自己所在的组；
 //!   非目录 chown 之后去掉 setuid、以及带组执行位时的 setgid。非属主改长度也去掉它们（"非属主写入时清除 suid/sgid"）。
 //! - 时间：设成"现在"只要有写权限（或是属主）；设成指定值要是属主或 root。任何改动都更新 ctime、change_id + 1。
+//! - 实现注记（M7）：改了长度（截断到 0 时还可能换了存储类）→ 祖先 RSTAT 按差值更新（3.9；孤儿不计）。
 
 use super::common::{
     MODE_MASK, Node, S_ISGID, attr_out, authz, bump_ctime, get, in_group, is_file, kill_suid, max_file_size, may_read,
@@ -28,6 +29,7 @@ use crate::base::ErrCode;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvTxn, OpCtx};
+use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys::{self, GC_EPOCH};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{F_HAS_ACL, F_INLINE, GcRecV1};
@@ -103,7 +105,7 @@ fn finish(v: &mut dyn KvTxn, c: &OpCtx, mut n: Node, sized: bool) -> Result<Meta
     save(v, &n);
     changelog::append(v, c, Change { op: "SetAttr", ino: n.ino, size: n.rec.size, ..Default::default() })?;
     if !sized {
-        return Ok(MetaReply::Entry { attr: attr_out(&n) });
+        return Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? });
     }
     let r = may_read(v, c, &n);
     Ok(MetaReply::Opened(open_out(v, c, &n, r, write_rights(r))?))
@@ -120,6 +122,7 @@ fn truncate(v: &mut dyn KvTxn, c: &OpCtx, n: &mut Node, size: u64, epoch_seen: u
     if n.rec.layout.as_ref().is_some_and(|l| size > max_file_size(l)) {
         return Err(ErrCode::EFBIG);
     }
+    let before = Delta::of(v, n)?; // 递归计数：长度（截断到 0 时可能还有存储类）变了（3.9）
     let was_inline = n.rec.flags & F_INLINE != 0;
     if size == 0 {
         let old = n.rec.layout.clone();
@@ -143,5 +146,5 @@ fn truncate(v: &mut dyn KvTxn, c: &OpCtx, n: &mut Node, size: u64, epoch_seen: u
     }
     n.rec.size = size;
     n.rec.mtime = c.req.now;
-    Ok(())
+    rstat::changed(v, c, &before, n)
 }

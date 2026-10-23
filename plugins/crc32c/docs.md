@@ -14,6 +14,8 @@
 ## 配置
 
 没有部署参数：用哪种校验和是目录属性 `checksum`（`crc32c` / `xxh3` / `blake3`，默认 crc32c；只对新文件与截断到 0 的文件生效）。
+M7 起可以 `wmfs set <目录> checksum=…`：这个插件的 manifest 声明消费 `checksum`；设成 `xxh3`、`blake3` 时要对应的插件已启用（M11 之前没有），
+否则报错"校验算法 xxh3 的插件没有启用"——不会静默改用 crc32c。
 
 ## 诚实说明
 

@@ -6,6 +6,7 @@
 #                                              失败即不通过（清单里每一条都对应 semantics.md 的一条放松）
 #       scripts/container-tests.sh fsx [N [参数…]]  xfstests 的 fsx，N 次操作（默认 10000），其余参数原样交给 fsx（例如 `-l 65536`）
 #       scripts/container-tests.sh fio         fio 写 + verify=crc32c
+#       scripts/container-tests.sh pathmap     M7：容器里 root 挂载（类型 fuse）时 CLI 的挂载点路径换算
 # 退出码：0 通过；1 不通过；3 没有镜像 wmfs-tools（先 scripts/build-tools-image.sh；调用方显示 SKIP）。
 # 只起一次性的 wmfs-suite-* 容器（--rm），不碰机器上别的容器与镜像。
 set -u

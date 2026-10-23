@@ -4,6 +4,8 @@
 //! - ADR-0036（已打开的句柄学 NFS）：属主建 0444 文件后照常写入并提交、写过 64 KiB（Uninline）、续写 cap、经写句柄 ftruncate
 //!   （`TruncateHandle`）、Fallocate；按路径 truncate 与写方式的 Open 仍按当前权限 → `EACCES`；其他用户的写句柄在 chmod o-w
 //!   之后提交 / 续期 / ftruncate → `EACCES`。
+//! - M7 第一步（ADR-0037 第 4、12 条）：`ReopenHandle`——属主经写句柄重新取一个 0444 文件的 layout（别人刚把它截断到 0、换了 epoch）
+//!   照常拿到新 layout 与写 cap，按新 epoch 写入并提交；其他用户在 chmod o-w 之后 `ReopenHandle{write}` → `EACCES`，读的照常。
 
 use wmfs_core::base::ErrCode;
 use wmfs_core::base::rand::XorShift64;
@@ -105,6 +107,44 @@ fn owner_handles_ignore_mode_bits_while_others_get_eacces_after_chmod() {
     assert_eq!(t.err(), Some(ErrCode::EACCES), "其他用户经写句柄 ftruncate 也 EACCES");
     let r = c.meta.read(&other, MetaOp::RenewCap { ino, write: false });
     assert!(r.is_ok(), "读 cap 续期：其他人还有 r：{r:?}");
+    c.meta.close();
+    run.stop();
+}
+
+#[test]
+fn reopen_handle_gives_the_owner_a_fresh_layout_of_a_read_only_file() {
+    let d = TempDir::new("handle-reopen"); // 丢弃时删掉（失败时也删）
+    init(&d.0);
+    let run = start(&d.0);
+    let c = client(&d.0, &run, "admin");
+    let (owner, other) = (who(1000, 1000), who(2000, 2000));
+    let create = MetaOp::Create { parent: ROOT_INO, name: b"ro".to_vec(), mode: 0o666, umask: 0, excl: true };
+    let o = opened(c.meta.write(&owner, create)).unwrap();
+    let ino = o.attr.ino;
+    let _theirs = opened(c.meta.read(&other, MetaOp::Open { ino, flags: O_WRONLY })).unwrap(); // 其他用户也开着写句柄
+    let e1 = o.layout.as_ref().unwrap().epoch;
+    // 别人（这里用 root）把它截断到 0：换了 epoch；属主随后把它改成 0444
+    let root = who(0, 0);
+    let t = opened(c.meta.write(&root, MetaOp::SetAttr { ino, set: size(0, e1) })).unwrap();
+    let e2 = t.layout.as_ref().unwrap().epoch;
+    assert!(e2 > e1, "截断到 0 换了 epoch");
+    c.meta.write(&owner, MetaOp::SetAttr { ino, set: chmod(0o444) }).unwrap();
+    assert_eq!(commit(&c, &owner, &o, 5, vec![]).err(), Some(ErrCode::STALE_LAYOUT), "旧 epoch 的提交");
+    let w = c.meta.read(&owner, MetaOp::Open { ino, flags: O_WRONLY });
+    assert_eq!(w.err(), Some(ErrCode::EACCES), "按当前权限的 Open 打不开（M6 时客户端因此回 ESTALE）");
+    let r = opened(c.meta.read(&owner, MetaOp::ReopenHandle { ino, write: true })).expect("属主经句柄重新取 layout");
+    assert_eq!(r.layout.as_ref().unwrap().epoch, e2, "拿到新 epoch 的 layout");
+    assert!(!r.cap.is_empty(), "带一张写 cap");
+    assert!(r.inline.is_some(), "0444：属主能读，带 inline 内容");
+    commit(&c, &owner, &r, 5, vec![(0, b"fresh".to_vec())]).expect("按新 epoch 提交");
+    assert_eq!(get(&c, &owner, ino).unwrap(), b"fresh");
+    // 其他用户：chmod 0444 之后经写句柄重新取 → EACCES；读句柄照常（o+r 还在）
+    let r = c.meta.read(&other, MetaOp::ReopenHandle { ino, write: true });
+    assert_eq!(r.err(), Some(ErrCode::EACCES), "其他用户 chmod o-w 之后 ReopenHandle → EACCES");
+    let r = c.meta.read(&other, MetaOp::ReopenHandle { ino, write: false });
+    assert!(matches!(r, Ok(MetaReply::Opened(_))), "读句柄：其他人还有 r：{r:?}");
+    let dir = c.meta.read(&owner, MetaOp::ReopenHandle { ino: ROOT_INO, write: false });
+    assert_eq!(dir.err(), Some(ErrCode::EISDIR));
     c.meta.close();
     run.stop();
 }

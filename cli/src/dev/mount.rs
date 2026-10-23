@@ -3,7 +3,8 @@
 //! - `dev mount <挂载点> [--key-file F] [--cache …]`：后台起一个 `wmfs mount <全部节点的 rpc 地址> <挂载点> --key-file <n1 的
 //!   client.key>`（自己的进程组；stdout/stderr 与 `--log` 都写进 `<开发目录>/mounts/<名字>/mount.log`），记下挂载点与进程号，等到
 //!   `/proc/self/mountinfo` 里出现这个 `fuse.wmfs` 挂载、**并且**日志里已经有完整的"已挂载 …"一行才返回（见 [`announced`]；进程
-//!   退出或 30 s 超时 → 还挂着就 lazy 卸载、打印日志路径与最后一行、非 0 退出），然后把它打印的集群警告与"已挂载"转出来。
+//!   退出或 30 s 超时 → 还挂着就 lazy 卸载、打印日志路径与最后一行、非 0 退出；实现注记（M7，ADR-0037 第 14 条）：这时只删记录里的
+//!   pid 与挂载点，mount.log 留着给人看——`dev down` 时随记录目录一起删），然后把它打印的集群警告与"已挂载"转出来。
 //!   记录目录的名字 = 挂载点的最后一段（重名时加 `-2`、`-3`……）；按挂载点找记录时扫一遍 `mounts/`，比对各自的 `mountpoint`
 //!   文件。实现注记（M6）：7.2 的 `--node n`（客户端冒充那个节点所在的"主机"）随 M13 的 locality。
 //! - `dev umount <挂载点>`：`fusermount3 -u`，等挂载进程退出（它写出全部脏数据后自己退出），删掉记录。
@@ -29,7 +30,7 @@ const MOUNT_TIMEOUT_MS: u64 = 30_000;
 pub fn mounted(mp: &Path) -> bool {
     let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let want = mp.display().to_string();
-    parse_mountinfo(&text).iter().any(|(m, t)| *m == want && t == "fuse.wmfs")
+    parse_mountinfo(&text).iter().any(|m| m.point == want && m.fstype == "fuse.wmfs")
 }
 
 /// 全部挂载记录：(记录目录, 记下的挂载点)。
@@ -105,7 +106,9 @@ pub fn mount(d: &Path, mp: &Path, key_file: &Option<PathBuf>, cache: &Option<Str
     let ready = || mounted(&mp) && announced(&read_log());
     if let Err(e) = wait_ready(&mut child, MOUNT_TIMEOUT_MS, &log_path, "wmfs mount", ready) {
         lazy_umount(&mp); // 挂上了却没等到"已挂载"（挂载进程已被结束）：不留下没有记录、没人管的挂载点
-        let _ = std::fs::remove_dir_all(&rec);
+        // 只删 pid 与挂载点记录，mount.log 留着：错误信息里指着它（ADR-0037 第 14 条）；wmfs dev down 时随记录目录一起删
+        let _ = std::fs::remove_file(rec.join("pid"));
+        let _ = std::fs::remove_file(rec.join("mountpoint"));
         return Err(e);
     }
     let text = read_log();
@@ -181,9 +184,11 @@ pub fn stop_all(d: &Path) -> Vec<String> {
     }
     let mut lines = Vec::new();
     for (rec, mp) in &recs {
-        lazy_umount(mp);
         let _ = std::fs::remove_dir_all(rec);
-        lines.push(format!("已卸载 {}", mp.display()));
+        if !mp.as_os_str().is_empty() {
+            lazy_umount(mp); // 没有挂载点的是挂载失败留下的日志（见 mount）
+            lines.push(format!("已卸载 {}", mp.display()));
+        }
     }
     lines
 }

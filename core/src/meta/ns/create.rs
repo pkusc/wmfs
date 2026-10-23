@@ -2,7 +2,9 @@
 //!
 //! 顺序与 3.5.1 的示例相同：名字检查 → 父目录（`ENOENT`/`ENOTDIR`）→ authz（对父目录要写 + 执行）→ 已存在 → `EEXIST` →
 //! 分配 ino → 权限位（父目录有默认 ACL → 按 ACL 规则、不用 umask；否则 `mode & !umask`）→ 普通文件按当前生效属性选好链
-//! （`new_layout`，必要时 `gen_chains`；inline_max > 0 时置 F_INLINE）→ 写 inode、目录项、继承的 ACL、父目录 → changelog。
+//! （`new_layout`，必要时 `gen_chains`；inline_max > 0 时置 F_INLINE）→ 写 inode、目录项、继承的 ACL、父目录 → 祖先的 RSTAT（M7：
+//! 文件、符号链接、设备节点 files + 1，目录 dirs + 1 并建它自己的空 RSTAT，3.9）→ changelog。link 不改 RSTAT（硬链接只在主链接
+//! 所在目录计一次）。
 //! 字符设备与块设备节点只有 root 能建（`EPERM`，与 Linux 的 CAP_MKNOD 相同）。
 //! `Create` 不带 O_EXCL 时名字可能已存在（要按名字打开它），所以先查"能不能在父目录里查名字"（执行权限，与 lookup 相同；
 //! 没有 → `EACCES`，不泄露名字在不在），再看名字：已存在 → O_EXCL 回 `EEXIST`、目录回 `EISDIR`、否则要对它有写权限。
@@ -17,6 +19,7 @@ use crate::base::ErrCode;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvTxn, OpCtx};
+use crate::meta::rstat;
 use crate::meta::schema::records::{
     F_ORPHAN, KIND_BLK, KIND_CHR, KIND_DIR, KIND_FIFO, KIND_FILE, KIND_SOCK, KIND_SYMLINK,
 };
@@ -55,6 +58,11 @@ fn make(v: &mut dyn KvTxn, c: &OpCtx, p: &mut Node, o: NewInode) -> Result<Node,
     save(v, &n);
     link_dentry(v, p.ino, o.name, &n);
     update_dir(v, c, p, 1, (o.kind == KIND_DIR) as i64);
+    if o.kind == KIND_DIR {
+        rstat::init_dir(v, ino); // 新目录自己的 RSTAT 从 0 开始（3.9）
+    }
+    let d = rstat::Delta::of(v, &n)?; // 文件 + 1（计入存储类）或目录 + 1
+    rstat::apply(v, c, p.ino, &d)?;
     changelog::append(v, c, Change { op: o.op, ino, parent: p.ino, name: o.name, ..Default::default() })?;
     Ok(n)
 }
@@ -110,7 +118,8 @@ pub fn mkdir(
     let mut p = prepare(v, c, parent, name, AuthzOp::Mkdir)?;
     let mode = mode & (0o777 | S_ISVTX); // mkdir 只认权限位与粘滞位；setgid 只从父目录继承
     let o = NewInode { name, kind: KIND_DIR, mode, umask, rdev: 0, target: b"", op: "Mkdir" };
-    Ok(MetaReply::Entry { attr: attr_out(&make(v, c, &mut p, o)?) })
+    let n = make(v, c, &mut p, o)?;
+    Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? })
 }
 
 /// `Mknod`：fifo、socket、字符/块设备节点（只存元数据），也接受普通文件（与 create 一样选好链，回 `Entry`）。
@@ -134,7 +143,8 @@ pub fn mknod(
     let mut p = prepare(v, c, parent, name, AuthzOp::Mknod)?;
     let rdev = if kind == KIND_CHR || kind == KIND_BLK { rdev } else { 0 };
     let o = NewInode { name, kind, mode, umask, rdev, target: b"", op: "Mknod" };
-    Ok(MetaReply::Entry { attr: attr_out(&make(v, c, &mut p, o)?) })
+    let n = make(v, c, &mut p, o)?;
+    Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? })
 }
 
 /// `Symlink`：目标 1–4096 字节、不含 NUL。
@@ -150,7 +160,8 @@ pub fn symlink(v: &mut dyn KvTxn, c: &OpCtx, parent: u64, name: &[u8], target: &
     }
     let mut p = prepare(v, c, parent, name, AuthzOp::Symlink)?;
     let o = NewInode { name, kind: KIND_SYMLINK, mode: 0o777, umask: 0, rdev: 0, target, op: "Symlink" };
-    Ok(MetaReply::Entry { attr: attr_out(&make(v, c, &mut p, o)?) })
+    let n = make(v, c, &mut p, o)?;
+    Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? })
 }
 
 /// `Link`：硬链接（只能链接文件，目录 → `EPERM`；每个文件 ≤ 1000 个链接 → `EMLINK`）。
@@ -178,5 +189,5 @@ pub fn link(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, new_parent: u64, new_name: &
     link_dentry(v, new_parent, new_name, &n);
     update_dir(v, c, &mut p, 1, 0);
     changelog::append(v, c, Change { op: "Link", ino, parent: new_parent, name: new_name, ..Default::default() })?;
-    Ok(MetaReply::Entry { attr: attr_out(&n) })
+    Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? })
 }

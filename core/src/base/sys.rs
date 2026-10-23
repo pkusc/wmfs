@@ -49,6 +49,21 @@ pub fn statvfs(path: &Path) -> Result<FsStat, ErrCode> {
     })
 }
 
+/// `getxattr(path, name)`（跟随符号链接）：扩展属性的值（最多 64 KiB）。实现注记（M7）：CLI 的路径换算读挂载根目录的虚拟 xattr
+/// `user.wmfs.mgmt` 用（design.md 7.2；cli 不直接调 libc）。
+pub fn getxattr(path: &Path, name: &str) -> Result<Vec<u8>, ErrCode> {
+    let p = CString::new(path.as_os_str().as_bytes()).map_err(|_| ErrCode::EINVAL)?;
+    let n = CString::new(name).map_err(|_| ErrCode::EINVAL)?;
+    let mut buf = vec![0u8; 64 << 10];
+    // SAFETY: p、n 是以 NUL 结尾的 C 字符串；buf 在调用期间有效，长度如实传入；getxattr 最多写 buf.len() 个字节。
+    let r = unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if r < 0 {
+        return Err(last_err());
+    }
+    buf.truncate(r as usize);
+    Ok(buf)
+}
+
 /// 在内核里把 `src[src_off..]` 复制到 `dst[dst_off..]`，最多 `len` 字节，返回实际复制的字节数
 /// （可能少于 len；`EXDEV/ENOSYS/EOPNOTSUPP` 时调用方退回 pread/pwrite，design.md 3.2.5 R1）。
 pub fn copy_file_range(src: &File, src_off: u64, dst: &File, dst_off: u64, len: usize) -> Result<usize, ErrCode> {

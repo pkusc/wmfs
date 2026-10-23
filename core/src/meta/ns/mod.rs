@@ -2,7 +2,8 @@
 //! 失败整体丢弃），只读的跑在 meta-read 线程上（ReadIndex 之后的一个 redb 读事务）。authz、placement 钩子都在闭包**内部**
 //! 对着同一个视图调用，判定与修改之间没有 TOCTOU 窗口。
 //!
-//! - [`common`]：读写 inode 与目录项、名字检查、属主与权限位、AttrOut/OpenOut、authz、new_layout、孤儿
+//! - [`common`]：读写 inode 与目录项、名字检查、属主与权限位、AttrOut/OpenOut、authz、孤儿
+//! - [`layout`]：新文件与截断到 0 的文件按生效属性选链、建 layout（M7 从 common 搬出）
 //! - [`read_ops`]：lookup、getattr、readdir、readlink、按路径解析、open
 //! - [`create`]：create、mkdir、mknod、symlink、link
 //! - [`remove`]：unlink、rmdir（孤儿标记）
@@ -10,10 +11,11 @@
 //! - [`setattr`]：chmod、chown、utimensat、truncate（截断到 0 按当前属性重建 layout）、TruncateHandle（M6，经写句柄改长度）
 //! - [`xattr`]：扩展属性与 POSIX ACL 的存储（mode 与 F_HAS_ACL 同步）
 //! - [`acl`]：ACL 的二进制格式、新文件继承默认 ACL（umask 规则）
-//! - [`file_ops`]：CommitWrite、Fallocate、GetInline、RenewCap，以及服务端 uninline 的只读前半段（M5）；SetAtime（M6，relatime 批量）
+//! - [`file_ops`]：CommitWrite、Fallocate、GetInline、RenewCap，以及服务端 uninline 的只读前半段（M5）；SetAtime（M6，relatime 批量）；
+//!   ReopenHandle（M7，ADR-0037 第 4 条：经句柄重新取 layout）
 //!
 //! 实现注记（M4）：`GetLock`/`SetLock`/`AppendReserve`（M12）还没有实现，回 `FEATURE_UNSUPPORTED`；回收站（M12）、递归计数（M7）、
-//! 配额（M10）、目录属性的继承（M7）随各自的里程碑加入。实现注记（M5）：`StatFs`（要心跳报上来的 target 容量，
+//! 配额（M10）、目录属性的继承（M7）随各自的里程碑加入（M7 已实现递归计数与属性继承：见 `meta/rstat.rs`、`meta/attrs.rs`）。实现注记（M5）：`StatFs`（要心跳报上来的 target 容量，
 //! `meta/cluster/targets.rs`）与 `Uninline`（要经数据面写 chunk，`meta/uninline.rs`）由元数据服务另外处理。实现注记（M6）：
 //! `SetAtime` 与 ADR-0036 的 `TruncateHandle`（与 SetAttr{size} 同一段代码，授权用 `AuthzOp::Handle`）加入。
 
@@ -21,6 +23,7 @@ pub mod acl;
 pub mod common;
 pub mod create;
 pub mod file_ops;
+pub mod layout;
 pub mod read_ops;
 pub mod remove;
 pub mod rename;
@@ -98,6 +101,7 @@ pub fn is_read(op: &MetaOp) -> bool {
             | MetaOp::Open { .. }
             | MetaOp::GetInline { .. }
             | MetaOp::RenewCap { .. }
+            | MetaOp::ReopenHandle { .. }
     )
 }
 
@@ -114,6 +118,7 @@ pub fn read(v: &dyn KvScan, c: &OpCtx, op: &MetaOp) -> Result<MetaReply, ErrCode
         MetaOp::Open { ino, flags } => read_ops::open(v, c, *ino, *flags),
         MetaOp::GetInline { ino } => file_ops::get_inline(v, c, *ino),
         MetaOp::RenewCap { ino, write } => file_ops::renew_cap(v, c, *ino, *write),
+        MetaOp::ReopenHandle { ino, write } => file_ops::reopen_handle(v, c, *ino, *write),
         _ => Err(ErrCode::FEATURE_UNSUPPORTED),
     }
 }

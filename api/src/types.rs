@@ -1,10 +1,14 @@
 //! 管理 API 与进程外插件共用的数据结构（design.md 7.1、3.12）。
 //!
-//! 密钥文件、changelog 事件，以及各管理端点的请求/响应结构（随所在里程碑加入；M1：health、failpoints、错误回复）。
+//! 密钥文件、changelog 事件，以及各管理端点的请求/响应结构（随所在里程碑加入；M1：health、failpoints、错误回复；
+//! M7：目录属性、用量、声明 vs 实际、语义、changelog 与游标、集群运行参数，在 `types/mgmt.rs`）。
 //! core 的服务端与 wmfs-mgr 的 ApiClient 都用这里的定义；每个结构的 JSON 字段名都有逐字的金样测试（本文件末尾）。
 //! 演进规则：路径带 `/v1`，字段只增不改（ADR-0005）。
 
 use serde::{Deserialize, Serialize};
+
+mod mgmt;
+pub use mgmt::*; // M7 的管理端点：目录属性、用量、声明 vs 实际、语义、changelog 与游标、集群运行参数（types/mgmt.rs）
 
 /// 所有错误回复的 body：`{"error": "<code>", "message": "<中文说明>"}`（7.1）。
 /// `error` 是错误码名的小写（例如 `auth_failed`、`eacces`、`einval`、`enoent`、`not_leader`）。

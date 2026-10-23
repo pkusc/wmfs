@@ -118,6 +118,26 @@ impl From<std::io::Error> for ErrCode {
     }
 }
 
+/// 失败：错误码 + 给人看的中文原因（空 = 用错误码名）。管理 API 的端点回 `{"error": 码名, "message": 原因}`（7.1）；实现注记（M7）：
+/// 属性字符串的切分（`meta::attr_registry::split`）要分出 `EINVAL`/`EOPNOTSUPP`/`FEATURE_UNSUPPORTED`，也返回它（0.2 第 5 条的 M7 注记）。
+#[derive(Debug)]
+pub struct Failed {
+    pub code: ErrCode,
+    pub msg: String,
+}
+
+impl Failed {
+    pub fn new(code: ErrCode, msg: impl Into<String>) -> Failed {
+        Failed { code, msg: msg.into() }
+    }
+}
+
+impl From<ErrCode> for Failed {
+    fn from(code: ErrCode) -> Failed {
+        Failed { code, msg: String::new() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

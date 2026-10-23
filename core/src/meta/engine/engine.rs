@@ -17,7 +17,7 @@ use wmfs_api::metrics::{self, Histogram};
 use wmfs_api::types::NodeAddrs;
 
 use super::executor;
-use super::txn::{EngineStatus, MetaEngine, OpCtx, ReadFn, RoleInfo, TxnRequest};
+use super::txn::{EngineStatus, KvScan, MetaEngine, OpCtx, ReadFn, RoleInfo, TxnRequest};
 use super::view::ReadView;
 use crate::base::types::ReqCtx;
 use crate::base::{ErrCode, log};
@@ -192,10 +192,28 @@ impl EmbeddedEngine {
         KvKeys { master, eng: self.clone() }
     }
 
+    /// 在本地（不经 ReadIndex）的已应用状态上跑 `f`：只给"读到稍旧的也无妨"的统计用（cluster-mgr 刷新 changelog 消费者的
+    /// 落后条数，实现注记（M7））。
+    pub fn local_scan(&self, f: &mut dyn FnMut(&dyn KvScan) -> Result<(), ErrCode>) -> Result<(), ErrCode> {
+        let rtx = self.shared.db.begin_read().map_err(|e| redb_eio("本地读的读事务", e))?;
+        f(&ReadView::new(&rtx)?)
+    }
+
     /// 当前的集群图（本地读已应用的状态，不经 ReadIndex：cluster-mgr 写集群警告的日志用）。
     pub fn cluster_map(&self) -> Result<Arc<ClusterMap>, ErrCode> {
         let rtx = self.shared.db.begin_read().map_err(|e| redb_eio("本地读的读事务", e))?;
         self.shared.map_for(&ReadView::new(&rtx)?)
+    }
+
+    /// changelog 长轮询用（3.11，实现注记（M7））："写了 changelog 的批次"计数的当前值；先记下它再读一页，读完没有新记录就
+    /// [`wait_changelog`](Self::wait_changelog)——中间提交的记录不会漏掉唤醒。
+    pub fn changelog_seen(&self) -> u64 {
+        self.shared.published.changelog_seen()
+    }
+
+    /// 等到有新的 changelog 记录提交（计数不再是 `seen`）或超时。
+    pub fn wait_changelog(&self, seen: u64, timeout: Duration) -> u64 {
+        self.shared.published.wait_changelog(seen, timeout)
     }
 
     /// 已经 `shutdown` 了吗（cluster-mgr 线程据此退出）。

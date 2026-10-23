@@ -95,6 +95,9 @@ fn truncate_to_zero_rebuilds_the_layout_from_the_current_attributes() {
     let mut class: StorageClassV1 = decode_v1(&ns.kv.0[&keys::class(1)]).unwrap();
     class.replica = 1;
     ns.kv.0.insert(keys::class(1), encode_v1(&class));
+    // 改存储类也要让 attr_epoch 加一（M7 起属性解析按 attr_epoch 缓存，meta/attrs.rs；M13 的 class update 照这样做）
+    let e: u64 = decode_v1(&ns.kv.0[&keys::global(keys::G_ATTR_EPOCH)]).unwrap();
+    ns.kv.0.insert(keys::global(keys::G_ATTR_EPOCH), encode_v1(&(e + 1)));
     let MetaReply::Opened(o) = sa(&mut ns, &OWNER, f, SetAttrIn { size: Some(0), ..set() }).unwrap() else { panic!() };
     let l = o.layout.unwrap();
     assert_eq!((o.attr.size, l.epoch, l.replicas, l.chains.clone()), (0, 2, 1, vec![2]), "新 epoch、按新的副本数选链");

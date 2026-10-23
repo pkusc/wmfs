@@ -55,9 +55,13 @@ LIMIT=36000
 # inode、files、writeback、flusher、read、strong、session；余下 M10 的配额额度、M12 的 locks.rs 与 strong 的读和 O_APPEND、驱逐后的
 # 处理约 330）、cli 3700 → 3800（已约 3,330：fuse/ 约 830、dev 的 mount/proc 约 200；余下挂载路径映射约 70、M12 的 getlk/setlk 与
 # lock-wait 约 120、M7–M15 的其余子命令约 180）。
-MODULES="wmfs-api:900 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1180 core/hooks:1060
+# M7（design.md 2.2 的 M7 注记）：连同审查修复新增约 2,135 行（预算约 2,140）。重估两个：wmfs-api 900 → 1100（已约 815：M7 的 12 个端点的结构
+# 约 145 行；余下集群、链、会话、任务、存储类、key、feature、trace、qos、插件清单等约 15 组端点约 290）、cli 3800 → 4850（已约 3,800：M7 的策略命令、
+# 路径换算、changelog/cluster 约 455；余下 M8 的 join/node/cluster plugins/dev 多节点约 300、M9 chain 约 80、M10 key/session 约 130、M11 task/
+# datakey/feature 约 135、M12 锁约 150、M13 class 约 115、M14 mgr/trace/dev wait 约 165）。
+MODULES="wmfs-api:1100 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1180 core/hooks:1060
 core/meta/raft:1570 core/meta/engine:760 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
-core/data:3000 core/client:2200 core/bg:850 core/mgmt:790 core:720 plugins:5380 cli:3800 dashboard:880
+core/data:3000 core/client:2200 core/bg:850 core/mgmt:790 core:720 plugins:5380 cli:4850 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

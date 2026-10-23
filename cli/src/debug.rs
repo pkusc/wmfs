@@ -14,12 +14,13 @@
 pub mod chunk;
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use wmfs_core::base::{ErrCode, clock};
+use wmfs_core::meta::rstat::check_data_dir;
 use wmfs_core::net::client::{Endpoint, Family, PendingCall, RpcClient, check_reply};
 use wmfs_core::net::retry::{BACKOFF_MAX_MS, BACKOFF_START_MS, retry, retryable};
 use wmfs_core::proto::frame::{FrameHeader, FrameKind, InFrame, MSG_META_CALL, OutFrame};
@@ -271,4 +272,28 @@ fn describe(b: &Bench) -> String {
         b.concurrency,
         b.retries
     )
+}
+
+/// `wmfs debug rstat-check <data_dir> [--json]`（design.md 3.9 的离线自检，M7）：节点要先停掉（redb 不允许两个进程同时打开）。
+/// 一致 → 退出码 0；不一致 → 列出每个不一致的目录、退出码 1。`--json`：`{ok, inodes, dirs, problems}`。
+pub fn rstat_check(data_dir: &Path, json: bool) -> i32 {
+    match check_data_dir(data_dir) {
+        Ok(r) => {
+            let ok = r.problems.is_empty();
+            let text = if json {
+                serde_json::json!({"ok": ok, "inodes": r.inodes, "dirs": r.dirs, "problems": r.problems}).to_string()
+            } else if ok {
+                format!("RSTAT 一致：{} 个 inode、{} 个目录", r.inodes, r.dirs)
+            } else {
+                format!("RSTAT 有 {} 处不一致：\n  {}", r.problems.len(), r.problems.join("\n  "))
+            };
+            let rc = out(text);
+            if ok { rc } else { 1 }
+        }
+        Err(e) if json => {
+            let _ = out(serde_json::json!({"ok": false, "error": "eio", "message": e}));
+            1
+        }
+        Err(e) => fail(format!("wmfs debug rstat-check：{e}")),
+    }
 }

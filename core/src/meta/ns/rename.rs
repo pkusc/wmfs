@@ -8,8 +8,9 @@
 //! 类型要匹配（目录 ← 非目录 `ENOTDIR`、非目录 ← 目录 `EISDIR`），目标目录必须为空（`ENOTEMPTY`）→ 改目录项、被移动 inode 的
 //! 链接（主链接或 extra_links）、两个父目录的 size/nlink/mtime/ctime/change_id → 被覆盖的目标：目录直接删掉，文件 nlink − 1、
 //! 归零即孤儿 → changelog。
-//! 实现注记（M4）：跨配额域的检查（M10）、递归计数的搬移（M7）、移动目录时 `attr_epoch += 1` 与 RECONCILE_Q（M7、M11）、
-//! 回收站（M12）随各自的里程碑加入。
+//! 实现注记（M4）：跨配额域的检查（M10）、回收站（M12）随各自的里程碑加入。实现注记（M7）：递归计数的搬移——换了目录的主链接
+//! （目录、或文件的主链接）把它的那一份计数从旧祖先链搬到新祖先链，到最近公共祖先为止；被覆盖的目标按 unlink / rmdir 扣；
+//! 涉及目录的 rename 令 `attr_epoch += 1` 并写 `RECONCILE_Q(dir, 2)`（同一个目录里改名也算：3.8"任何目录 rename"；协调器在 M11）。
 
 use super::common::{
     Node, authz, bump_ctime, check_name, child, link_dentry, relink, save, searchable_dir, update_dir,
@@ -17,8 +18,10 @@ use super::common::{
 use super::remove::{delete_dir_records, unlink_file};
 use crate::base::ErrCode;
 use crate::hooks::traits::AuthzOp;
+use crate::meta::attrs::{bump_attr_epoch, queue_reconcile};
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
+use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys;
 use crate::proto::meta::{MetaReply, RENAME_EXCHANGE, RENAME_NOREPLACE};
 
@@ -27,9 +30,21 @@ fn inside(v: &dyn KvRead, c: &OpCtx, dir: u64, anc: u64) -> Result<bool, ErrCode
     Ok(c.attrs.ancestors(v, dir)?.contains(&anc))
 }
 
+/// 这个目录项 (parent, name) 是不是 `n` 的主链接（递归计数归属于它，3.9）：目录只有一个链接；文件看记录里的 parent/name。
+fn primary(n: &Node, parent: u64, name: &[u8]) -> bool {
+    n.is_dir() || (n.rec.parent == parent && n.rec.name == name)
+}
+
 /// 换了父目录的目录：要能写它自己（更新它的 ..），在 RenameTo 里作为 target 交给 authz 插件。
-fn moved(across: bool, n: &Node) -> Option<&Node> {
+fn dir_changing_parent(across: bool, n: &Node) -> Option<&Node> {
     (across && n.is_dir()).then_some(n)
+}
+
+/// 目录被移动了（任何目录 rename，同一个目录里改名也算）：继承关系变了 → 写 `RECONCILE_Q(dir, 2)`（3.1.2；协调器在 M11）、
+/// `attr_epoch += 1`（3.8 的缓存规则；之后这个操作里不再解析属性）。
+fn note_dir_moved(v: &mut dyn KvTxn, dir: u64) -> Result<(), ErrCode> {
+    queue_reconcile(v, dir, 2)?;
+    bump_attr_epoch(v)
 }
 
 /// 一次 rename 涉及的两个父目录：源父 `from` 与目标父 `to`（同一个目录时 `to` 为 None）。
@@ -84,14 +99,14 @@ pub fn rename(
     let mut src = child(v, parent, name)?.ok_or(ErrCode::ENOENT)?;
     let victim = child(v, new_parent, new_name)?; // 目标名字现在指向的 inode（要被覆盖或对调的）
     authz(v, c, AuthzOp::RenameFrom, None, Some(&ps.from), Some(&src))?;
-    authz(v, c, AuthzOp::RenameTo, moved(across, &src), Some(ps.to()), victim.as_ref())?;
+    authz(v, c, AuthzOp::RenameTo, dir_changing_parent(across, &src), Some(ps.to()), victim.as_ref())?;
     if src.is_dir() && across && inside(v, c, new_parent, src.ino)? {
         return Err(ErrCode::EINVAL); // 不得把目录移进自己的子树
     }
     if flags & RENAME_EXCHANGE != 0 {
         let other = victim.ok_or(ErrCode::ENOENT)?;
         authz(v, c, AuthzOp::RenameFrom, None, Some(ps.to()), Some(&other))?;
-        authz(v, c, AuthzOp::RenameTo, moved(across, &other), Some(&ps.from), Some(&src))?;
+        authz(v, c, AuthzOp::RenameTo, dir_changing_parent(across, &other), Some(&ps.from), Some(&src))?;
         let a = Side { node: src, parent, name };
         let b = Side { node: other, parent: new_parent, name: new_name };
         return exchange(v, c, ps, a, b);
@@ -110,11 +125,15 @@ pub fn rename(
             _ => {}
         }
     }
+    let moving = if across && primary(&src, parent, name) { Some(Delta::of(v, &src)?) } else { None };
     v.delete(&keys::dentry(parent, name));
     link_dentry(v, new_parent, new_name, &src);
     relink(&mut src, (parent, name), (new_parent, new_name));
     bump_ctime(&mut src, c);
     save(v, &src);
+    if let Some(d) = &moving {
+        rstat::transfer(v, c, parent, new_parent, d)?; // 计数从旧祖先链搬到新祖先链（到最近公共祖先为止，3.9）
+    }
     // 父目录的增量 (size, nlink)：源父少一项；目标父多一项（覆盖了目标就抵掉）；目录换了父目录，它的 .. 跟着走
     let dir_moves = (across && src.is_dir()) as i64;
     let (mut dsize, mut dnlink) = (1, dir_moves);
@@ -122,12 +141,17 @@ pub fn rename(
         dsize -= 1;
         if d.is_dir() {
             dnlink -= 1;
+            let gone = Delta::of(v, &d)?.neg();
+            rstat::apply(v, c, new_parent, &gone)?;
             delete_dir_records(v, d.ino)?;
         } else {
-            unlink_file(v, c, &mut d, new_parent, new_name);
+            unlink_file(v, c, &mut d, new_parent, new_name)?;
         }
     }
     ps.apply(v, c, (-1, -dir_moves), (dsize, dnlink));
+    if src.is_dir() {
+        note_dir_moved(v, src.ino)?;
+    }
     let ch = Change {
         op: "Rename",
         ino: src.ino,
@@ -151,6 +175,10 @@ fn exchange(v: &mut dyn KvTxn, c: &OpCtx, ps: Parents, mut a: Side, mut b: Side)
     if across && b.node.is_dir() && inside(v, c, a.parent, b.node.ino)? {
         return Err(ErrCode::EINVAL); // b 会被移进它自己的子树
     }
+    let share = |n: &Node, p: u64, nm: &[u8]| -> Result<Option<Delta>, ErrCode> {
+        if across && primary(n, p, nm) { Delta::of(v, n).map(Some) } else { Ok(None) }
+    };
+    let (da, db) = (share(&a.node, a.parent, a.name)?, share(&b.node, b.parent, b.name)?);
     link_dentry(v, a.parent, a.name, &b.node);
     link_dentry(v, b.parent, b.name, &a.node);
     relink(&mut a.node, (a.parent, a.name), (b.parent, b.name));
@@ -161,6 +189,15 @@ fn exchange(v: &mut dyn KvTxn, c: &OpCtx, ps: Parents, mut a: Side, mut b: Side)
     }
     let (ad, bd) = ((across && a.node.is_dir()) as i64, (across && b.node.is_dir()) as i64);
     ps.apply(v, c, (0, bd - ad), (0, ad - bd));
+    if let Some(d) = &da {
+        rstat::transfer(v, c, a.parent, b.parent, d)?;
+    }
+    if let Some(d) = &db {
+        rstat::transfer(v, c, b.parent, a.parent, d)?;
+    }
+    for n in [&a.node, &b.node].into_iter().filter(|n| n.is_dir()) {
+        note_dir_moved(v, n.ino)?;
+    }
     let (ino, size) = (a.node.ino, a.node.rec.size);
     let (parent, name, new_parent, new_name) = (a.parent, a.name, b.parent, b.name);
     let ch = Change { op: "Rename", ino, parent, name, new_parent, new_name, size, ..Default::default() };

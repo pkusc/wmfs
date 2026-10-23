@@ -9,9 +9,12 @@
 //! - **cap**：用到 80% 时 `RenewCap`（经已打开的句柄，ADR-0036：属主不看权限位）；续回来的 cap 的 epoch 与手上的 layout 不同 =
 //!   layout 已经变了 → `STALE_LAYOUT`（调用方重新 Open）。数据节点回 `BAD_CAP` 时续一次再试，再失败 → `EACCES`（8.7，
 //!   [`FileClient::with_cap`]：读、写、截断、SyncChunks 都经它）。
-//! - **重新 Open**（`STALE_LAYOUT` 之后，C4）：只换上 layout、cap 与属性，不前进"见过的 change_id"（`inode.rs`）。
+//! - **重新取 layout**（`STALE_LAYOUT` 之后，C4）：只换上 layout、cap 与属性，不前进"见过的 change_id"（`inode.rs`）；写句柄用
+//!   `ReopenHandle`（M7，ADR-0037 第 4 条），读与按路径截断用 `Open`。
 //! - **目录句柄** = opendir 时按名字分页读出的完整快照（readdir 的 offset = 快照下标；POSIX 允许 readdir 反映某个快照），带属性
-//!   （readdirplus 用）；前面补上 `.` 与 `..`（`..` 的 inode 号用目录自己的：服务端不存父目录项，内核也不靠它）。
+//!   （readdirplus 用）；前面补上 `.` 与 `..`。实现注记（M7，ADR-0037 第 13 条）：`..` 的 inode 号是父目录（不改协议：客户端在
+//!   lookup、mkdir、readdirplus 与自己的 rename 时记下目录的父目录，[`FileClient::note_parent`]）；根目录的 `..` 是它自己；不知道时
+//!   （极少）沿用目录自己的并写 debug 日志。M6 的 `..` 一律是目录自己。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +32,7 @@ use crate::hooks::manifest::Hook;
 use crate::hooks::pipeline::HookCall;
 use crate::hooks::traits::CacheStore;
 use crate::meta::attrs::CONSISTENCY_STRONG;
+use crate::meta::schema::keys::ROOT_INO;
 use crate::meta::schema::records::KIND_DIR;
 use crate::proto::cap;
 use crate::proto::meta::{AttrOut, DirEntryOut, MetaOp, MetaReply, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, OpenOut};
@@ -59,6 +63,7 @@ pub struct FileClient {
     pub(super) inodes: Mutex<HashMap<u64, Arc<Inode>>>,
     handles: Mutex<HashMap<u64, Handle>>,
     dirs: Mutex<HashMap<u64, Arc<Vec<DirEntryOut>>>>, // 目录句柄 → 快照
+    parents: Mutex<HashMap<u64, u64>>,                // 目录 → 它的父目录（快照里 `..` 的 inode 号，见文件头）
     next_fh: AtomicU64,                               // 文件句柄与目录句柄共用这一个计数（不会撞号）
     pub(super) delta: Mutex<OpenDelta>,
     pub(super) slots: Slots,
@@ -83,6 +88,7 @@ impl FileClient {
             inodes: Mutex::default(),
             handles: Mutex::default(),
             dirs: Mutex::default(),
+            parents: Mutex::default(),
             next_fh: AtomicU64::new(1),
             delta: Mutex::default(),
             slots,
@@ -207,6 +213,7 @@ impl FileClient {
 
     /// 内核忘掉了这个 inode（FUSE forget）：没有句柄、也没有脏数据时丢掉它的状态（连同"见过的 change_id"）与它在 cache_store 里的块。
     pub fn forget(&self, ino: u64) {
+        lock(&self.parents).remove(&ino);
         let mut m = lock(&self.inodes);
         let idle = m.get(&ino).is_some_and(|i| {
             let st = lock(&i.st);
@@ -236,28 +243,31 @@ impl FileClient {
         }
     }
 
-    /// 重新 Open 取最新的 layout、cap 与属性（C4：`STALE_LAYOUT` 之后），只换上、不前进"见过的 change_id"。写：先试读写打开（顺便
-    /// 拿到读权限与 inline 内容），没有读权限再试只写。打不开（例如属主经句柄写一个 0444 文件时 layout 恰好变了）→ `ESTALE`
-    /// （8.7："layout 无法刷新"）。
-    pub(super) fn reopen(&self, inode: &Inode, who: &Caller, write: bool) -> Result<(), ErrCode> {
-        let flags = if write { O_RDWR } else { O_RDONLY };
-        let r = match self.meta.read(who, MetaOp::Open { ino: inode.ino, flags }) {
-            Err(ErrCode::EACCES) if write => self.meta.read(who, MetaOp::Open { ino: inode.ino, flags: O_WRONLY }),
-            r => r,
+    /// 重新取最新的 layout、cap 与属性（C4：`STALE_LAYOUT` 之后），只换上、不前进"见过的 change_id"。`how`：经写句柄
+    /// （写回、同步写、ftruncate）→ `ReopenHandle{write}`（ADR-0037 第 4 条：属主不看权限位，所以属主经句柄写一个 0444 文件时
+    /// 碰上 layout 变化也照常重写进新 epoch；实现注记（M7）：以前只能 Open，回 `ESTALE`）；读 → `Open(O_RDONLY)`；按路径截断
+    /// （没有写句柄）→ `Open`，照常按当前权限：先试读写打开（顺便拿到读权限与 inline 内容），没有读权限再试只写。被授权拒绝
+    /// → 原样回 `EACCES`（8.7 的 M7 注记：与 ADR-0036 的"其他用户之后可能 EACCES"一致；M6 把它映射成 `ESTALE`）。
+    pub(super) fn reopen(&self, inode: &Inode, who: &Caller, how: Reopen) -> Result<(), ErrCode> {
+        let ino = inode.ino;
+        let r = match how {
+            Reopen::Handle => self.meta.read(who, MetaOp::ReopenHandle { ino, write: true }),
+            Reopen::Read => self.meta.read(who, MetaOp::Open { ino, flags: O_RDONLY }),
+            Reopen::Path => match self.meta.read(who, MetaOp::Open { ino, flags: O_RDWR }) {
+                Err(ErrCode::EACCES) => self.meta.read(who, MetaOp::Open { ino, flags: O_WRONLY }),
+                r => r,
+            },
         };
-        let o = expect_open_out(r).map_err(|e| if e == ErrCode::EACCES { ErrCode::ESTALE } else { e })?;
+        let o = expect_open_out(r)?;
         lock(&inode.st).install(&o);
         Ok(())
     }
 
     /// `STALE_LAYOUT` 之后（C4）：写一行日志，再 [`reopen`](Self::reopen)。
-    pub(super) fn stale(&self, inode: &Inode, who: &Caller, write: bool) -> Result<(), ErrCode> {
-        let what = if write { "重写" } else { "读" };
-        log::info(
-            "client",
-            format_args!("ino {}：layout 变了（STALE_LAYOUT），重新 Open 取新 layout 再{what}", inode.ino),
-        );
-        self.reopen(inode, who, write)
+    pub(super) fn stale(&self, inode: &Inode, who: &Caller, how: Reopen) -> Result<(), ErrCode> {
+        let what = if how == Reopen::Read { "读" } else { "重写" };
+        log::info("client", format_args!("ino {}：layout 变了（STALE_LAYOUT），重新取 layout 再{what}", inode.ino));
+        self.reopen(inode, who, how)
     }
 
     /// 带写（或读）权限的 cap；用到 80% 了先 `RenewCap`。
@@ -307,13 +317,29 @@ impl FileClient {
         }
     }
 
-    /// opendir：读出完整的目录快照（按名字分页，每页 1024 条、带属性），前面补 `.` 与 `..`；返回目录句柄。
+    /// 记下目录 `dir` 的父目录（lookup、mkdir、readdirplus 与自己的 rename 时；只对目录记，内核 forget 时一起丢）。
+    pub fn note_parent(&self, dir: u64, parent: u64) {
+        lock(&self.parents).insert(dir, parent);
+    }
+
+    /// opendir：读出完整的目录快照（按名字分页，每页 1024 条、带属性），前面补 `.` 与 `..`；返回目录句柄。`..` 是父目录
+    /// （根目录的是它自己；不知道时——极少，例如别的客户端刚移动了它——沿用目录自己的，写一行 debug 日志）；快照里的子目录顺便
+    /// 记下父目录。实现注记（M7，ADR-0037 第 13 条）：M6 的 `..` 一律是目录自己。
     pub fn open_dir(&self, who: &Caller, ino: u64) -> Result<u64, ErrCode> {
         let MetaReply::Entry { attr: me } = self.meta.read(who, MetaOp::GetAttr { ino })? else {
             return Err(ErrCode::INTERNAL);
         };
-        let dot = |name: &[u8]| DirEntryOut { name: name.to_vec(), ino, kind: KIND_DIR, attr: Some(me.clone()) };
-        let mut all = vec![dot(b"."), dot(b"..")];
+        let up = if ino == ROOT_INO { Some(ROOT_INO) } else { lock(&self.parents).get(&ino).copied() };
+        let up = up.unwrap_or_else(|| {
+            log::debug("client", format_args!("目录 {ino} 的父目录不知道：快照里的 .. 先用它自己"));
+            ino
+        });
+        // fuser 的 readdirplus 用属性里的 ino 填 d_ino（内核对 . 与 .. 不用别的属性），所以 .. 的属性换上父目录的号
+        let dot = |name: &[u8], ino| {
+            let attr = Some(AttrOut { ino, ..me.clone() });
+            DirEntryOut { name: name.to_vec(), ino, kind: KIND_DIR, attr }
+        };
+        let mut all = vec![dot(b".", ino), dot(b"..", up)];
         let mut after = Vec::new();
         loop {
             let op = MetaOp::ReadDir { ino, after: after.clone(), limit: 1024, plus: true };
@@ -324,6 +350,11 @@ impl FileClient {
                 break;
             }
         }
+        let mut parents = lock(&self.parents);
+        for e in all[2..].iter().filter(|e| e.kind == KIND_DIR) {
+            parents.insert(e.ino, ino);
+        }
+        drop(parents);
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         lock(&self.dirs).insert(fh, Arc::new(all));
         Ok(fh)
@@ -338,6 +369,14 @@ impl FileClient {
     pub fn close_dir(&self, fh: u64) {
         lock(&self.dirs).remove(&fh);
     }
+}
+
+/// layout 变了之后怎么重新取它（[`FileClient::reopen`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reopen {
+    Handle, // 经写句柄：ReopenHandle（属主不看权限位）
+    Read,   // 读：Open(O_RDONLY)
+    Path,   // 按路径截断：Open，按当前权限
 }
 
 /// 回复应当是 `Opened(OpenOut)`（Open、Create、改长度的 SetAttr/TruncateHandle、Uninline）。

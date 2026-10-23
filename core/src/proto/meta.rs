@@ -11,6 +11,8 @@
 //! `GetInline` 仍只给能读的人）。
 //! 实现注记（M6）：`MetaOp::TruncateHandle { ino, size, epoch_seen }` 按 ADR-0036 追加在末尾（金样 `MetaOp.TruncateHandle`）：
 //! 经已打开的写句柄改长度（FUSE 的 setattr 带写句柄）；与 `SetAttr { size }` 走同一段代码，只是授权用 `AuthzOp::Handle`。
+//! 实现注记（M7）：`MetaOp::ReopenHandle { ino, write }` 按 ADR-0037 第 4、12 条追加在末尾（金样 `MetaOp.ReopenHandle`）：`Open` 的
+//! "经已打开的句柄"版本——layout 变了（3.1.4 C4）之后写句柄用它重新取 layout 与 cap，属主不看权限位（ADR-0036）。
 
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +105,8 @@ pub enum MetaOp {
     Uninline { ino: u64 },                                               // 服务端把 inline 内容搬进 chunk：要写权限；幂等；只读路径、seq 0；回 Opened
     // ---- ADR-0036（M6 追加，只增不改）----
     TruncateHandle { ino: u64, size: u64, epoch_seen: u32 },             // 经已打开的写句柄改长度（ftruncate）：同 SetAttr{size}，授权用 AuthzOp::Handle；回 Opened
+    // ---- ADR-0037 第 4、12 条（M7 追加，只增不改）----
+    ReopenHandle { ino: u64, write: bool },                              // Open 的经句柄版本（C4 给写句柄重新取 layout）：授权用 AuthzOp::Handle；只读路径、seq 0；回 Opened
 }
 
 impl MetaOp {
@@ -144,6 +148,7 @@ impl MetaOp {
             MetaOp::DebugGet { .. } => "DebugGet",
             MetaOp::Uninline { .. } => "Uninline",
             MetaOp::TruncateHandle { .. } => "TruncateHandle",
+            MetaOp::ReopenHandle { .. } => "ReopenHandle",
         }
     }
 }

@@ -7,11 +7,13 @@
 //! M5：数据面——打开 node.toml 里的 target（超级块核对、清空 `p/`、`t/`）、DataCall 服务与 16 个 io 线程、服务端之间的 RPC 客户端
 //! （服务端身份 key 0）（[`open_data`]），监听之后起 target 心跳、给 Uninline 与后台任务共用的数据面客户端、后台调度器
 //! （[`start_background`]）。
+//! M7：管理 API 拿到元数据引擎（属性、用量、声明 vs 实际、changelog……）；启动时插件 manifest 里的属性名与属性注册表对账。
 //! 信号（design.md 0.2 第 4 条）：main 在**创建任何线程之前** `sys::block_signals(&[SIGTERM, SIGINT])`，
 //! 调用 `start` 之后 `sys::wait_signals(..)`，收到后 [`Running::stop`] 再退出。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use raft::StateRole;
 use wmfs_api::hex::hex;
@@ -30,6 +32,7 @@ use crate::hooks::pipeline::Pipeline;
 use crate::hooks::registry::PluginSet;
 use crate::hooks::traits::{CODEC_REPLICA, KeyLookup};
 use crate::init::{NodeFile, read_master};
+use crate::meta::attr_registry;
 use crate::meta::cluster::cluster_mgr;
 use crate::meta::engine::txn::{MetaEngine, RoleInfo};
 use crate::meta::engine::{self, EmbeddedEngine, EngineOpts};
@@ -72,6 +75,9 @@ pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &st
     let pool = MemPool::new(&cfg.mem)
         .map_err(|e| format!("内存池创建失败（node.toml [mem]，共 {} MiB）：{e}", cfg.mem.total_bytes() >> 20))?;
     let pipeline = Arc::new(Pipeline::new(plugins));
+    for (name, attrs) in pipeline.consumed_attrs() {
+        attr_registry::check_manifest_attrs(name, attrs)?; // 与属性注册表对账（3.8，M7）
+    }
     let opts = EngineOpts {
         node_id: node.node_id,
         plugins: plugin_list,
@@ -130,7 +136,14 @@ pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &st
     let pid_file = data_dir.join("run/server.pid");
     sys::atomic_write(&pid_file, format!("{}\n", std::process::id()).as_bytes())
         .map_err(|e| format!("写 {} 失败：{e}", pid_file.display()))?;
-    let ctx = MgmtCtx { health, role: Some(role), keys, failpoints_api: cfg.failpoints_api };
+    let ctx = MgmtCtx {
+        health,
+        role: Some(role),
+        keys,
+        failpoints_api: cfg.failpoints_api,
+        meta: Some(meta.clone()), // 依赖元数据的端点（M7）
+        polls: AtomicUsize::new(0),
+    };
     if let Err(e) = mgmt.start(Arc::new(ctx)) {
         let _ = std::fs::remove_file(&pid_file);
         return Err(format!("管理 API 启动失败：{e}"));

@@ -4,7 +4,9 @@
 //! - 冒烟：目录、文件、改名、符号链接、硬链接、xattr、截断、删除；
 //! - inline 与 chunk 文件（`wmfs fs stat --json` 核对：≤ 64 KiB 只在元数据里，更大的按 4 MiB 的 chunk 存）；
 //! - `kill -9` / 重启：fsync 过的数据在服务端被 `kill -9`、重启之后完整，挂载进程在服务端不在的这段时间里自己重试（不报错）；
-//! - 属性 set/get 在 M7 才有；pjdfstest、fio verify、fsx 在容器里跑（`scripts/profiles.sh minimal`，没有镜像时显示 SKIP）。
+//! - 属性（M7）：在挂载点下的目录上 `wmfs set chunk=1M,replicas=1`（没有警告：只有 1 个故障域、声明也是 1 副本），新文件按 1 MiB 的
+//!   chunk 存，`wmfs get` 的来源与 `semantics:` 一行（replicas 声明 1/实际 1），`wmfs usage` 的字节数等于写进去的；
+//! - pjdfstest、fio verify、fsx 在容器里跑（`scripts/profiles.sh minimal`，没有镜像时显示 SKIP）。
 //!
 //! 用的是开发集群的固定端口 19100/19180，所以是 `#[ignore]`：只由 `scripts/profiles.sh minimal`（`scripts/accept.sh M6` 调用它）跑。
 //! 实现注记（M6）：这个文件是 cli 包的 `[[test]]`（`path = "../tests/profiles/minimal.rs"`）——要用 `CARGO_BIN_EXE_wmfs`。
@@ -78,6 +80,17 @@ fn minimal_profile_smoke() {
     let s = stat_json(&dir, "/a/chunked");
     assert!(s.contains("\"inline\":false") && s.contains("\"chunk_size\":4194304"), "大文件按 chunk 存：{s}");
     assert!(s.contains("\"replicas\":1"), "default 类 1 副本：新文件的 layout 声明 1 副本：{s}");
+    // 目录属性（M7）：挂载点下的路径由 CLI 换算
+    std::fs::create_dir(mp.join("attrs")).unwrap();
+    let d = mp.join("attrs");
+    let set = wmfs(&dir, &["set", d.to_str().unwrap(), "chunk=1M,replicas=1", "--json"]);
+    assert!(set.contains("\"warnings\":[\"class、replicas"), "1 个故障域、声明 1 副本：只有\"已有文件\"的提醒：{set}");
+    std::fs::write(d.join("f"), &big).unwrap();
+    assert!(stat_json(&dir, "/attrs/f").contains("\"chunk_size\":1048576"), "新文件按目录属性的 chunk");
+    let get = wmfs(&dir, &["get", d.to_str().unwrap()]);
+    assert!(get.contains("chunk=1M") && get.contains("来自 /attrs") && get.contains("replicas:声明1/实际1"), "{get}");
+    let usage = wmfs(&dir, &["usage", d.to_str().unwrap(), "--json"]);
+    assert!(usage.contains(&format!("\"bytes\":{}", big.len())), "递归用量：{usage}");
     // kill -9 / 重启：fsync 过的数据完整
     let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 253) as u8).collect();
     let mut f = std::fs::File::create(mp.join("durable")).unwrap();

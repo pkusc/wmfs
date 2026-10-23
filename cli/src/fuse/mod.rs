@@ -87,7 +87,7 @@ fn mount(a: MountArgs) -> Result<(), String> {
     }
     let mp = std::fs::canonicalize(&a.mountpoint).map_err(|e| format!("挂载点 {}：{e}", a.mountpoint.display()))?;
     let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    if parse_mountinfo(&text).iter().any(|(m, t)| *m == mp.display().to_string() && t == "fuse.wmfs") {
+    if parse_mountinfo(&text).iter().any(|m| m.point == mp.display().to_string() && m.fstype == "fuse.wmfs") {
         return Err(format!("{} 上已经挂着 wmfs（先 wmfs umount {}）", mp.display(), mp.display()));
     }
     let kp = a.key_file.clone().unwrap_or_else(|| home().join(".config/wmfs/client.key"));

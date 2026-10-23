@@ -6,7 +6,8 @@
 //! 到了就不再从队列取，没取的请求留给下一批。回复在批次有了确定结果之后才发出（规则 2，`settle`）：`Applied{ok: true}` →
 //! 各自的结果；批次作废或没进日志 → `RETRY`（客户端用同一个 seq 重试）；结果不确定 → `NOT_LEADER`（去重表兜底）。
 //! 每个批次开始时从批次的读事务里取一份集群图快照（`OpCtx.map`，按 map_epoch 缓存）：placement 读它，所以生成了新链的
-//! 操作之后本批结束（规则 5），下一批的快照里就有新链。
+//! 操作之后本批结束（规则 5），下一批的快照里就有新链。实现注记（M7）：批次没有成功应用（作废、丢失、没进日志、fail point）时清空
+//! 目录属性的解析缓存——它可能装着按这一批的覆盖层算出的项（`meta/attrs.rs` 的文件头）。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -64,6 +65,7 @@ pub(crate) fn run(rx: Receiver<TxnRequest>, shared: Arc<EngineShared>) {
             continue;
         }
         if let Err(c) = fail_point("meta.exec.before_propose") {
+            shared.env.attrs.clear(); // 这一批的覆盖层作废：按它算出的属性缓存也作废（meta/attrs.rs 的文件头）
             results.into_iter().for_each(|e| (e.done)(Err(ErrCode(c))));
             continue;
         }
@@ -73,6 +75,9 @@ pub(crate) fn run(rx: Receiver<TxnRequest>, shared: Arc<EngineShared>) {
         let t0 = Instant::now();
         let outcome = shared.propose_and_wait(&wb); // 阻塞到 raft 线程给出 Applied/Lost/Dropped（raft 线程保证必有其一）
         shared.observe_batch(n, bytes, t0.elapsed());
+        if outcome != (ProposeOutcome::Applied { ok: true }) {
+            shared.env.attrs.clear(); // 批次没有（或不确定有没有）应用：按它的覆盖层算出的属性缓存作废
+        }
         for e in results {
             (e.done)(settle(outcome, e.result));
         }

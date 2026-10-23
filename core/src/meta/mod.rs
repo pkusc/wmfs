@@ -8,12 +8,16 @@
 //! - [`sessions`]：客户端会话（M4：open / heartbeat / close；驱逐在 M10）
 //! - [`changelog`]：changelog 写入（M4）
 //! - [`cluster`]：集群图与集群警告、链的生成、cluster-mgr 线程（M4 起）
-//! - [`attrs`]：目录属性解析（M4 只有内置默认值；继承在 M7）
+//! - [`attrs`]：目录属性解析（M4 只有内置默认值；M7：继承、来源、按 attr_epoch 的缓存）
+//! - [`attr_registry`]：属性注册表与服务端切分（M7）；[`attr_ops`]：设置、删除、查询、用量、声明 vs 实际（M7，管理 API 用）
+//! - [`rstat`]：递归用量计数（M7）
 //! - [`uninline`]：服务端把 inline 小文件转成 chunk（M5，ADR-0034）
 //! - [`gc_meta`]：GC 记录的元数据一侧（gc 任务用，M5）
 //!
-//! 递归用量与配额（rstat、quota，M7、M10）、锁（M12）随里程碑加入。
+//! 配额（quota，M10）、锁（M12）随里程碑加入。
 
+pub mod attr_ops;
+pub mod attr_registry;
 pub mod attrs;
 pub mod changelog;
 pub mod cluster;
@@ -21,6 +25,7 @@ pub mod engine;
 pub mod gc_meta;
 pub mod ns;
 pub mod raft;
+pub mod rstat;
 pub mod schema;
 pub mod service;
 pub mod sessions;

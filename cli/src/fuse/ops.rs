@@ -10,6 +10,8 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request, TimeOrNow,
 };
 use wmfs_core::base::{ErrCode, log};
+use wmfs_core::client::meta_client::Caller;
+use wmfs_core::meta::schema::records::KIND_DIR;
 use wmfs_core::proto::meta::{AttrOut, MetaOp, MetaReply, SetAttrIn, TimeSet};
 
 use super::WmfsFs;
@@ -36,6 +38,21 @@ impl WmfsFs {
             Ok(_) => reply.error(Errno::EIO),
             Err(e) => reply.error(errno(e)),
         }
+    }
+
+    /// lookup / mkdir 的回复是目录 → 记下它的父目录（readdir 快照里 `..` 的 inode 号，ADR-0037 第 13 条）。
+    pub(super) fn note_dir(&self, parent: u64, r: Result<MetaReply, ErrCode>) -> Result<MetaReply, ErrCode> {
+        if let Ok(MetaReply::Entry { attr }) = &r
+            && attr.kind == KIND_DIR
+        {
+            self.fc.note_parent(attr.ino, parent);
+        }
+        r
+    }
+
+    /// 自己的 rename 把 `dir/name` 移到了另一个目录：查一下它是不是目录，是就记下新的父目录（查不到就算了：下次 lookup 会记）。
+    pub(super) fn note_moved_dir(&self, who: &Caller, dir: u64, n: &OsStr) {
+        let _ = self.note_dir(dir, self.fc.meta.read(who, MetaOp::Lookup { parent: dir, name: name(n) }));
     }
 
     pub(super) fn empty(&self, reply: ReplyEmpty, r: Result<(), ErrCode>) {

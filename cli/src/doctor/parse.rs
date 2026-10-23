@@ -21,15 +21,25 @@ pub fn parse_kernel(rel: &str) -> Option<(u32, u32)> {
     Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
 }
 
-/// /proc/self/mountinfo → [(挂载点, 文件系统类型)]。挂载点里的空格、制表符、换行、反斜杠在 mountinfo 里写成 `\040`、`\011`、
-/// `\012`、`\134`，这里解回来。
-pub fn parse_mountinfo(text: &str) -> Vec<(String, String)> {
+/// /proc/self/mountinfo 的一行里用得到的部分。
+#[derive(Debug, PartialEq, Eq)]
+pub struct MountLine {
+    pub point: String,  // 挂载点（八进制转义已经解回来）
+    pub fstype: String, // 例如 ext4、fuse.wmfs，容器里以 root 直接挂载的 wmfs 是 fuse
+    pub source: String, // 挂载来源，例如 /dev/nvme0n1p2、wmfs:c1c1c1c1（没有就是空）
+}
+
+/// /proc/self/mountinfo → 每个挂载一项。挂载点里的空格、制表符、换行、反斜杠在 mountinfo 里写成 `\040`、`\011`、`\012`、`\134`，
+/// 这里解回来。
+pub fn parse_mountinfo(text: &str) -> Vec<MountLine> {
     text.lines()
         .filter_map(|l| {
             let (left, right) = l.split_once(" - ")?;
-            let mp = left.split(' ').nth(4)?;
-            let fstype = right.split(' ').next()?;
-            Some((unescape_octal(mp), fstype.to_string()))
+            let point = unescape_octal(left.split(' ').nth(4)?);
+            let mut r = right.split(' ');
+            let fstype = r.next()?.to_string();
+            let source = r.next().unwrap_or("").to_string();
+            Some(MountLine { point, fstype, source })
         })
         .collect()
 }
@@ -81,8 +91,8 @@ mod tests {
         let mi = "29 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n\
                   90 29 0:50 / /home/u/wmfs-mnt rw,nosuid shared:2 - fuse.wmfs wmfs:c1c1c1c1 rw,user_id=1000\n";
         let m = parse_mountinfo(mi);
-        assert_eq!(m[0], ("/".to_string(), "ext4".to_string()));
-        assert_eq!(m[1].1, "fuse.wmfs");
+        assert_eq!((m[0].point.as_str(), m[0].fstype.as_str()), ("/", "ext4"));
+        assert_eq!((m[1].fstype.as_str(), m[1].source.as_str()), ("fuse.wmfs", "wmfs:c1c1c1c1"));
         assert_eq!(uid_from_status("Name:\tx\nUid:\t1000\t1000\t1000\t1000\n"), Some(1000));
         assert!(!fuse_conf_allows_other("# user_allow_other\n"));
         assert!(fuse_conf_allows_other("mount_max = 1000\n user_allow_other \n"));

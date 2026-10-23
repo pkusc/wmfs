@@ -290,6 +290,16 @@ impl PluginSet {
         Ok(())
     }
 
+    /// 有没有已启用的插件在 manifest 的 `attrs` 里声明消费目录属性 `key`（3.8"必须有插件消费"，M7）。
+    pub fn consumes(&self, key: &str) -> bool {
+        self.all().iter().any(|(_, m)| m.attrs.contains(&key))
+    }
+
+    /// 全部已启用插件的 (名字, 消费的属性)（启动时与属性注册表对账，3.8）。
+    pub fn consumed_attrs(&self) -> Vec<(&'static str, &'static [&'static str])> {
+        self.all().iter().map(|(_, m)| (m.name, m.attrs)).collect()
+    }
+
     /// 本节点会影响策略的插件清单（3.7.2 第 1 条）：8 个钩子上启用的插件各一条 `"钩子:名字"`，排序；只比名字、不比版本。
     pub fn plugin_list(&self) -> PluginListV1 {
         let mut plugins: Vec<String> = self

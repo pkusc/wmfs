@@ -22,7 +22,8 @@ use crate::meta::schema::records::{KvOp, PluginListV1, WriteBatchV1, decode_v1};
 pub(super) struct AppliedEntry {
     index: u64,
     term: u64,
-    ok: bool,
+    ok: bool,        // 批次应用了（空条目、作废的批次为 false）
+    changelog: bool, // 这个批次写了 changelog（0x0E）：提交之后唤醒长轮询
 }
 
 impl Driver {
@@ -34,20 +35,21 @@ impl Driver {
         let _ = fail_point("raft.apply.before");
         let mut out = Vec::with_capacity(ents.len());
         for e in ents {
-            let ok = match e.get_entry_type() {
+            let mut a = AppliedEntry { index: e.index, term: e.term, ok: false, changelog: false };
+            match e.get_entry_type() {
                 // 新 leader 的空条目，或被 raft-rs 改写成空条目的 conf change（坑 P4 的反面、P21）
-                EntryType::EntryNormal if e.data.is_empty() => false,
-                EntryType::EntryNormal => self.apply_batch(tx, &e),
+                EntryType::EntryNormal if e.data.is_empty() => {}
+                EntryType::EntryNormal => self.apply_batch(tx, &e, &mut a),
                 EntryType::EntryConfChangeV2 => {
                     self.apply_conf_change(tx, &e);
-                    true
+                    a.ok = true;
                 }
                 EntryType::EntryConfChange => {
                     panic!("wmfs 只提议 ConfChangeV2，日志里出现了 v1 EntryConfChange（index {}，坑 P22）", e.index)
                 }
-            };
+            }
             (self.applied.index, self.applied.term) = (e.index, e.term);
-            out.push(AppliedEntry { index: e.index, term: e.term, ok });
+            out.push(a);
         }
         or_abort(storage::put_state(tx, KEY_APPLIED, &self.applied.encode()), "写 applied"); // 与 KV 同事务
         out
@@ -55,17 +57,20 @@ impl Driver {
 
     /// 一个批次：`expect_version == state_version` 才应用并令 `state_version = index`；不等则整批跳过
     /// （所有副本看到同样的日志、做同样的判断，所以是确定性的，3.4.1.5）。follower 只做"按顺序应用 ops"，没有业务逻辑。
-    fn apply_batch(&mut self, tx: &WriteTransaction, e: &Entry) -> bool {
+    /// 应用了 → `a.ok = true`；批次里写了 changelog → `a.changelog = true`。
+    fn apply_batch(&mut self, tx: &WriteTransaction, e: &Entry, a: &mut AppliedEntry) {
         let wb = WriteBatchV1::decode(&e.data)
             .unwrap_or_else(|c| panic!("不变量破坏：已提交的 raft 条目 {} 无法解码为 WriteBatchV1（{c}）", e.index));
         if wb.expect_version != self.applied.state_version {
             self.metrics.stale.inc();
             let (want, have) = (wb.expect_version, self.applied.state_version);
             log::warn("raft", format_args!("批次 {} 作废：expect_version {want} ≠ state_version {have}", e.index));
-            return false;
+            return;
         }
         let plugins_key = keys::global(keys::G_PLUGINS);
         let mut plugins_changed = None;
+        a.changelog =
+            wb.ops.iter().any(|op| matches!(op, KvOp::Put { key, .. } if key.first() == Some(&keys::T_CHANGELOG)));
         {
             let mut kv = or_abort(tx.open_table(KV), "打开 kv");
             for op in &wb.ops {
@@ -89,7 +94,7 @@ impl Driver {
             self.check_plugins(c.as_ref()); // 集群插件清单变了：重新比对（3.7.2）
         }
         self.applied.state_version = e.index;
-        true
+        a.ok = true;
     }
 
     /// conf change：空 data = raft-rs 自动发起的 leave-joint，必须应用（坑 P4）；新的 ConfState 与条目同事务落盘（坑 P5）。
@@ -121,8 +126,11 @@ impl Driver {
             }
         }
         // 集群图缓存按 GLOBAL map_epoch 失效（改变集群图的批次都在同一批次里 map_epoch += 1，读者每次比对它，
-        // meta/cluster/map.rs），这里不用另外通知。实现注记（M4）：changelog 的长轮询（GET /api/v1/changelog）在 M7，
-        // 到时在这里"写入了 changelog（0x0E）就唤醒长轮询等待者"
+        // meta/cluster/map.rs），这里不用另外通知。实现注记（M7）：写了 changelog（0x0E）的批次 → 唤醒 changelog 长轮询的
+        // 等待者（ADR-0033 第 9 条；写事务已经提交，它们新开的读事务看得到）
+        if applied.iter().any(|a| a.changelog) {
+            self.published.changelog_applied();
+        }
     }
 
     /// 日志压缩（3.4.1.8，3.2.6 的写入规则 M3）：每应用 10 000 条检查一次，压缩点 C = durable_applied − 10 000（给慢 follower 留余量）。

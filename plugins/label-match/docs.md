@@ -17,7 +17,9 @@
 
 ## 配置
 
-没有部署参数：存储类（`class`）、副本数（`replicas`）、条带数（`stripe`）、`locality` 都是目录属性。
+没有部署参数：存储类（`class`）、副本数（`replicas`）、条带数（`stripe`）、`locality` 都是目录属性。M7 起 `class`、`replicas`、`stripe` 可以
+`wmfs set`（它们由这个插件消费：停用它之后设置这几个属性会被拒绝，"没有已启用的插件消费"）；可用的链不够 `stripe` 条、故障域不够
+`replicas` 个时设置照样成功、给出警告（ADR-0016）；`locality` 在 M13。
 
 ## 诚实说明
 

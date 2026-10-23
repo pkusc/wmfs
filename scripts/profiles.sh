@@ -5,7 +5,7 @@
 #     ① cargo 的 profile_minimal 冒烟（tests/profiles/minimal.rs：自己起集群、挂载、inline 与 chunk 文件、kill -9 / 重启后 fsync 过的
 #        数据完整……）；
 #     ② 再起一个同样的部署，在 wmfs-tools 容器里跑 fio verify、pjdfstest 子集、fsx（没有镜像 → SKIP，不算通过也不算失败）。
-#     属性 set/get 在 M7 加入。
+#     M7 起冒烟里有目录属性的 set/get 与递归用量。
 #   nas-safe（M9 起）、hpc-rdma（有 Soft-RoCE 时）还没有。
 # 输出：每项一行 ✓ / ✗ / SKIP，最后一行 "minimal PASS" 或 "minimal FAIL"。用开发集群的端口 19100/19180（要空闲），开发目录是临时的，
 # 结束时 wmfs dev down --purge（先卸载挂载、再停节点），不留挂载与进程。
@@ -27,13 +27,12 @@ bad() {
 case "$PROFILE" in
 minimal)
     if cargo test --release -p wmfs --test profile_minimal -- --ignored >/tmp/wmfs-profile-$$.log 2>&1; then
-        ok "冒烟：目录与文件、改名、链接、截断、inline 与 chunk 文件、kill -9 / 重启后 fsync 过的数据完整"
+        ok "冒烟：目录与文件、改名、链接、截断、inline 与 chunk 文件、目录属性 set/get 与递归用量、kill -9 / 重启后 fsync 过的数据完整"
     else
         tail -30 /tmp/wmfs-profile-$$.log
         bad "冒烟（cargo test -p wmfs --test profile_minimal -- --ignored）"
     fi
     rm -f /tmp/wmfs-profile-$$.log
-    echo "SKIP 属性 set/get（原因：目录属性在 M7）"
     if docker image inspect wmfs-tools >/dev/null 2>&1; then
         dev="$(mktemp -d "${TMPDIR:-/tmp}/wmfs-profile-dev-XXXX")"
         export WMFS_DEV_DIR="$dev"

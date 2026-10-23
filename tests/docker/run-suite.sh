@@ -6,6 +6,8 @@
 #   run-suite.sh fsx <次数> [fsx 的其余参数…]   xfstests 的 fsx（随机读写、截断、mmap，与内存模型比对）；例如 `-l 65536`：文件一直
 #                               不超过 64 KiB（全程 inline，内容常比长度短）
 #   run-suite.sh fio            fio 顺序写 + verify=crc32c（冒烟）
+#   run-suite.sh pathmap        M7：以 root 直接挂载时 mountinfo 里的类型是 fuse（不是 fuse.wmfs），`wmfs get <挂载点下的路径>` 照样按
+#                               来源 wmfs: 认出挂载点、读 user.wmfs.mgmt 找到集群（ADR-0037 第 10 条）；读用 client key 就行
 set -u
 SUITE="${1:-}"
 MNT=/mnt/wmfs
@@ -48,6 +50,16 @@ fsx)
     shift 2 2>/dev/null || shift $#
     /opt/xfstests/ltp/fsx -q -N "$n" -S 42 "$@" fsx.data; rc=$?
     echo "FSX-RC $rc"
+    ;;
+pathmap)
+    # 要测的正是"类型是 fuse（不是 fuse.wmfs）"这种挂载：没测到它就不算通过
+    type_ok=1
+    grep -E " $MNT .* - fuse wmfs:" /proc/self/mountinfo || { echo "（这个挂载的类型不是 fuse：没测到要测的情况）"; type_ok=0; }
+    out="$(wmfs get "$WORK" --json --key-file /root/.config/wmfs/client.key)"; rc=$?
+    echo "$out"
+    printf '%s' "$out" | grep -q "\"dir\":\"/suite-pathmap-" || rc=1
+    [ "$type_ok" -eq 1 ] || rc=1
+    echo "PATHMAP-RC $rc"
     ;;
 fio)
     fio --name=verify --filename=fio.data --size=256M --bs=1M --rw=write --verify=crc32c --do_verify=1 \

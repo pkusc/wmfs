@@ -22,7 +22,7 @@
 //!   design.md 8.1 的注记）。
 
 use super::data_client::{DataClient, chunk_id};
-use super::files::{FileClient, Handle, expect_open_out};
+use super::files::{FileClient, Handle, Reopen, expect_open_out};
 use super::inode::Inode;
 use super::meta_client::Caller;
 use super::{CLIENT_POOL_WAIT, STALE_RETRIES};
@@ -55,7 +55,7 @@ impl FileClient {
                 self.write_through(inode, who, off, data, cs, h.sync)
             };
             match r {
-                Err(ErrCode::STALE_LAYOUT) => self.stale(inode, who, true)?,
+                Err(ErrCode::STALE_LAYOUT) => self.stale(inode, who, Reopen::Handle)?,
                 r => return r.map(|()| data.len() as u32),
             }
         }
@@ -119,7 +119,7 @@ impl FileClient {
                     return Ok(o.attr);
                 }
                 Err(ErrCode::STALE_LAYOUT) => {
-                    self.stale(&inode, who, true)?;
+                    self.stale(&inode, who, if by_handle { Reopen::Handle } else { Reopen::Path })?;
                     known = Some(lock(&inode.st).attr.size); // 重新 Open 回来的长度就是最新的
                 }
                 Err(e) => return Err(e),

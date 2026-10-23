@@ -36,6 +36,7 @@ MetaOp.DebugPut 1f0568656c6c6f05776f726c64
 MetaOp.DebugGet 200568656c6c6f
 MetaOp.Uninline 219280808010
 MetaOp.TruncateHandle 2293808080100603
+MetaOp.ReopenHandle 23948080801001
 MetaReply.Session 00b0ea0109
 MetaReply.Heartbeat 01b0ea010901
 MetaReply.Entry 021201a003e807e9070280808080208abcb5ad0da58d068cbcb5ad0da68d068ebcb5ad0da78d0690bcb5ad0da88d0603090402e80705

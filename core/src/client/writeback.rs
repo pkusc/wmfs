@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use wmfs_api::failpoint::fail_point;
 
-use super::files::{FileClient, Handle};
+use super::files::{FileClient, Handle, Reopen};
 use super::flusher::inline_patches;
 use super::inode::Inode;
 use super::meta_client::Caller;
@@ -361,7 +361,7 @@ impl FileClient {
                 self.write_flying(inode, who, fly, sync, end, close)
             };
             match r {
-                Err(ErrCode::STALE_LAYOUT) => self.stale(inode, who, true)?,
+                Err(ErrCode::STALE_LAYOUT) => self.stale(inode, who, Reopen::Handle)?,
                 r => return r,
             }
         }

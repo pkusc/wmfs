@@ -18,7 +18,7 @@ pub mod sys;
 pub mod types;
 pub mod units;
 
-pub use errcode::ErrCode;
+pub use errcode::{ErrCode, Failed};
 
 use std::sync::{Mutex, MutexGuard};
 

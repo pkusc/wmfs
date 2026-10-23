@@ -12,12 +12,16 @@
 //!     `STALE_LAYOUT`（服务端的 uninline 从头重做）。内容与大小都没变、只换了存放位置，所以不写 changelog（ADR-0034）。
 //!   - `want_quota` 在 M10 才有用（回复的 `quota_end` 先一律是 `u64::MAX`）；`close`（M6 起客户端在写句柄 close 时带上）服务端
 //!     还不用（拿它做什么规格没写，实现注记（M6）：等主管决定，3.3.4 的 M6 注记 ③）。
+//! - 实现注记（M7）：CommitWrite 与 Fallocate 改了长度 → 祖先 RSTAT 按差值更新（3.9；孤儿不计）。
 //! - **Fallocate**：经句柄（`AuthzOp::Handle`）；只支持 mode 0（别的 → `EOPNOTSUPP`）；`size = max(size, offset + len)`（超过最大长度 → `EFBIG`）；inline 文件的
 //!   INLINE 不变（新增的区域按不变式读 0）。实现注记（M5）：规格没写回复，取 `Entry { attr }`；M6 的 FUSE 才有调用者。
 //! - **GetInline**：只给能读这个文件的人（ADR-0033 第 11 条；它不是句柄操作，按当前的读权限）；文件已经不是 inline →
 //!   `STALE_LAYOUT`（重新 Open 取 layout）。
 //! - **RenewCap**：经已打开的句柄续一张新 cap（`AuthzOp::Handle`：属主不看权限位，其他人按 `write` 检查读/写权限）。RenewCap 与 Uninline 走只读路径：签 cap 之前先核对会话
 //!   （`sessions::may_sign_cap`）。
+//! - **ReopenHandle**（M7，ADR-0037 第 4、12 条）：`Open` 的"经已打开的句柄"版本——layout 变了（3.1.4 C4）之后写句柄用它重新取
+//!   layout 与 cap：授权 `AuthzOp::Handle { read: !write, write }`（属主不看权限位）、只读路径、签 cap 之前核对会话，回 `Opened`；
+//!   cap 的权限位与 RenewCap 相同（写：能读时再加读），inline 内容只给能读的人（ADR-0033 第 11 条）。
 
 use super::common::{
     Node, attr_out, authz, bump_ctime, get, is_file, kill_suid, max_file_size, may_read, open_out, save, sign_cap,
@@ -28,6 +32,7 @@ use crate::base::types::Ts;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
+use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys;
 use crate::meta::schema::records::F_INLINE;
 use crate::meta::sessions;
@@ -87,8 +92,9 @@ pub fn commit_write(v: &mut dyn KvTxn, c: &OpCtx, w: &CommitIn) -> Result<MetaRe
         v.delete(&keys::inline(w.ino));
         bump_ctime(&mut n, c);
         save(v, &n);
-        return Ok(MetaReply::Committed { attr: attr_out(&n), quota_end: u64::MAX });
+        return Ok(MetaReply::Committed { attr: attr_out(v, c, &n)?, quota_end: u64::MAX });
     }
+    let before = Delta::of(v, &n)?; // 递归计数按长度的差值更新（3.9）
     let mut size = n.rec.size.max(w.new_size);
     if !w.patches.is_empty() {
         if !inline {
@@ -111,9 +117,10 @@ pub fn commit_write(v: &mut dyn KvTxn, c: &OpCtx, w: &CommitIn) -> Result<MetaRe
     n.rec.size = size;
     touch_data(&mut n, c);
     save(v, &n);
+    rstat::changed(v, c, &before, &n)?;
     let extra = vec![("via".to_string(), "CommitWrite".to_string())];
     changelog::append(v, c, Change { op: "SetSize", ino: w.ino, size, extra, ..Default::default() })?;
-    Ok(MetaReply::Committed { attr: attr_out(&n), quota_end: u64::MAX })
+    Ok(MetaReply::Committed { attr: attr_out(v, c, &n)?, quota_end: u64::MAX })
 }
 
 pub fn fallocate(
@@ -135,20 +142,28 @@ pub fn fallocate(
     let max = n.rec.layout.as_ref().map_or(i64::MAX as u64, max_file_size);
     let end = offset.checked_add(len).filter(|e| *e <= max).ok_or(ErrCode::EFBIG)?;
     if end > n.rec.size {
+        let before = Delta::of(v, &n)?;
         n.rec.size = end;
         touch_data(&mut n, c);
         save(v, &n);
+        rstat::changed(v, c, &before, &n)?;
         let extra = vec![("via".to_string(), "Fallocate".to_string())];
         changelog::append(v, c, Change { op: "SetSize", ino, size: end, extra, ..Default::default() })?;
     }
-    Ok(MetaReply::Entry { attr: attr_out(&n) })
+    Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? })
 }
 
-pub fn get_inline(v: &dyn KvRead, c: &OpCtx, ino: u64) -> Result<MetaReply, ErrCode> {
+/// 普通文件 `ino`：目录 → `EISDIR`，别的种类 → `EINVAL`（GetInline、RenewCap、ReopenHandle）。
+fn file_node(v: &dyn KvRead, ino: u64) -> Result<Node, ErrCode> {
     let n = get(v, ino)?;
     if !is_file(&n) {
         return Err(if n.is_dir() { ErrCode::EISDIR } else { ErrCode::EINVAL });
     }
+    Ok(n)
+}
+
+pub fn get_inline(v: &dyn KvRead, c: &OpCtx, ino: u64) -> Result<MetaReply, ErrCode> {
+    let n = file_node(v, ino)?;
     authz(v, c, AuthzOp::Open { read: true, write: false }, Some(&n), None, None)?;
     if n.rec.flags & F_INLINE == 0 {
         return Err(ErrCode::STALE_LAYOUT);
@@ -157,15 +172,25 @@ pub fn get_inline(v: &dyn KvRead, c: &OpCtx, ino: u64) -> Result<MetaReply, ErrC
     Ok(MetaReply::Inline { data, change_id: n.rec.change_id })
 }
 
-pub fn renew_cap(v: &dyn KvRead, c: &OpCtx, ino: u64, write: bool) -> Result<MetaReply, ErrCode> {
-    let n = get(v, ino)?;
-    if !is_file(&n) {
-        return Err(if n.is_dir() { ErrCode::EISDIR } else { ErrCode::EINVAL });
-    }
-    authz(v, c, AuthzOp::Handle { read: !write, write }, Some(&n), None, None)?; // 续期 = 经已打开的句柄（ADR-0036）
+/// RenewCap 与 ReopenHandle 共用的前半段：经已打开的句柄（`AuthzOp::Handle`，ADR-0036：属主不看权限位）、签 cap 之前核对会话；
+/// 返回 (inode, 能不能读, cap 的权限位)——读句柄只给读；写句柄给写，能读时再加读。
+fn handle_rights(v: &dyn KvRead, c: &OpCtx, ino: u64, write: bool) -> Result<(Node, bool, u8), ErrCode> {
+    let n = file_node(v, ino)?;
+    authz(v, c, AuthzOp::Handle { read: !write, write }, Some(&n), None, None)?;
     sessions::may_sign_cap(v, c.req)?;
-    let rights = if write { write_rights(may_read(v, c, &n)) } else { RIGHT_READ };
+    let can_read = !write || may_read(v, c, &n); // 读句柄：上面的 Handle 已经查过读
+    let rights = if write { write_rights(can_read) } else { RIGHT_READ };
+    Ok((n, can_read, rights))
+}
+
+pub fn renew_cap(v: &dyn KvRead, c: &OpCtx, ino: u64, write: bool) -> Result<MetaReply, ErrCode> {
+    let (n, _, rights) = handle_rights(v, c, ino, write)?;
     Ok(MetaReply::Cap { cap: sign_cap(c, &n, rights, c.req.session) })
+}
+
+pub fn reopen_handle(v: &dyn KvRead, c: &OpCtx, ino: u64, write: bool) -> Result<MetaReply, ErrCode> {
+    let (n, can_read, rights) = handle_rights(v, c, ino, write)?;
+    Ok(MetaReply::Opened(open_out(v, c, &n, can_read, rights)?))
 }
 
 /// `SetAtime`（relatime 批量、尽力而为；实现注记（M6））：调用者能读这个文件才更新它的 atime（读文件本来就会更新 atime）；atime 只往后

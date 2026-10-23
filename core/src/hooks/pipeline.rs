@@ -201,6 +201,14 @@ impl Pipeline {
     pub fn plugin_list(&self) -> PluginListV1 {
         self.set.plugin_list()
     }
+    /// 有没有已启用的插件消费目录属性 `key`（3.8；实现注记（M7）：新增，只增）。
+    pub fn consumes(&self, key: &str) -> bool {
+        self.set.consumes(key)
+    }
+    /// 全部已启用插件的 (名字, 消费的属性)（启动时与属性注册表对账；实现注记（M7）：新增）。
+    pub fn consumed_attrs(&self) -> Vec<(&'static str, &'static [&'static str])> {
+        self.set.consumed_attrs()
+    }
 }
 // meta/ns/common.rs 里的便捷函数（命名空间代码只用它们，M4）：
 //   authz(v, c, op, target, parent, victim) -> Result<(), ErrCode>      // 实现注记（M4）：多一个 victim（unlink/rename 的粘滞位），

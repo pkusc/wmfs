@@ -2,23 +2,25 @@
 //! 属主与权限位（setgid 继承）、`AttrOut`/`OpenOut`、调 authz 钩子、`new_layout`（选链，必要时生成新链）、目录的
 //! mtime/ctime/size/nlink/change_id、硬链接列表、孤儿标记。命名空间代码只用这些函数碰 KV（全部是点查，3.4.1.4 规则 1）。
 //!
-//! 实现注记（M4）：`AttrOut` 的 `consistency`、`ttl_ms` 取内置默认值（cto、attr_ttl 1 s）——按目录属性给出在 M7；
-//! `quota_end = u64::MAX`（配额在 M10）。实现注记（M5）：`OpenOut.cap` 在闭包里签（[`sign_cap`]，有效期 `cap_ttl`）：权限位
-//! 按这次打开的方式给（Open 按 O_ACCMODE；Create 新建的文件读写都给，打开已有的文件给写、能读才再给读；改了长度的 SetAttr
-//! 同后者）；`qos_id` 先填 0（qos 属性在 M13）。`OpenOut.inline`（文件的完整内容）只给
-//! 能读这个文件的人：Open 按这次是否读打开，Create 打开已有的文件、改了 size 的 SetAttr 按调用者有没有读权限（[`may_read`]）；
-//! 不带时为 None，要内容就 GetInline（M5）。递归计数 RSTAT 的增量在 M7（roadmap M7 的 `meta/rstat`），配额检查在 M10，
-//! 所以这里的操作还不碰它们。
+//! 现状：`AttrOut` 的 `consistency`、`ttl_ms` 按管辖目录（目录自己、文件的主父目录）的生效属性给出（[`governing`]）；新文件的
+//! layout 在 `ns/layout.rs`（`new_layout`/`set_new_layout`，这里原样转出）；递归计数 RSTAT 由各操作调 `meta/rstat.rs` 更新；
+//! `quota_end = u64::MAX`（配额在 M10）。`OpenOut.cap` 在闭包里签（[`sign_cap`]，有效期 `cap_ttl`）：权限位按这次打开的方式给
+//! （Open 按 O_ACCMODE；Create 新建的文件读写都给，打开已有的文件给写、能读才再给读；改了长度的 SetAttr 同后者）；`qos_id` 先填 0
+//! （qos 属性在 M13）。`OpenOut.inline`（文件的完整内容）只给能读这个文件的人：Open 按这次是否读打开，Create 打开已有的文件、
+//! 改了 size 的 SetAttr 按调用者有没有读权限（[`may_read`]）；不带时为 None，要内容就 GetInline。
+//!
+//! 历史注记：M4 时 `consistency`、`ttl_ms` 取内置默认值（cto、attr_ttl 1 s），RSTAT 与配额都还不碰（M7 已实现前两者：见
+//! `attrs.rs`、`rstat.rs`）；cap 与 inline 的规则是 M5 加的。
+
+use std::sync::Arc;
 
 use crate::base::ErrCode;
 use crate::base::types::Principal;
-use crate::data::format::{ENC_AES256GCM, ENC_NONE};
-use crate::hooks::traits::{AuthzInput, AuthzOp, CODEC_REPLICA, InodeView, PlacementInput};
-use crate::meta::attrs::{CONSISTENCY_CTO, CONSISTENCY_STRONG, DEFAULT_ATTR_TTL_MS, EffectiveAttrs};
-use crate::meta::cluster::chains::{gen_chains, view_of};
+use crate::hooks::traits::{AuthzInput, AuthzOp, InodeView};
+use crate::meta::attrs::{CONSISTENCY_STRONG, EffectiveAttrs};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
 use crate::meta::ns::xattr::{ACL_ACCESS, get_xattr};
-use crate::meta::schema::keys::{self, G_NEXT_INO, GC_ORPHAN};
+use crate::meta::schema::keys::{self, G_NEXT_INO, GC_ORPHAN, ROOT_INO};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{
     DentryV1, F_HAS_ACL, F_INLINE, F_ORPHAN, GcRecV1, InodeV1, KIND_BLK, KIND_CHR, KIND_DIR, KIND_FIFO, KIND_FILE,
@@ -26,6 +28,8 @@ use crate::meta::schema::records::{
 };
 use crate::proto::cap::{self, CapV1, RIGHT_READ, RIGHT_WRITE};
 use crate::proto::meta::{AttrOut, OpenOut};
+
+pub use super::layout::{new_layout, set_new_layout};
 
 pub const S_ISUID: u32 = 0o4000;
 pub const S_ISGID: u32 = 0o2000;
@@ -185,9 +189,23 @@ pub fn update_dir(v: &mut dyn KvTxn, c: &OpCtx, d: &mut Node, dsize: i64, dnlink
     save(v, d);
 }
 
-pub fn attr_out(n: &Node) -> AttrOut {
+/// 一个 inode 的属性管辖目录的生效属性：目录 = 它自己，其他 = 主父目录（实现注记（M7），3.1.4 C1、3.3.4 的
+/// `AttrOut.consistency`）；孤儿（nlink = 0）的主父目录可能已经删掉了 → 用根目录的。先点查它还在不在：解析缓存里可能还留着
+/// 已删目录的项（删掉没有 DIRATTR 的目录不加 attr_epoch），不能靠解析失败来判断。
+pub fn governing(v: &dyn KvRead, c: &OpCtx, n: &Node) -> Result<Arc<EffectiveAttrs>, ErrCode> {
+    let mut dir = if n.is_dir() { n.ino } else { n.rec.parent };
+    if !n.is_dir() && n.rec.nlink == 0 && kv::get::<InodeV1>(v, &keys::inode(dir))?.is_none() {
+        dir = ROOT_INO;
+    }
+    c.attrs.resolve(v, dir)
+}
+
+/// 回给客户端的属性：`consistency` 与 `ttl_ms` 按管辖目录的生效属性（cto = attr_ttl，strong = 0，3.1.4 C1）。
+pub fn attr_out(v: &dyn KvRead, c: &OpCtx, n: &Node) -> Result<AttrOut, ErrCode> {
+    let e = governing(v, c, n)?;
+    let ttl_ms = if e.consistency == CONSISTENCY_STRONG { 0 } else { e.attr_ttl_ms };
     let r = &n.rec;
-    AttrOut {
+    Ok(AttrOut {
         ino: n.ino,
         kind: r.kind,
         mode: r.mode,
@@ -202,10 +220,10 @@ pub fn attr_out(n: &Node) -> AttrOut {
         rdev: r.rdev,
         change_id: r.change_id,
         epoch: r.layout.as_ref().map_or(0, |l| l.epoch),
-        consistency: CONSISTENCY_CTO, // M7 起按目录属性
-        ttl_ms: DEFAULT_ATTR_TTL_MS,  // attr_ttl 的默认值（M7 起按目录属性）
+        consistency: e.consistency,
+        ttl_ms,
         flags: r.flags,
-    }
+    })
 }
 
 /// Open、Create、改了 size 的 SetAttr 共用的回复：属性、layout、带 `rights` 权限位的 cap（普通文件才有）；`with_inline`
@@ -217,7 +235,7 @@ pub fn open_out(v: &dyn KvRead, c: &OpCtx, n: &Node, with_inline: bool, rights: 
         None
     };
     Ok(OpenOut {
-        attr: attr_out(n),
+        attr: attr_out(v, c, n)?,
         layout: n.rec.layout.clone(),
         cap: sign_cap(c, n, rights, c.req.session),
         inline,
@@ -307,58 +325,6 @@ fn view<'a>(n: Option<&Node>, acl: &'a Option<Vec<u8>>) -> Option<InodeView<'a>>
         gid: n.rec.gid,
         acl_access: acl.as_deref(),
     })
-}
-
-/// 按生效属性给新文件（或截断到 0 的文件）建 layout（3.4.2.1、4.6）：候选 = 集群图快照里同 (class, replicas) 的链；
-/// 一条都没有 → `gen_chains` 生成（写了 CHAIN，本批在这个操作之后结束）；placement 插件依次过滤、排序；取前
-/// k = min(stripe, 互不相同的链数) 条，k = 0 → `ENOSPC`（拒绝，而不是静默放到别处）。encrypt 或 strong 生效时不 inline。
-pub fn new_layout(
-    v: &mut dyn KvTxn,
-    c: &OpCtx,
-    eff: &EffectiveAttrs,
-    ino: u64,
-    epoch: u32,
-    size_hint: u64,
-) -> Result<LayoutV1, ErrCode> {
-    let class = c.map.classes.iter().find(|k| k.id == eff.class_id).ok_or(ErrCode::ENOSPC)?;
-    let replicas = eff.replicas;
-    let same = c.map.chains.iter().filter(|(_, r)| r.class_id == class.id && r.replicas == replicas);
-    let mut cands: Vec<_> = same.map(|(id, r)| view_of(c.map, *id, r)).collect();
-    if cands.is_empty() {
-        cands = gen_chains(v, c, class, replicas)?;
-    }
-    let stripe = eff.stripe;
-    let input = PlacementInput { eff, class, replicas, stripe, client_node: None, seed: ino, exclude: &[], size_hint };
-    let ranked = c.pipeline.place(&input, cands)?;
-    let k = (stripe as usize).min(ranked.len());
-    if k == 0 {
-        return Err(ErrCode::ENOSPC);
-    }
-    let no_inline = eff.encrypt_key != 0 || eff.consistency == CONSISTENCY_STRONG;
-    Ok(LayoutV1 {
-        epoch,
-        chunk_size: eff.chunk,
-        block_size: BLOCK_SIZE.min(eff.chunk),
-        chains: ranked[..k].iter().map(|c| c.id).collect(),
-        replicas,
-        codec: CODEC_REPLICA,
-        checksum: eff.checksum,
-        compress: eff.compress,
-        compress_level: eff.compress_level,
-        encrypt: if eff.encrypt_key != 0 { ENC_AES256GCM } else { ENC_NONE },
-        encrypt_key: eff.encrypt_key,
-        inline_max: if no_inline { 0 } else { eff.inline_max },
-    })
-}
-
-/// 给普通文件 `n` 装上新 layout（epoch = max_epoch + 1）、存储类与 F_INLINE（inline_max > 0 才 inline）。
-pub fn set_new_layout(v: &mut dyn KvTxn, c: &OpCtx, n: &mut Node) -> Result<(), ErrCode> {
-    let eff = c.attrs.resolve(v, n.rec.parent)?;
-    let epoch = n.rec.max_epoch.checked_add(1).ok_or(ErrCode::EOVERFLOW)?;
-    let l = new_layout(v, c, &eff, n.ino, epoch, 0)?;
-    n.rec.flags = if l.inline_max > 0 { n.rec.flags | F_INLINE } else { n.rec.flags & !F_INLINE };
-    (n.rec.max_epoch, n.rec.class_id, n.rec.layout) = (epoch, eff.class_id, Some(l));
-    Ok(())
 }
 
 /// 把 `n` 在 `from` = (目录, 名字) 的链接改到 `to`（主链接或 extra_links 里的那一项）。

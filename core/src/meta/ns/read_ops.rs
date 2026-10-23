@@ -31,13 +31,13 @@ pub fn lookup(v: &dyn KvRead, c: &OpCtx, parent: u64, name: &[u8]) -> Result<Met
     check_name(name)?;
     searchable_dir(v, c, parent)?;
     let n = child(v, parent, name)?.ok_or(ErrCode::ENOENT)?;
-    Ok(MetaReply::Entry { attr: attr_out(&n) })
+    Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? })
 }
 
 pub fn getattr(v: &dyn KvRead, c: &OpCtx, ino: u64) -> Result<MetaReply, ErrCode> {
     let n = get(v, ino)?;
     authz(v, c, AuthzOp::GetAttr, Some(&n), None, None)?;
-    Ok(MetaReply::Entry { attr: attr_out(&n) })
+    Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? })
 }
 
 pub fn readdir(
@@ -58,7 +58,7 @@ pub fn readdir(
     let (mut entries, mut bytes) = (Vec::new(), 0);
     for (k, b) in rows.into_iter().take(limit) {
         let de: DentryV1 = decode_v1(&b)?;
-        let attr = if plus { Some(attr_out(&get(v, de.ino)?)) } else { None };
+        let attr = if plus { Some(attr_out(v, c, &get(v, de.ino)?)?) } else { None };
         let e = DirEntryOut { name: k[prefix.len()..].to_vec(), ino: de.ino, kind: de.kind, attr };
         bytes += encode_body(&e).len();
         if bytes > MAX_REPLY && !entries.is_empty() {

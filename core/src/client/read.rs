@@ -12,7 +12,7 @@
 //!   块号按块大小数（键里还有 change_id，同一个版本的块大小不变）。
 
 use super::data_client::chunk_id;
-use super::files::{FileClient, Handle, expect_open_out};
+use super::files::{FileClient, Handle, Reopen, expect_open_out};
 use super::inode::Inode;
 use super::meta_client::Caller;
 use super::{CLIENT_POOL_WAIT, STALE_RETRIES};
@@ -63,7 +63,7 @@ impl FileClient {
             };
             match r {
                 Err(ErrCode::STALE_LAYOUT) => {
-                    self.stale(&inode, who, false)?;
+                    self.stale(&inode, who, Reopen::Read)?;
                     continue;
                 }
                 r => r?,

@@ -4,8 +4,14 @@
 //! （基础版）、`debug gen-key`；M3 加了 `dev wait`（leader）与 `debug kv put/get/bench`，`init` 写元数据的初始状态；
 //! M4 加了 `fs`（元数据命令与 `--as-uid`）、`init --target`。M5 加了 `fs put/get/cat/truncate` 与
 //! `debug chunk-path/chunk-header/corrupt-chunk`（按 local-fs 的路径规则找 chunk 文件：没编进 local-fs 插件就没有这三个子命令）。
-//! M6 加了 `mount`/`umount`（FUSE，`fuse/`）与 `dev mount/umount/client-pid`。其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
+//! M6 加了 `mount`/`umount`（FUSE，`fuse/`）与 `dev mount/umount/client-pid`。M7 加了策略命令 `set/get/unset/usage/status`
+//! （`attr.rs`，挂载点路径的换算在 `pathmap.rs`）、`changelog tail`（`changelog.rs`）、`cluster set`（`cluster.rs`）与
+//! `debug rstat-check`。
+//! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
+mod attr;
+mod changelog;
+mod cluster;
 mod debug;
 mod dev;
 mod doctor;
@@ -14,6 +20,7 @@ mod fs;
 mod fuse;
 mod leader;
 mod node;
+mod pathmap;
 mod ping;
 mod registry;
 
@@ -72,6 +79,26 @@ enum Cmd {
     Mount(fuse::MountArgs),
     /// 卸载一个 wmfs 挂载点（fusermount3 -u）
     Umount { mountpoint: PathBuf },
+    /// 设置目录属性，例如 wmfs set ~/wmfs-mnt/proj chunk=1M,stripe=2（服务端切分、解析；打印规范化的结果与警告）
+    Set(attr::SetArgs),
+    /// 生效属性、来源与生效方式，最后一行是 semantics:（-r：另列出子树里设置了属性的目录）
+    Get(attr::GetArgs),
+    /// 删掉目录上的一个属性
+    Unset(attr::UnsetArgs),
+    /// 目录的递归用量：字节数、文件数、子目录数（常量时间）
+    Usage(attr::PathArgs),
+    /// 声明 vs 实际；第一行起是集群警告（不给路径 = 整个文件系统）
+    Status(attr::StatusArgs),
+    /// changelog 流（tail）
+    Changelog {
+        #[command(subcommand)]
+        cmd: changelog::ChangelogCmd,
+    },
+    /// 集群管理（set：集群运行参数）
+    Cluster {
+        #[command(subcommand)]
+        cmd: cluster::ClusterCmd,
+    },
     /// 调试工具
     Debug {
         #[command(subcommand)]
@@ -86,6 +113,13 @@ enum DebugCmd {
         /// 写到哪个文件（权限 0600）
         #[arg(long)]
         out: PathBuf,
+    },
+    /// 离线检查递归用量计数（节点要先停掉）：从全部 inode 重新算一遍，与每个目录的 RSTAT 比较
+    RstatCheck {
+        /// 节点数据目录（例如 ~/wmfs-dev/n1）
+        data_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     /// 读写元数据 KV 的调试键空间（服务端要开 debug_ops，只接受 admin key）
     Kv {
@@ -131,6 +165,14 @@ fn main() {
         Cmd::Fs(a) => fs::run(a),
         Cmd::Mount(a) => fuse::run(a),
         Cmd::Umount { mountpoint } => fuse::umount(&mountpoint),
+        Cmd::Set(a) => attr::set(a),
+        Cmd::Get(a) => attr::get(a),
+        Cmd::Unset(a) => attr::unset(a),
+        Cmd::Usage(a) => attr::usage(a),
+        Cmd::Status(a) => attr::status(a),
+        Cmd::Changelog { cmd } => changelog::run_changelog(cmd),
+        Cmd::Cluster { cmd } => cluster::run_cluster(cmd),
+        Cmd::Debug { cmd: DebugCmd::RstatCheck { data_dir, json } } => debug::rstat_check(&data_dir, json),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),
         #[cfg(feature = "local-fs")]

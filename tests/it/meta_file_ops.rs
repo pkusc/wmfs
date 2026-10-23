@@ -216,13 +216,20 @@ fn caps_on_the_read_path_need_a_usable_session() {
     let e = open(&mut ns, &OWNER, f, O_RDONLY).err();
     assert_eq!(e, Some(ErrCode::EINVAL), "session 0 的 cap 不属于任何会话：只签给内部请求与 Server 角色");
     assert_eq!(ns.read(&OWNER, MetaOp::RenewCap { ino: f, write: false }), Err(ErrCode::EINVAL));
+    // ReopenHandle（M7，ADR-0037 第 12 条）也是只读路径上签 cap 的请求：读写两种都先核对会话
+    let reopen = |ns: &mut Ns, write| ns.read(&OWNER, MetaOp::ReopenHandle { ino: f, write }).err();
+    assert_eq!((reopen(&mut ns, true), reopen(&mut ns, false)), (Some(ErrCode::EINVAL), Some(ErrCode::EINVAL)));
     ns.session = 8;
     assert_eq!(open(&mut ns, &OWNER, f, O_RDONLY).err(), Some(ErrCode::SESSION_EVICTED), "没有这个会话");
+    let evicted = Some(ErrCode::SESSION_EVICTED);
+    assert_eq!((reopen(&mut ns, true), reopen(&mut ns, false)), (evicted, evicted));
     ns.session = SESSION;
     let mut rec: SessionRecV1 = decode_v1(&ns.kv.0[&keys::session(SESSION)]).unwrap();
     rec.key_id = 2;
     ns.kv.0.insert(keys::session(SESSION), encode_v1(&rec));
     assert_eq!(open(&mut ns, &OWNER, f, O_RDONLY).err(), Some(ErrCode::EACCES), "别的 key 打开的会话");
+    let eacces = Some(ErrCode::EACCES);
+    assert_eq!((reopen(&mut ns, true), reopen(&mut ns, false)), (eacces, eacces));
 }
 
 #[test]

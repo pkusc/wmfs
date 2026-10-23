@@ -17,7 +17,9 @@ use serde::Serialize;
 use wmfs_core::base::{clock, devinfo, sys};
 use wmfs_core::buf::PoolConfig;
 
-use parse::{fuse_conf_allows_other, list_dir, name_of, nvme_ctrl, parse_kernel, parse_mountinfo, uid_from_status};
+use parse::{
+    MountLine, fuse_conf_allows_other, list_dir, name_of, nvme_ctrl, parse_kernel, parse_mountinfo, uid_from_status,
+};
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -163,8 +165,8 @@ fn memlock() -> Check {
     }
 }
 
-fn rootfs(mounts: &[(String, String)]) -> Check {
-    let fs = mounts.iter().rev().find(|(mp, _)| mp == "/").map(|(_, t)| t.as_str()).unwrap_or("未知");
+fn rootfs(mounts: &[MountLine]) -> Check {
+    let fs = mounts.iter().rev().find(|m| m.point == "/").map(|m| m.fstype.as_str()).unwrap_or("未知");
     match fs {
         "xfs" => ok("rootfs", "根分区 xfs", "推荐的文件系统（ADR-0008）"),
         "ext4" => {
@@ -270,8 +272,8 @@ fn allow_other() -> Check {
     }
 }
 
-fn stale_mounts(mounts: &[(String, String)]) -> Check {
-    let left: Vec<&str> = mounts.iter().filter(|(_, t)| t == "fuse.wmfs").map(|(m, _)| m.as_str()).collect();
+fn stale_mounts(mounts: &[MountLine]) -> Check {
+    let left: Vec<&str> = mounts.iter().filter(|m| m.fstype == "fuse.wmfs").map(|m| m.point.as_str()).collect();
     if left.is_empty() {
         return ok("stale_mounts", "没有残留的 wmfs 挂载", "");
     }

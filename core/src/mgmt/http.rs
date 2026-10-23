@@ -1,5 +1,6 @@
 //! 管理 API 的 HTTP 服务（design.md 7.1）：tiny_http 监听、4 个处理线程 `mgmt-http-<i>`、路由与端点。
 //!
+//! M7：依赖元数据的端点（属性、用量、声明 vs 实际、语义、集群运行参数、changelog 与游标）在 `api.rs` 与 `changelog.rs`。
 //! M1 的端点：`GET /metrics`（免认证）、`GET /api/v1/health`（免认证，带本节点地址；M3 起带元数据角色与 leader 地址）、
 //! `/api/v1/failpoints`（仅 node.toml 里 `failpoints_api = true` 时存在：`GET` 列出（任一已认证 key）、`POST {name, action}` 设置、
 //! `DELETE ?name=` 清除（写需要 admin；清除没设置过的名字回 404））。实现注记（M1）：规格只写了 POST 与 DELETE，
@@ -12,6 +13,7 @@
 
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use wmfs_api::failpoint;
 use wmfs_api::metrics;
@@ -19,7 +21,8 @@ use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health, NodeAddrs};
 
 use crate::base::{ErrCode, log};
 use crate::hooks::traits::KeyLookup;
-use crate::mgmt::auth;
+use crate::meta::engine::EmbeddedEngine;
+use crate::mgmt::{api, auth};
 
 /// 请求体上限（字节）。
 const MAX_BODY: usize = 1 << 20;
@@ -28,12 +31,15 @@ const THREADS: usize = 4;
 /// health 里随时变化的部分：本节点的元数据角色与 leader 的地址（M3 起由元数据引擎给出）。
 pub type RoleFn = Arc<dyn Fn() -> (String, Option<NodeAddrs>) + Send + Sync>;
 
-/// 各端点要用的本节点信息。
+/// 各端点要用的本节点信息。实现注记（M7）：`meta` = 本节点的元数据引擎（依赖元数据的端点用，`mgmt/api.rs`；只有传输与认证的
+/// 组件测试里为 None）；`polls` = 正在挂着的 changelog 长轮询数（每个节点最多 2 个，1.2）。
 pub struct MgmtCtx {
     pub health: Health, // 不变的部分（版本、cluster_id、本节点地址）
     pub role: Option<RoleFn>,
     pub keys: Arc<dyn KeyLookup + Send + Sync>,
     pub failpoints_api: bool,
+    pub meta: Option<Arc<EmbeddedEngine>>,
+    pub polls: AtomicUsize,
 }
 
 /// 已经绑定好地址、还没开始处理请求的管理 API（先绑定，才知道实际地址写进 health）。
@@ -43,10 +49,10 @@ pub struct MgmtServer {
 }
 
 /// 一个回复。
-struct Reply {
-    status: u16,
-    content_type: &'static str,
-    body: Vec<u8>,
+pub(super) struct Reply {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: Vec<u8>,
 }
 
 impl MgmtServer {
@@ -124,6 +130,7 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
             json(200, &h)
         }
         (_, "/api/v1/failpoints") => failpoints(ctx, method, url, auth, body),
+        (_, p) if api::handles(p) => api::serve(ctx, method, url, auth, body),
         _ => err(404, "enoent", format!("没有这个接口：{method} {path}")),
     }
 }
@@ -164,12 +171,12 @@ fn failpoints(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: 
     json(200, &FailpointList { failpoints })
 }
 
-fn json<T: serde::Serialize>(status: u16, v: &T) -> Reply {
+pub(super) fn json<T: serde::Serialize>(status: u16, v: &T) -> Reply {
     let b = serde_json::to_vec(v).unwrap_or_else(|e| panic!("不变量破坏：管理 API 的回复无法编码为 JSON：{e}"));
     Reply { status, content_type: "application/json", body: b }
 }
 
-fn err(status: u16, error: &str, message: String) -> Reply {
+pub(super) fn err(status: u16, error: &str, message: String) -> Reply {
     json(status, &ErrorReply { error: error.into(), message })
 }
 
@@ -198,7 +205,8 @@ mod tests {
             ..Default::default()
         };
         let keys = Arc::new(InitKeys::new(MASTER, 0));
-        m.start(Arc::new(MgmtCtx { health, role: None, keys, failpoints_api })).unwrap();
+        let ctx = MgmtCtx { health, role: None, keys, failpoints_api, meta: None, polls: AtomicUsize::new(0) };
+        m.start(Arc::new(ctx)).unwrap();
         addr
     }
 

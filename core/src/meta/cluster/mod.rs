@@ -5,10 +5,12 @@
 //! - [`cluster_mgr`]：cluster-mgr 线程（M4 只在 leader 就绪与集群图变化时把集群警告写进日志）
 //!
 //! - [`targets`]：target 心跳的 leader 一侧（更新 TargetRecV1、记下用量）与 StatFs（M5）
+//! - [`settings`]：集群运行参数 `wmfs cluster set`（M7）
 //!
 //! join（M8）、集群插件清单的比对与退出（plugins.rs，M8）随里程碑加入。
 
 pub mod chains;
 pub mod cluster_mgr;
 pub mod map;
+pub mod settings;
 pub mod targets;

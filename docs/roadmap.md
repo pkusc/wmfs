@@ -292,11 +292,15 @@ wmfs set ~/wmfs-mnt/proj chunck=4M                  # 预期：错误"未知属�
 cp -r /usr/include ~/wmfs-mnt/proj/a/
 wmfs usage ~/wmfs-mnt/proj                          # 预期：立即返回字节数与文件数
 find ~/wmfs-mnt/proj -type f -printf '%s\n' | awk '{s+=$1} END {print s}'   # 预期：与上一行的字节数相同
-wmfs changelog tail -n 100000 | grep -E 'AttrSet|Mkdir' | tail -3   # 预期：能看到 AttrSet 与 Mkdir 事件（最后几条大多是 cp 产生的 Create）
+wmfs changelog tail -n 100000 | grep -E 'AttrSet|Mkdir' | head -6   # 预期：mkdir -p 的 3 个 Mkdir 与 wmfs set 的 3 个 AttrSet（cp 产生的 Mkdir 都在后面）
 wmfs dev down
 scripts/accept.sh M7
 ```
 
+- 实现注记（M7）：changelog 那一行原来是 `| tail -3`（预期"能看到 AttrSet 与 Mkdir 事件"）：changelog 按时间排序，`cp -r /usr/include` 建的
+  几百个目录都排在 `wmfs set` 之后，`tail -3` 只看得到 cp 产生的 Mkdir，看不到 AttrSet；改成 `| head -6`（最前面正好是 `mkdir -p` 的 3 个
+  Mkdir 与 3 次 `wmfs set` 的 AttrSet）。`wmfs get` 的输出每行是"键=值  来自 <目录> 或 (默认值)（生效：…）"，最后一行 `semantics:`；单节点上
+  `proj/a/b` 的 replicas 是默认的 3、实际 1，所以 `semantics:` 之前有警告。
 - **本阶段你需要理解的概念**：
   - **目录属性继承**：在一个目录上 `wmfs set` 的策略（比如副本数）自动作用于整个子树，子目录可以覆盖；`wmfs get` 会告诉你每个值是从哪一层目录继承来的。
   - **递归用量**：每个目录都记着"我下面一共有多少字节、多少文件"，每次修改顺着父目录一路更新到根。所以查任何目录的用量只读一条记录，不用遍历。

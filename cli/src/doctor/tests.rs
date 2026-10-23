@@ -10,7 +10,7 @@ fn mount_based_checks() {
     assert_eq!(rootfs(&m).title, "根分区 ext4");
     assert_eq!(stale_mounts(&m[..1]).status, Status::Ok);
     let sp = parse_mountinfo("91 29 0:51 / /home/u/my\\040mnt\\134x rw - fuse.wmfs w rw\n");
-    assert_eq!(sp[0].0, "/home/u/my mnt\\x", "挂载点里的空格、反斜杠在 mountinfo 里是八进制转义");
+    assert_eq!(sp[0].point, "/home/u/my mnt\\x", "挂载点里的空格、反斜杠在 mountinfo 里是八进制转义");
 }
 
 #[test]

@@ -18,6 +18,7 @@ redb.workspace = true
 raft.workspace = true
 protobuf.workspace = true
 crossbeam-channel.workspace = true
+wmfs-mgr.workspace = true
 
 # 组件测试（design.md 9.3 的思路：单进程，经 mem 或回环 TCP 互连）。端口一律 127.0.0.1:0，由系统分配。
 [[test]]
@@ -163,3 +164,20 @@ path = "it/meta_handle_authz.rs"
 [[test]]
 name = "client_files"
 path = "it/client_files.rs"
+
+# M7：目录属性与递归用量（design.md 3.8、3.9；内存 KV 视图上的语义与带种子的随机自检）、管理 API 与 changelog 流（完整节点）。
+[[test]]
+name = "meta_attrs"
+path = "it/meta_attrs.rs"
+
+[[test]]
+name = "meta_rstat"
+path = "it/meta_rstat.rs"
+
+[[test]]
+name = "mgmt_api"
+path = "it/mgmt_api.rs"
+
+[[test]]
+name = "failpoint_attr"
+path = "it/failpoint_attr.rs"
