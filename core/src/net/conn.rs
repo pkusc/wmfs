@@ -126,6 +126,11 @@ impl ConnHandle {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
+    /// 发送队列里还没写出去的帧数。
+    pub fn queued(&self) -> usize {
+        self.tx.len()
+    }
+
     /// 握手完成（在读线程上调用）：记下对端身份（只有服务端有）；告诉传输插件（`Conn::mark_authenticated`：
     /// 从此才收带 bulk 的帧、单边传输才允许 READ/WRITE）；写线程从此才发保活 Ping。
     pub(crate) fn authenticated(&self, id: Option<ConnIdentity>) {

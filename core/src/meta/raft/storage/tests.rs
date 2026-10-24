@@ -157,9 +157,20 @@ fn hard_state_and_conf_state_persist() {
 }
 
 #[test]
-fn snapshot_is_not_available_until_m8() {
-    let (_db, s) = storage_3_to_5();
-    assert_eq!(s.snapshot(5, 2), Err(RaftError::Store(StorageError::SnapshotTemporarilyUnavailable)));
+fn snapshot_exports_the_applied_state_as_a_desc() {
+    let db = db();
+    bootstrap(&db, &[1], &[]).unwrap();
+    let mut s = RedbStorage::open(db.clone()).unwrap();
+    s.set_snapshots(9, Arc::default());
+    let snap = s.snapshot(0, 2).unwrap();
+    let m = snap.get_metadata();
+    assert_eq!(
+        (m.index, m.term, m.get_conf_state().voters.clone()),
+        (1, 1, vec![1]),
+        "applied 与 conf_state 来自同一个读事务"
+    );
+    let d: crate::proto::peer::SnapDesc = crate::proto::decode_body(&snap.data).unwrap();
+    assert_eq!((d.index, d.term, d.source_node), (1, 1, 9), "快照内容不进 raft 消息：只有 SnapDesc（3.4.1.7）");
 }
 
 #[test]

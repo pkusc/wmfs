@@ -106,8 +106,10 @@ step "4/7 单元测试、fail point 用例与金样：cargo test"
 cargo test --release --workspace
 
 step "5/7 确定性 raft 模拟（1000 个种子，内存后端）"
-# M3：单节点部分（design.md 9.2）；普通 cargo test 只跑 200 个种子，这里按"每次提交 1000 个"跑。多节点部分在 M8 加入
+# M3：单节点部分（design.md 9.2）；普通 cargo test 只跑 200 个种子，这里按"每次提交 1000 个"跑。
+# M8：多节点部分（3 节点 × 400 步，掉电、丢消息、分区、重排、换 leader、成员变更、快照；普通 cargo test 跑 100 个种子，这里 1000 个，约 75 s）
 WMFS_SIM_SEEDS=1000 cargo test --release -p wmfs-testkit --test raft_sim
+WMFS_SIM_SEEDS=1000 cargo test --release -p wmfs-testkit --test raft_sim_cluster -- --nocapture
 
 step "6/7 行数对账：scripts/loc.sh"
 scripts/loc.sh

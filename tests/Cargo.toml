@@ -165,6 +165,11 @@ path = "it/meta_handle_authz.rs"
 name = "client_files"
 path = "it/client_files.rs"
 
+# M8 第一步（ADR-0038 第 7 条）：读句柄碰上 layout 变化时经句柄重新取 layout（属主不看权限位）。
+[[test]]
+name = "client_reopen"
+path = "it/client_reopen.rs"
+
 # M7：目录属性与递归用量（design.md 3.8、3.9；内存 KV 视图上的语义与带种子的随机自检）、管理 API 与 changelog 流（完整节点）。
 [[test]]
 name = "meta_attrs"
@@ -181,3 +186,20 @@ path = "it/mgmt_api.rs"
 [[test]]
 name = "failpoint_attr"
 path = "it/failpoint_attr.rs"
+
+# M8：元数据三副本（同一个进程里的多节点集群；确定性 raft 模拟的多节点部分；需要 fail point 的各自一个测试程序）。
+[[test]]
+name = "meta_cluster"
+path = "it/meta_cluster.rs"
+
+[[test]]
+name = "failpoint_uninline_fence"
+path = "it/failpoint_uninline_fence.rs"
+
+[[test]]
+name = "raft_sim_cluster"
+path = "it/raft_sim_cluster.rs"
+
+[[test]]
+name = "raft_pitfalls_m8"
+path = "it/raft_pitfalls_m8.rs"

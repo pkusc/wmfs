@@ -11,6 +11,10 @@
 //! 实现注记（M4）：回 `NOT_LEADER` 的 ERROR 帧由 core 自动填 `leader_hint`（[`RpcServer::set_leader_hint`] 登记的函数给出
 //! leader 在 control_scheme 上的 rpc 地址，例如 "127.0.0.1:19100"；不知道 leader 时为 None）；[`Responder::drop_reply`]
 //! 什么也不回、Drop 时也不自动回 EIO（fail point `meta.reply.drop` 用它"弄丢"一次回复）。
+//! 实现注记（M8）：OneWay 帧（RaftMsg）交给 [`RpcServer::add_oneway`] 登记的处理函数（在连接读线程上调用，不得阻塞；bulk 被丢弃的
+//! OneWay 直接丢掉，raft 会重发）；[`Responder::error_with`] 带一句给人看的原因（`ErrorBody.msg`，例如 join 被拒时的插件差异；`NOT_LEADER` 时
+//! 照样自动填 leader_hint——join 发给 follower 也能跟到 leader）；
+//! [`StreamTx::wait_room`] 让流的发送方（snap-serve）等发送队列腾出地方，不会把整个快照一下子塞进队列。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -28,12 +32,15 @@ use crate::hooks::traits::{Conn, ConnIdentity, KeyLookup, Transport};
 use crate::net::conn::{self, ConnHandle, ConnOpts, recv_checked};
 use crate::net::handshake::{self, ServerSide};
 use crate::proto::frame::{
-    ErrorBody, FLAG_ERROR, FLAG_LAST_CHUNK, FrameHeader, FrameKind, InFrame, MSG_DATA_CALL, MSG_META_CALL,
-    MSG_NODE_CALL, MSG_PEER_CALL, MSG_PING, MSG_RAFT, MSG_SNAPSHOT_FETCH, OutFrame, msg_name,
+    ErrorBody, FLAG_ERROR, FrameHeader, FrameKind, InFrame, MSG_DATA_CALL, MSG_META_CALL, MSG_NODE_CALL, MSG_PEER_CALL,
+    MSG_PING, MSG_RAFT, MSG_SNAPSHOT_FETCH, OutFrame, msg_name,
 };
 use crate::proto::handshake::PingBody;
 use crate::proto::peer::NodeOp;
 use crate::proto::{decode_body, encode_body};
+
+mod stream;
+pub use stream::StreamTx;
 
 /// 一个消息族的服务（M3 起：元数据、数据、节点……）。在连接读线程上调用，**不得阻塞**：只把请求交给别的线程。
 pub trait Service: Send + Sync {
@@ -50,6 +57,9 @@ pub struct ServerId {
 /// 给出 leader 的 rpc 地址（填进 NOT_LEADER 的 `leader_hint`；不知道 → None）。
 pub type HintFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// 一种 OneWay 帧的处理函数（M8：RaftMsg）：在连接读线程上调用，不得阻塞（只 try_send 进某个队列）。
+pub type OneWayFn = Arc<dyn Fn(InFrame) + Send + Sync>;
+
 /// 各自计数的消息族（3.3.3）；其余的 msg_type（不认识的、认证之后又发来的握手消息）都记在 "Unknown" 名下。
 const FAMILIES: [u16; 7] =
     [MSG_PING, MSG_META_CALL, MSG_DATA_CALL, MSG_PEER_CALL, MSG_NODE_CALL, MSG_RAFT, MSG_SNAPSHOT_FETCH];
@@ -61,6 +71,7 @@ pub struct RpcServer {
     keys: Arc<dyn KeyLookup + Send + Sync>,
     queue: usize,
     services: RwLock<HashMap<u16, Arc<dyn Service>>>,
+    oneway: RwLock<HashMap<u16, OneWayFn>>,
     stats: [OnceLock<Arc<FamilyStats>>; FAMILIES.len() + 1], // FAMILIES 各一个 + Unknown；第一次用到时注册，之后不加锁
     hint: OnceLock<HintFn>,
 }
@@ -79,6 +90,7 @@ impl RpcServer {
             keys,
             queue: net.send_queue as usize,
             services: RwLock::new(HashMap::new()),
+            oneway: RwLock::new(HashMap::new()),
             stats: Default::default(),
             hint: OnceLock::new(),
         })
@@ -92,6 +104,11 @@ impl RpcServer {
     /// 注册一个消息族的服务（例如 `MSG_META_CALL`）。
     pub fn add_service(&self, msg_type: u16, s: Arc<dyn Service>) {
         self.services.write().unwrap_or_else(|e| e.into_inner()).insert(msg_type, s);
+    }
+
+    /// 登记一种 OneWay 帧的处理函数（例如 `MSG_RAFT`）。
+    pub fn add_oneway(&self, msg_type: u16, f: OneWayFn) {
+        self.oneway.write().unwrap_or_else(|e| e.into_inner()).insert(msg_type, f);
     }
 
     /// 在一个传输上开始监听；返回要写进 `NodeRecV1.addrs` 的地址（None = 这个传输在本节点不监听）。
@@ -159,7 +176,11 @@ impl RpcServer {
             return;
         }
         if hdr.kind == FrameKind::OneWay {
-            return; // OneWay（RaftMsg）的服务 M8 起才有：现在丢弃（raft 会重发）
+            let handler = self.oneway.read().unwrap_or_else(|e| e.into_inner()).get(&hdr.msg_type).cloned();
+            if let Some(on_frame) = handler.filter(|_| !f.bulk_dropped) {
+                on_frame(f); // bulk 被丢弃的、没有处理函数的：丢掉（raft 会重发）
+            }
+            return;
         }
         let r = Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type), hint);
         if f.bulk_dropped {
@@ -274,9 +295,17 @@ impl Responder {
         self.finish(f, ErrCode(0));
     }
     /// ERROR 帧；leader_hint 由 core 自动填（`NOT_LEADER` 时问 [`RpcServer::set_leader_hint`] 登记的函数）
-    pub fn error(mut self, code: ErrCode, extra: u64) {
-        let hint = self.hint.as_ref().filter(|_| code == ErrCode::NOT_LEADER).and_then(|f| f());
-        let f = error_frame(self.header(), ErrorBody { leader_hint: hint, ..ErrorBody::new(code, extra) });
+    pub fn error(self, code: ErrCode, extra: u64) {
+        self.error_body(ErrorBody::new(code, extra));
+    }
+    /// ERROR 帧，带一句给人看的原因（`ErrorBody.msg`；默认是错误码名）；leader_hint 与 [`Responder::error`] 一样自动填。
+    pub fn error_with(self, code: ErrCode, msg: String) {
+        self.error_body(ErrorBody { msg, ..ErrorBody::new(code, 0) });
+    }
+    fn error_body(mut self, mut body: ErrorBody) {
+        let code = ErrCode(body.code);
+        body.leader_hint = self.hint.as_ref().filter(|_| code == ErrCode::NOT_LEADER).and_then(|f| f());
+        let f = error_frame(self.header(), body);
         self.finish(f, code);
     }
     /// 什么也不回（Drop 时也不自动回 EIO）：对端等到超时后用同一个 seq 重试。只给 fail point `meta.reply.drop` 用。
@@ -290,8 +319,7 @@ impl Responder {
     /// 这个请求在流结束时（最后一帧、`StreamTx::error`，或 StreamTx 被丢弃）才计入指标。
     pub fn into_stream(mut self) -> StreamTx {
         self.done = true;
-        let (conn, hdr, stats, t0) = (self.conn.clone(), self.header(), self.stats.clone(), self.t0);
-        StreamTx { conn, hdr, stats, t0, finished: false }
+        StreamTx::new(self.conn.clone(), self.header(), self.stats.clone(), self.t0)
     }
 
     fn header(&self) -> FrameHeader {
@@ -329,54 +357,4 @@ impl Drop for Responder {
 fn error_frame(mut hdr: FrameHeader, body: ErrorBody) -> OutFrame {
     (hdr.kind, hdr.flags) = (FrameKind::Response, FLAG_ERROR);
     OutFrame { hdr, body: encode_body(&body), bulk: vec![], recv_into: None }
-}
-
-/// 流式回复的发送端（`Responder::into_stream`）。没发最后一帧就被丢弃时自动回 `EIO`（与 Responder 相同，3.6.3），
-/// 客户端的这个流立即结束，不用等"相邻两帧之间"的超时（SnapshotFetch 是 10 min）。
-pub struct StreamTx {
-    conn: ConnHandle,
-    hdr: FrameHeader,
-    stats: Arc<FamilyStats>,
-    t0: Instant,
-    finished: bool, // 已经发了最后一帧、ERROR 帧，或连接已断
-}
-
-impl StreamTx {
-    /// 发一个 StreamChunk 帧；`last = true` 时带 LAST_CHUNK（流结束）。连接已断 → `ECONNRESET`（流到此为止）；
-    /// 这一帧超过协议上限 → `FEATURE_UNSUPPORTED`（没发出去，流还在：可以改发小一点的，或用 [`StreamTx::error`] 结束）。
-    pub fn send(&mut self, body: Vec<u8>, bulk: Vec<BufSlice>, last: bool) -> Result<(), ErrCode> {
-        let mut hdr = self.hdr;
-        (hdr.kind, hdr.flags) = (FrameKind::StreamChunk, if last { FLAG_LAST_CHUNK } else { 0 });
-        let r = self.conn.send(OutFrame { hdr, body, bulk, recv_into: None });
-        match r {
-            Ok(()) if last => self.end(ErrCode(0)),
-            Err(e) if e != ErrCode::FEATURE_UNSUPPORTED => self.end(e),
-            _ => {}
-        }
-        r
-    }
-
-    /// 以错误码结束这个流：发一个 ERROR 帧，客户端的 `StreamRx::next` 返回这个错误。
-    pub fn error(mut self, code: ErrCode) {
-        self.fail(code);
-    }
-
-    fn fail(&mut self, code: ErrCode) {
-        let _ = self.conn.send(error_frame(self.hdr, ErrorBody::new(code, 0)));
-        self.end(code);
-    }
-
-    fn end(&mut self, code: ErrCode) {
-        self.finished = true;
-        self.stats.record(code, self.t0);
-    }
-}
-
-impl Drop for StreamTx {
-    fn drop(&mut self) {
-        if !self.finished {
-            conn::counters().req_dropped.inc(); // 没发最后一帧就被丢弃 → 回 EIO（客户端的流立即结束）
-            self.fail(ErrCode::EIO);
-        }
-    }
 }

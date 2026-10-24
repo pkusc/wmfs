@@ -8,14 +8,16 @@
 //! `after` 之后的一段已经被修剪 → `410 {"error":"gone","oldest": …}`（缺口显式；修剪在 M11 的 gc）。查询参数没给用默认值
 //! （after 0、limit 1000、wait_ms 0），给了却不是非负整数 → `400 einval`（不静默当成默认值）。游标名只能由字母、数字和 `.` `_` `-`
 //! 组成（1–64 个）。指标：`wmfs_changelog_longpolls`（挂着的长轮询数）；消费者的落后条数 `wmfs_changelog_consumer_lag{name}` 由
-//! cluster-mgr 每 5 s 刷新（`meta::changelog::refresh_lag`）。
+//! cluster-mgr 每 5 s 刷新（`meta::changelog::refresh_lag`）。实现注记（M8）：本节点在等的时候失去 leader 身份（raft 线程发布了新角色
+//! 之后也唤醒等待者）→ 立即按 ADR-0038 第 2 条的状态码回（409 带 leader 的管理地址，或 503），不挂到 `wait_ms` 到期；醒来之后的那次读
+//! 失败于 `NOT_LEADER` 时也一样（`api.rs` 的 `failed_at`）。
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use wmfs_api::metrics;
 
-use super::api::{failed, read, write};
+use super::api::{failed, failed_at, leader_gate, read, write};
 use super::http::{MgmtCtx, Reply, err, json};
 use crate::api::types::{CursorReq, GoneReply};
 use crate::api::url::param;
@@ -51,7 +53,7 @@ pub(super) fn serve(
             }
             match write(eng, req, move |v, x| changelog::set_cursor(v, x, &c.name, c.seq)) {
                 Ok(out) => json(200, &out),
-                Err(f) => failed(f),
+                Err(f) => failed_at(eng, f),
             }
         }
         ("GET", "/api/v1/changelog/cursor") => {
@@ -59,7 +61,7 @@ pub(super) fn serve(
             match read(eng, req, |v, _c| Ok(changelog::get_cursor(v, &name)?)) {
                 Ok(Some(c)) => json(200, &c),
                 Ok(None) => err(404, "enoent", format!("没有名为 {name:?} 的游标")),
-                Err(f) => failed(f),
+                Err(f) => failed_at(eng, f),
             }
         }
         _ => err(400, "einval", format!("{path} 不支持 {method}")),
@@ -106,13 +108,16 @@ fn poll(ctx: &MgmtCtx, eng: &EmbeddedEngine, req: &ReqCtx, after: u64, limit: u3
         match page {
             Ok(Page::Events(p)) if p.events.is_empty() && now < deadline => {
                 eng.wait_changelog(seen, Duration::from_millis(deadline - now));
+                if let Some(r) = leader_gate(eng) {
+                    break r; // 等的时候本节点失去了 leader（M8）：立即回 409 / 503，不挂到超时
+                }
             }
             Ok(Page::Events(p)) => break json(200, &p),
             Ok(Page::Gone { oldest }) => {
                 let message = format!("seq {after} 之后的一段已经被修剪（保留期之外），最早还在的是 {oldest}");
                 break json(410, &GoneReply { error: "gone".into(), message, oldest });
             }
-            Err(f) => break failed(f),
+            Err(f) => break failed_at(eng, f),
         }
     };
     if held {

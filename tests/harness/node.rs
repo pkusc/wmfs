@@ -113,7 +113,7 @@ pub fn init(dir: &Path) {
 pub fn start(dir: &Path) -> Running {
     let nd = node_dir(dir);
     let cfg = NodeConfig::parse(&std::fs::read_to_string(nd.join("node.toml")).unwrap()).unwrap();
-    let run = server::start(&nd, &cfg, plugins(&cfg), "test").unwrap();
+    let run = server::start(&nd, &cfg, plugins(&cfg), "test", Default::default()).unwrap();
     if std::env::var_os("WMFS_LOG").is_none() {
         log::set_level(log::Level::Warn);
     }
@@ -141,14 +141,19 @@ pub fn file_client(dir: &Path, run: &Running) -> Arc<FileClient> {
 }
 
 fn connect(dir: &Path, run: &Running, key: &str, pool: PoolConfig) -> Client {
-    let kf = KeyFile::parse(&std::fs::read_to_string(node_dir(dir).join(format!("keys/{key}.key"))).unwrap()).unwrap();
+    let ep = Endpoint { node: 1, addrs: run.addrs.clone() };
+    connect_seeds(&node_dir(dir), &[ep], key, pool)
+}
+
+/// 用 `<节点目录>/keys/<key>.key` 连到 `seeds` 里的节点（MetaClient 跟随 leader；多节点的测试给全部节点，M8）。
+pub fn connect_seeds(nd: &Path, seeds: &[Endpoint], key: &str, pool: PoolConfig) -> Client {
+    let kf = KeyFile::parse(&std::fs::read_to_string(nd.join(format!("keys/{key}.key"))).unwrap()).unwrap();
     let pool = MemPool::new(&pool).unwrap();
     let t = tcp::TcpTransport::new(&Default::default(), 5000).unwrap();
     let rpc = RpcClient::new(pool, vec![Arc::new(t)], kf, Default::default()).unwrap();
-    let ep = Endpoint { node: 1, addrs: run.addrs.clone() };
     let info = SessionInfo { client_name: "test".into(), host: "h".into(), host_id: "h".into(), mount: "/m".into() };
     let opts = MetaClientOpts { rpc_timeout: Duration::from_secs(10), op_timeout: Duration::from_secs(30) };
-    let meta = Arc::new(MetaClient::connect_with(rpc.clone(), &[ep], info, opts).unwrap());
+    let meta = Arc::new(MetaClient::connect_with(rpc.clone(), seeds, info, opts).unwrap());
     let data = DataClient::for_meta(rpc.clone(), meta.clone(), Duration::from_secs(10), Duration::from_secs(30));
     Client { meta, data, rpc }
 }

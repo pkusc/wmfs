@@ -2,6 +2,8 @@
 //! [`ProposeOutcome`]、raft 线程发布的只读快照 [`Published`]、打开 Driver 的参数 [`DriverOpts`]，以及 raft 参数 [`config`]。
 //! `driver` 模块原样转出它们。
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -35,18 +37,27 @@ pub enum ProposeOutcome {
 
 /// raft 线程发布给其他线程的快照：其他线程只读它，绝不碰 RawNode。实现注记（M7）：另有一个"写了 changelog 的批次"计数，
 /// changelog 长轮询（3.11）在它上面等：raft 线程应用了写 0x0E 的批次（写事务提交之后）就加一并唤醒全部等待者。
+/// 实现注记（M8）：失去 leader 身份时也加一（在发布了新角色之后：长轮询醒来看到自己不再是 leader，立即回 409/503，不挂到超时）；
+/// `mismatch` = 本节点已应用的 GLOBAL plugins 与本地插件清单不一致（还没有清单、applied 0 的新节点不算）——cluster-mgr 在任何角色上
+/// 据此退出（退出码 3），`--adopt-local-plugins` 的节点则在当选就绪之后把清单改成本地的（3.7.2）。
 pub struct Published {
     pub(super) role: Mutex<RoleInfo>,
     pub(super) status: Mutex<EngineStatus>,
     changelog: Mutex<u64>,
     changelog_cv: Condvar,
+    pub(super) mismatch: AtomicBool,
 }
 
 impl Published {
     pub(super) fn new() -> Published {
         let role = RoleInfo { role: StateRole::Follower, term: 0, leader_id: 0, ready: false };
         let (changelog, changelog_cv) = (Mutex::new(0), Condvar::new());
-        Published { role: Mutex::new(role), status: Mutex::new(EngineStatus::default()), changelog, changelog_cv }
+        let (status, mismatch) = (Mutex::new(EngineStatus::default()), AtomicBool::new(false));
+        Published { role: Mutex::new(role), status, changelog, changelog_cv, mismatch }
+    }
+    /// 已应用的集群插件清单与本地的不一致（见类型的说明）。
+    pub fn plugins_mismatch(&self) -> bool {
+        self.mismatch.load(Ordering::Relaxed)
     }
     pub fn role(&self) -> RoleInfo {
         *lock(&self.role)
@@ -65,17 +76,21 @@ impl Published {
             self.changelog_cv.wait_timeout_while(g, timeout, |n| *n == seen).unwrap_or_else(|e| e.into_inner());
         *g
     }
-    /// raft 线程：应用了写 changelog 的批次（写事务已提交）。
-    pub(super) fn changelog_applied(&self) {
+    /// raft 线程：写了 changelog 的批次应用之后（写事务已提交），或本节点失去 leader 时（M8，发布了新角色之后）——计数加一、
+    /// 唤醒全部等待者。
+    pub(super) fn wake_changelog(&self) {
         *lock(&self.changelog) += 1;
         self.changelog_cv.notify_all();
     }
 }
 
-/// 打开 Driver 的参数。
+/// 打开 Driver 的参数。实现注记（M8）：`snap_dir` = 下载的快照文件放在哪（`<data_dir>/meta`，3.4.1.7）；`adopt_local_plugins` =
+/// `wmfs server --adopt-local-plugins`：插件清单不一致也当就绪 leader（之后由 cluster-mgr 把 GLOBAL plugins 改成本地清单，3.7.2 第 5 条）。
 pub struct DriverOpts {
     pub node_id: u32,
     pub plugins: PluginListV1, // 本节点的插件清单：与已提交的 GLOBAL plugins 相同才算就绪（3.4.1.4 规则 3）
+    pub snap_dir: PathBuf,
+    pub adopt_local_plugins: bool,
 }
 
 /// raft 参数（3.4.1.1）。`applied` 来自 `raft_state["applied"]`（3.2.6 的写入规则 M4，坑 P9）。

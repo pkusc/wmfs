@@ -152,21 +152,25 @@ impl RpcClient {
         }
     }
 
-    /// 流的一帧：交给 StreamRx、把期限往后推；最后一帧（或出错）之后从在途表里摘掉。
+    /// 流的一帧：把期限往后推、交给 StreamRx；最后一帧（或出错）之后从在途表里摘掉。通道是有界的（client.rs 的 `STREAM_WINDOW`）：
+    /// 接收方慢时读线程在这里等——在在途表的锁外面等，别的调用照常登记与结束。
     fn stream_chunk(&self, id: u64, r: Result<InFrame, ErrCode>, last: bool) {
         let end = last || r.is_err();
-        {
+        let tx = {
             let mut m = self.track();
             let Some(p) = m.get_mut(&id) else { return };
             let Waiter::Stream(tx) = &p.w else { return };
             p.deadline = clock::mono_ms() + p.timeout_ms + 1;
-            let _ = tx.send(r);
-            if !end {
-                return;
+            let tx = tx.clone();
+            if end {
+                m.remove(&id);
             }
-            m.remove(&id);
+            tx
+        };
+        if end {
+            self.update_gauge();
         }
-        self.update_gauge();
+        let _ = tx.send(r);
     }
 
     /// 一条连接断了：从连接表摘掉（如果还是它），它上面的在途调用全部以 ECONNRESET 结束。

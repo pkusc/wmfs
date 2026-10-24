@@ -119,6 +119,10 @@ pub struct JoinReq {
     pub plugins: Vec<String>, // 本节点的插件清单；与 GLOBAL plugins 不同 → 拒绝加入并列出差异
 }
 
+/// `JoinReq.meta_role`：`--meta none`（只做数据）、`--meta auto`（现有元数据成员不到 3 个时以 learner 加入）。
+pub const JOIN_META_NONE: u8 = 0;
+pub const JOIN_META_AUTO: u8 = 1;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum NodeReply {
     HeartbeatOk { lease_ms: u64, map_epoch: u64, leader_wall_ms: u64 },

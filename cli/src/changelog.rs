@@ -4,6 +4,8 @@
 //! `-f` 之后一直长轮询（`wait_ms=5000`：ApiClient 的单次请求超时是 10 s）打印新事件，直到被 Ctrl-C。服务端没挂住就回了空页（每个节点
 //! 同时最多 2 个长轮询，第 3 个起立即回）→ 隔 1 s 再问（[`pause_ms`]），不忙等。每个事件一行：`#seq 时间(UTC) 操作 ino=…`，再带上
 //! 非零的字段与 extra；`--json` 每页一行 `{"events": [...], "next", "last_seq"}`（一条事件也没有时输出一行空页，带着 last_seq）。
+//! 实现注记（M8 审查）：`-f` 碰上换 leader（旧 leader 连不上、还在选举的节点回 503、409 指向刚被杀的 leader——ApiClient 都报成连不上或
+//! 503）不退出：保留读到的位置，隔 1 s 再问，连续失败最多 60 s（[`leader_changing`]）。
 
 use std::time::Duration;
 
@@ -16,8 +18,9 @@ use wmfs_mgr::api::{ApiClient, ApiError};
 use crate::attr::{ApiArgs, client, failed};
 use crate::out;
 
-/// `-f` 的一次长轮询最多挂多久（ApiClient 的单次请求超时是 10 s）。
+/// `-f` 的一次长轮询最多挂多久（ApiClient 的单次请求超时是 10 s）；换 leader 时连续失败最多等多久。
 const WAIT_MS: u64 = 5000;
+const FOLLOW_RETRY_MS: u64 = 60_000;
 
 #[derive(clap::Subcommand)]
 pub enum ChangelogCmd {
@@ -53,6 +56,11 @@ pub fn line(e: &ChangeEvent) -> String {
 
 fn page(c: &ApiClient, after: u64, wait_ms: u64) -> Result<ChangelogPage, ApiError> {
     c.get(&format!("/api/v1/changelog?after={after}&limit={PAGE_MAX}&wait_ms={wait_ms}"))
+}
+
+/// 这个错误像是 leader 正在换（见文件头）：连不上（status 0）或 503。
+fn leader_changing(e: &ApiError) -> bool {
+    e.status == 0 || e.status == 503
 }
 
 /// `-f` 的一次长轮询回来之后、发下一次之前等多久（毫秒）：空页、且不到 1 s 就回来了 = 服务端没挂住（这个节点的长轮询名额满了）
@@ -102,12 +110,18 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
         return 0;
     }
     // -f：从读到的最后一条接着等（不另问一次最新的 seq，中间提交的不会漏）
+    let mut failing_since = None;
     loop {
         let t0 = clock::mono_ms();
         let p = match page(&c, next, WAIT_MS) {
             Ok(p) => p,
+            Err(e) if leader_changing(&e) && t0 - *failing_since.get_or_insert(t0) < FOLLOW_RETRY_MS => {
+                std::thread::sleep(Duration::from_secs(1)); // 换 leader：保留 next，隔 1 s 再问
+                continue;
+            }
             Err(e) => return failed(api.json, &e),
         };
+        failing_since = None;
         next = p.next;
         if !p.events.is_empty() && print(&p) != 0 {
             return 1;

@@ -16,14 +16,17 @@
 //! （两个 target 的超级块与 chunk 目录会互相踩到）。实现注记（M5）：init 给每个 target 建目录、写 TARGET 超级块（3.2.3：
 //! cluster_id、target_id = 1..=n、node_id 1，`atomic_write`，在 NODE 之前）；任何一个 target 目录里已经有超级块（属于别的集群）
 //! → 拒绝初始化——在写任何文件之前就查完（与重复、嵌套的检查一起），所以被拒绝时什么也没写，改正参数就能重来。
-//! `c/`、`p/`、`t/` 由 chunk_store 插件打开 target 时建。
+//! `c/`、`p/`、`t/` 由 chunk_store 插件打开 target 时建。实现注记（M8）：`wmfs join` 的本地侧在 `init/join.rs`，与这里共用
+//! `check_new_node`、`node_config`、`write_common`、`create_meta_db`、`write_superblocks`、`write_node`（同样的文件、同样的顺序，NODE 最后）。
 
 mod initial_kv;
+mod join;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub use initial_kv::{HOME_INO, InitialKv, SCRATCH_INO, default_class, initial_kv};
+pub use join::{JoinError, JoinOpts, join_node};
 use serde::{Deserialize, Serialize};
 use wmfs_api::hex::{hex, unhex};
 use wmfs_api::types::KeyFile;
@@ -133,52 +136,85 @@ pub struct InitOpts {
 /// 建一个新的单节点数据目录。目录必须不存在或为空（防止覆盖已有集群，坑 P14）。
 pub fn init_node(o: &InitOpts) -> Result<(), String> {
     let d = &o.data_dir;
-    if std::fs::read_dir(d).is_ok_and(|mut it| it.next().is_some()) {
-        return Err(format!("{} 不是空目录：拒绝初始化（防止覆盖已有集群）", d.display()));
-    }
-    check_targets(&o.targets)?;
-    for sub in ["keys", "logs", "run", "meta"] {
-        std::fs::create_dir_all(d.join(sub)).map_err(|e| format!("建目录 {} 失败：{e}", d.join(sub).display()))?;
-    }
+    check_new_node(d, &o.targets)?;
     let (mut cluster_id, mut master) = ([0u8; 16], [0u8; 32]);
     rand::fill(&mut cluster_id);
     rand::fill(&mut master);
     let node = NodeFile { format: 1, cluster_id: hex(&cluster_id), node_id: 1, created_ms: clock::wall_ms() };
-    let mut cfg =
-        NodeConfig { failpoints_api: o.failpoints_api, debug_ops: o.debug_ops, mem: o.mem, ..NodeConfig::default() };
-    cfg.mgmt.listen = format!("{}:{}", o.addr, o.mgmt_port);
-    let tcp =
-        toml::Table::from_iter([("listen".to_string(), toml::Value::String(format!("{}:{}", o.addr, o.rpc_port)))]);
-    cfg.plugin.insert("tcp".into(), tcp);
-    cfg.debug.host_id = o.host_id.clone();
-    cfg.targets = o.targets.clone();
+    let net = Listen { addr: &o.addr, rpc_port: o.rpc_port, mgmt_port: o.mgmt_port };
+    let mut cfg = node_config(&net, &o.targets, o.host_id.clone());
+    (cfg.failpoints_api, cfg.debug_ops, cfg.mem) = (o.failpoints_api, o.debug_ops, o.mem);
     cfg.plugins.disable = o.profile.disabled_plugins();
-    let node_toml = toml::to_string(&node).map_err(|e| format!("NODE 编码失败：{e}"))?;
-    let key = |id| KeyFile { key_id: id, secret: derive_secret(&master, id) }.to_line();
-    let write = |name: &str, bytes: &[u8]| {
-        sys::atomic_write(&d.join(name), bytes).map_err(|e| format!("写 {} 失败：{e}", d.join(name).display()))
-    };
-    write("cluster.key", &master)?;
-    write("node.toml", cfg.to_toml().as_bytes())?;
-    write("keys/admin.key", key(ADMIN_KEY).as_bytes())?;
-    write("keys/client.key", key(CLIENT_KEY).as_bytes())?;
+    write_common(d, &cfg, &master)?;
     write_meta(d, o, &node)?;
-    write_superblocks(o, &node)?;
-    write("NODE", node_toml.as_bytes()) // NODE 放最后：它是提交点（见文件头），之前的文件都已经落盘
+    let ids: Vec<u32> = (1..=o.targets.len() as u32).collect();
+    write_superblocks(&o.targets, &ids, &node)?;
+    write_node(d, &node) // NODE 放最后：它是提交点（见文件头），之前的文件都已经落盘
+}
+
+/// 监听地址（init 与 join 共用）。
+pub(crate) struct Listen<'a> {
+    pub addr: &'a str,
+    pub rpc_port: u16,
+    pub mgmt_port: u16,
+}
+
+/// 新节点的检查（init 与 join 共用）：数据目录必须不存在或为空（防止覆盖已有集群，坑 P14）；target 不能重复、嵌套或已有超级块。
+pub(crate) fn check_new_node(d: &Path, targets: &[TargetConfig]) -> Result<(), String> {
+    if std::fs::read_dir(d).is_ok_and(|mut it| it.next().is_some()) {
+        return Err(format!("{} 不是空目录：拒绝初始化（防止覆盖已有集群）", d.display()));
+    }
+    check_targets(targets)
+}
+
+/// node.toml：监听地址（`[plugin.tcp] listen`、`[mgmt] listen`）、target、模拟的主机号；其余取默认值。
+pub(crate) fn node_config(l: &Listen, targets: &[TargetConfig], host_id: Option<String>) -> NodeConfig {
+    let mut cfg = NodeConfig::default();
+    cfg.mgmt.listen = format!("{}:{}", l.addr, l.mgmt_port);
+    let tcp =
+        toml::Table::from_iter([("listen".to_string(), toml::Value::String(format!("{}:{}", l.addr, l.rpc_port)))]);
+    cfg.plugin.insert("tcp".into(), tcp);
+    cfg.debug.host_id = host_id;
+    cfg.targets = targets.to_vec();
+    cfg
+}
+
+/// 建子目录，写 cluster.key、node.toml 与两把 key 文件（都在 NODE 之前）。
+pub(crate) fn write_common(d: &Path, cfg: &NodeConfig, master: &[u8; 32]) -> Result<(), String> {
+    for sub in ["keys", "logs", "run", "meta"] {
+        std::fs::create_dir_all(d.join(sub)).map_err(|e| format!("建目录 {} 失败：{e}", d.join(sub).display()))?;
+    }
+    let key = |id| KeyFile { key_id: id, secret: derive_secret(master, id) }.to_line();
+    write_file(d, "cluster.key", master)?;
+    write_file(d, "node.toml", cfg.to_toml().as_bytes())?;
+    write_file(d, "keys/admin.key", key(ADMIN_KEY).as_bytes())?;
+    write_file(d, "keys/client.key", key(CLIENT_KEY).as_bytes())
+}
+
+fn write_file(d: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    sys::atomic_write(&d.join(name), bytes).map_err(|e| format!("写 {} 失败：{e}", d.join(name).display()))
+}
+
+/// 写 NODE（init / join 的提交点，最后写）。
+pub(crate) fn write_node(d: &Path, node: &NodeFile) -> Result<(), String> {
+    let node_toml = toml::to_string(node).map_err(|e| format!("NODE 编码失败：{e}"))?;
+    write_file(d, "NODE", node_toml.as_bytes())
+}
+
+/// 新建 `meta/meta.redb`（0600）。redb 只 fsync 文件内容：调用方写完初始状态之后还要 fsync `meta/` 目录。
+pub(crate) fn create_meta_db(d: &Path) -> Result<redb::Database, String> {
+    let path = d.join("meta/meta.redb");
+    let db = redb::Database::create(&path).map_err(|e| format!("建元数据库 {} 失败：{e}", path.display()))?;
+    let private = std::fs::Permissions::from_mode(0o600); // 与 NODE、密钥文件一样只给本用户读写（3.2.1 的实现注记）
+    std::fs::set_permissions(&path, private).map_err(|e| format!("设置 {} 的权限失败：{e}", path.display()))?;
+    Ok(db)
 }
 
 /// 写 `meta/meta.redb` 的 index = 1 初始状态（3.4.1.9、3.4.3 第 3 步）。根目录的属主 = 运行 init 的用户（本进程的有效
 /// uid/gid；数据目录可以是别的用户事先建好的空目录，所以不取它的属主）。
 fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile) -> Result<(), String> {
     let path = d.join("meta/meta.redb");
-    let read = |p: &str| match std::fs::read_to_string(p) {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            log::warn("init", format_args!("读不到 {p}（{e}）：NodeRecV1 里的这一项留空"));
-            String::new()
-        }
-    };
-    let machine_id = read("/etc/machine-id");
+    let machine_id = read_fact("/etc/machine-id");
     let i = InitialKv {
         cluster_id: node.cluster_id_bytes()?,
         created_ms: node.created_ms,
@@ -187,14 +223,12 @@ fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile) -> Result<(), String> {
         mgmt_addr: format!("{}:{}", o.addr, o.mgmt_port),
         host_id: o.host_id.clone().unwrap_or_else(|| machine_id.clone()),
         machine_id,
-        hostname: read("/proc/sys/kernel/hostname"),
+        hostname: read_fact("/proc/sys/kernel/hostname"),
         plugins: o.plugins.clone(),
         targets: o.targets.iter().map(|t| target_rec(t, node.node_id, node.created_ms)).collect::<Result<_, _>>()?,
         profile: o.profile,
     };
-    let db = redb::Database::create(&path).map_err(|e| format!("建元数据库 {} 失败：{e}", path.display()))?;
-    let private = std::fs::Permissions::from_mode(0o600); // 与 NODE、密钥文件一样只给本用户读写（3.2.1 的实现注记）
-    std::fs::set_permissions(&path, private).map_err(|e| format!("设置 {} 的权限失败：{e}", path.display()))?;
+    let db = create_meta_db(d)?;
     storage::bootstrap(&db, &[node.node_id as u64], &initial_kv(&i)).map_err(|e| format!("{}：{e}", path.display()))?;
     // redb 只 fsync 文件内容：新建的 meta.redb 在 meta/ 里的目录项要另外落盘，才能在之后写 NODE（提交点）。
     // meta/ 自己在数据目录里的目录项已经落盘了——写 cluster.key 的 atomic_write 在它建好之后 fsync 过数据目录
@@ -202,10 +236,22 @@ fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile) -> Result<(), String> {
     sys::fsync_dir(&meta_dir).map_err(|e| format!("fsync 目录 {} 失败：{e}", meta_dir.display()))
 }
 
-/// 给每个 target 写超级块（见文件头的实现注记）：target_id 依次为 1..=n，与初始 KV 的 TargetRecV1 一致。
-fn write_superblocks(o: &InitOpts, node: &NodeFile) -> Result<(), String> {
+/// 读一行本机信息（machine-id、hostname）；读不到写一行警告、留空。
+pub(crate) fn read_fact(p: &str) -> String {
+    match std::fs::read_to_string(p) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            log::warn("init", format_args!("读不到 {p}（{e}）：NodeRecV1 里的这一项留空"));
+            String::new()
+        }
+    }
+}
+
+/// 给每个 target 写超级块（见文件头的实现注记）：init 的 target_id 依次为 1..=n，与初始 KV 的 TargetRecV1 一致；join 的取自
+/// `Joined.target_ids`。
+pub(crate) fn write_superblocks(targets: &[TargetConfig], ids: &[u32], node: &NodeFile) -> Result<(), String> {
     let cluster_id = node.cluster_id_bytes()?;
-    for (t, target_id) in o.targets.iter().zip(1u32..) {
+    for (t, &target_id) in targets.iter().zip(ids) {
         let dir = Path::new(&t.path);
         let sb_path = dir.join("TARGET");
         std::fs::create_dir_all(dir).map_err(|e| format!("建 target 目录 {} 失败：{e}", t.path))?;

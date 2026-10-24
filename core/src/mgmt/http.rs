@@ -22,7 +22,7 @@ use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health, NodeAddrs};
 use crate::base::{ErrCode, log};
 use crate::hooks::traits::KeyLookup;
 use crate::meta::engine::EmbeddedEngine;
-use crate::mgmt::{api, auth};
+use crate::mgmt::{api, auth, cluster};
 
 /// 请求体上限（字节）。
 const MAX_BODY: usize = 1 << 20;
@@ -130,6 +130,7 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
             json(200, &h)
         }
         (_, "/api/v1/failpoints") => failpoints(ctx, method, url, auth, body),
+        ("GET", "/api/v1/debug/meta-hash") => cluster::meta_hash(ctx, method, url, auth, body), // 每个节点都回答本节点的（M8）
         (_, p) if api::handles(p) => api::serve(ctx, method, url, auth, body),
         _ => err(404, "enoent", format!("没有这个接口：{method} {path}")),
     }

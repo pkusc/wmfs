@@ -2,7 +2,8 @@
 //! `GET /api/v1/status`、语义 `GET /api/v1/semantics`、集群运行参数 `POST /api/v1/cluster/settings`；changelog 与游标在 `changelog.rs`。
 //!
 //! - **只有就绪的元数据 leader 回答**：别的节点回 `409 {"error":"not_leader","leader":"http://<管理地址>"}`（ApiClient 自动跟随）；
-//!   还不知道 leader、或 leader 刚当选还没就绪 → `503`。
+//!   还不知道 leader、或 leader 刚当选还没就绪 → `503`。实现注记（M8 审查）：读或写的途中本节点失去了 leader（`NOT_LEADER`）也按
+//!   这一条回（[`failed_at`]），不回不带 leader 地址的 409——ApiClient 只跟随带 `leader` 的 409。
 //! - 读一律是线性一致读（`MetaEngine::read`，在管理 API 线程上）；写是 seq 0 的执行器闭包（`txn_blocking`），批次作废（`RETRY`）或
 //!   执行器队列满（`BUSY`）时退避重试几次——没有应用过，重来是安全的；结果不确定（`NOT_LEADER`）或重试用尽就如实报错，不自动重做，
 //!   也不拿闭包按批次覆盖层算出的业务错误当结论（[`settle_write`]）。
@@ -28,15 +29,16 @@ use crate::meta::attr_ops;
 use crate::meta::attr_registry::split;
 use crate::meta::cluster::settings;
 use crate::meta::engine::EmbeddedEngine;
-use crate::meta::engine::txn::{KvScan, KvTxn, MetaEngine, OpCtx, TxnOp, txn_blocking};
+use crate::meta::engine::txn::{KvScan, KvTxn, MetaEngine, OpCtx, TxnOp, txn_blocking, txn_blocking_exclusive};
 use crate::proto::meta::MetaReply;
 
-/// 这个路径归这里（或 `changelog.rs`）管吗。
+/// 这个路径归这里（或 `changelog.rs`、`cluster.rs`）管吗。
 pub fn handles(path: &str) -> bool {
     matches!(
         path,
         "/api/v1/attr" | "/api/v1/usage" | "/api/v1/status" | "/api/v1/semantics" | "/api/v1/cluster/settings"
     ) || path.starts_with("/api/v1/changelog")
+        || super::cluster::handles(path)
 }
 
 /// 签名校验 → 有元数据引擎 → 本节点是就绪的 leader → 按 (方法, 路径) 分派（见文件头）。
@@ -56,6 +58,9 @@ pub(super) fn serve(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&st
     let q = |name: &str| param(query, name);
     if path.starts_with("/api/v1/changelog") {
         return super::changelog::serve(ctx, eng, &req, method, path, query, body);
+    }
+    if super::cluster::handles(path) {
+        return super::cluster::serve(eng, &req, method, path, body); // M8：集群概览、节点、集群插件清单
     }
     let r = match (method, path) {
         ("GET", "/api/v1/attr") => {
@@ -84,7 +89,7 @@ pub(super) fn serve(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&st
         ("POST", "/api/v1/cluster/settings") => cluster_set(eng, &req, body),
         _ => Err(Failed::new(ErrCode::EINVAL, format!("{path} 不支持 {method}"))),
     };
-    r.unwrap_or_else(failed)
+    r.unwrap_or_else(|f| failed_at(eng, f))
 }
 
 fn attr_set(eng: &EmbeddedEngine, req: &ReqCtx, a: AttrSetReq) -> Result<Reply, Failed> {
@@ -101,8 +106,16 @@ fn cluster_set(eng: &EmbeddedEngine, req: &ReqCtx, body: &[u8]) -> Result<Reply,
     write(eng, req, move |v, c| Ok(settings::apply(v, c, &items)?)).map(|x| json(200, &x))
 }
 
+/// 失败 → HTTP 回复；`NOT_LEADER`（读或写的途中本节点失去了 leader）照 [`leader_gate`] 回 409 带 leader 的管理地址或 503（见文件头）。
+pub(super) fn failed_at(eng: &EmbeddedEngine, f: Failed) -> Reply {
+    if f.code != ErrCode::NOT_LEADER {
+        return failed(f);
+    }
+    leader_gate(eng).unwrap_or_else(|| err(503, "not_leader", "本节点刚失去 leader 又当选了，稍后重试".into()))
+}
+
 /// 不是就绪的 leader → 409（知道 leader 的管理地址）或 503。
-fn leader_gate(eng: &EmbeddedEngine) -> Option<Reply> {
+pub(super) fn leader_gate(eng: &EmbeddedEngine) -> Option<Reply> {
     let r = eng.role();
     if r.ready {
         return None;
@@ -187,6 +200,24 @@ pub(super) fn write<T: Send + 'static>(
     req: &ReqCtx,
     f: impl Fn(&mut dyn KvTxn, &OpCtx) -> Result<T, Failed> + Send + Sync + 'static,
 ) -> Result<T, Failed> {
+    write_with(eng, req, false, f)
+}
+
+/// 同 [`write`]，用于改变集群拓扑的修改（节点记录，3.4.1.4 规则 5：exclusive，本批最后一个）。
+pub(super) fn write_exclusive<T: Send + 'static>(
+    eng: &EmbeddedEngine,
+    req: &ReqCtx,
+    f: impl Fn(&mut dyn KvTxn, &OpCtx) -> Result<T, Failed> + Send + Sync + 'static,
+) -> Result<T, Failed> {
+    write_with(eng, req, true, f)
+}
+
+fn write_with<T: Send + 'static>(
+    eng: &EmbeddedEngine,
+    req: &ReqCtx,
+    exclusive: bool,
+    f: impl Fn(&mut dyn KvTxn, &OpCtx) -> Result<T, Failed> + Send + Sync + 'static,
+) -> Result<T, Failed> {
     let f = Arc::new(f);
     for i in 0..RETRIES {
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -197,7 +228,9 @@ pub(super) fn write<T: Send + 'static>(
             let _ = tx.try_send(r);
             code.map_or(Ok(MetaReply::Ok), Err)
         });
-        let r = txn_blocking(eng as &dyn MetaEngine, req.clone(), op);
+        let eng: &dyn MetaEngine = eng;
+        let r =
+            if exclusive { txn_blocking_exclusive(eng, req.clone(), op) } else { txn_blocking(eng, req.clone(), op) };
         match settle_write(r, rx.try_recv().ok(), i + 1 == RETRIES) {
             Some(out) => return out,
             None => backoff(i),

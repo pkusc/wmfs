@@ -1,22 +1,62 @@
 //! Driver 的"应用与发布"一侧（design.md 3.4.1.3 的 apply_entries/after_apply/publish_role、3.4.1.5、3.4.1.8、3.7.2）：
 //! 按顺序应用已提交条目、认领在途提议、日志压缩、发布角色与状态、比对集群插件清单。是 `driver.rs` 的子模块，
-//! 可以直接用 Driver 的私有字段。
+//! 可以直接用 Driver 的私有字段。实现注记（M8）：另有快照的安装（规则 M5，[`Driver::install`]）与 raft 线程的指标。
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use protobuf::Message as _;
-use raft::eraftpb::{ConfChangeV2, Entry, EntryType};
-use redb::{Durability, WriteTransaction};
-use wmfs_api::failpoint::fail_point;
-
 use raft::StateRole;
+use raft::eraftpb::{ConfChangeV2, Entry, EntryType, SnapshotMetadata};
+use redb::{Durability, WriteTransaction};
+use wmfs_api::failpoint::{fail_point, fail_point_value};
+use wmfs_api::metrics::{self, Counter, Gauge, Histogram};
 
-use super::{COMPACT_EVERY, COMPACT_KEEP, Driver, ProposeOutcome};
+use super::{ACTIVE_TICKS, COMPACT_EVERY, COMPACT_KEEP, Driver, ProposeOutcome};
 use crate::base::{lock, log};
+use crate::meta::cluster::plugins;
 use crate::meta::engine::txn::{EngineStatus, RoleInfo};
 use crate::meta::raft::or_abort;
+use crate::meta::raft::snapshot;
 use crate::meta::raft::storage::{self, KV};
 use crate::meta::schema::keys;
-use crate::meta::schema::raft_state::KEY_APPLIED;
+use crate::meta::schema::raft_state::{Applied, KEY_APPLIED};
 use crate::meta::schema::records::{KvOp, PluginListV1, WriteBatchV1, decode_v1};
+
+pub(super) struct Metrics {
+    pub(super) term: Arc<Gauge>,
+    pub(super) leader: Arc<Gauge>,
+    pub(super) commit: Arc<Gauge>,
+    pub(super) applied: Arc<Gauge>,
+    pub(super) persist: Arc<Histogram>,
+    pub(super) stale: Arc<Counter>,
+    pub(super) dropped: Arc<Counter>,
+    pub(super) installed: Arc<Counter>,
+}
+
+impl Metrics {
+    pub(super) fn new() -> Metrics {
+        Metrics {
+            term: metrics::gauge("wmfs_raft_term", "元数据 raft 的当前 term", &[]),
+            leader: metrics::gauge("wmfs_raft_is_leader", "本节点是否是元数据 leader（1/0）", &[]),
+            commit: metrics::gauge("wmfs_raft_commit_index", "元数据 raft 的 commit index", &[]),
+            applied: metrics::gauge("wmfs_raft_applied_index", "元数据 raft 已应用到的 index", &[]),
+            persist: metrics::histogram(
+                "wmfs_raft_persist_seconds",
+                "Ready 的第一个写事务提交耗时（含 fsync）",
+                &[],
+                metrics::SECONDS_BUCKETS,
+            ),
+            stale: metrics::counter(
+                "wmfs_meta_batch_stale_total",
+                "expect_version 不符而整批作废的批次数（应恒为 0，非 0 即告警）",
+                &[],
+            ),
+            dropped: metrics::counter("wmfs_raft_msg_dropped_total", "没能发出的 raft 消息数", &[]),
+            installed: metrics::counter("wmfs_raft_snapshot_installed_total", "本节点安装过的元数据快照数", &[]),
+        }
+    }
+}
 
 /// 一条已应用的条目：在途提议按 (index, term) 认领它。
 pub(super) struct AppliedEntry {
@@ -27,6 +67,25 @@ pub(super) struct AppliedEntry {
 }
 
 impl Driver {
+    /// 规则 M5 的安装（在第一个写事务里）：kv、raft_log、snap_meta、conf_state 由 `install_snapshot` 写，这里写 applied。
+    pub(super) fn install(&mut self, tx: &WriteTransaction, m: &SnapshotMetadata) {
+        let file = snapshot::file_path(&self.snap_dir, m.index, m.term);
+        let sv = or_abort(self.node.mut_store().install_snapshot(tx, m, &file), "安装快照");
+        self.applied = Applied { index: m.index, term: m.term, state_version: sv };
+        or_abort(storage::put_state(tx, KEY_APPLIED, &self.applied.encode()), "写 applied");
+    }
+
+    /// 快照安装的写事务提交之后：删掉快照文件，重新比对插件清单（kv 整个换了），日志压缩从这里重新计数。
+    pub(super) fn installed(&mut self, m: &SnapshotMetadata) {
+        let _ = std::fs::remove_file(snapshot::file_path(&self.snap_dir, m.index, m.term));
+        let rtx = or_abort(self.db.begin_read(), "读事务");
+        let committed = or_abort(storage::read_global::<PluginListV1>(&rtx, keys::G_PLUGINS), "读 GLOBAL plugins");
+        self.check_plugins(committed.as_ref());
+        self.compact_checked = m.index;
+        self.metrics.installed.inc();
+        log::info("raft", format_args!("node{} 安装了快照（index {}，term {}）", self.id, m.index, m.term));
+    }
+
     /// 在写事务 `tx` 里按顺序应用已提交条目（3.4.1.3），最后写 `applied`（与 KV 同事务）。
     pub(super) fn apply_entries(&mut self, tx: &WriteTransaction, ents: Vec<Entry>) -> Vec<AppliedEntry> {
         if ents.is_empty() {
@@ -129,7 +188,7 @@ impl Driver {
         // meta/cluster/map.rs），这里不用另外通知。实现注记（M7）：写了 changelog（0x0E）的批次 → 唤醒 changelog 长轮询的
         // 等待者（ADR-0033 第 9 条；写事务已经提交，它们新开的读事务看得到）
         if applied.iter().any(|a| a.changelog) {
-            self.published.changelog_applied();
+            self.published.wake_changelog();
         }
     }
 
@@ -137,11 +196,15 @@ impl Driver {
     /// 因为落盘的 hs.commit ≥ 落盘的 applied ≥ C，重启时 raft-rs 的 `hs.commit ≥ first_index − 1` 检查恒成立（坑 P8）。
     /// 单独一个 None 事务：崩溃时丢了它也无妨（日志里只是多留了一些条目）。
     pub(super) fn maybe_compact(&mut self) {
-        if self.applied.index < self.next_compact {
+        let (every, keep) = match fail_point_value("raft.compact.small") {
+            Some(n) if n > 0 => (n as u64, n as u64), // 测试用的小阈值（见 driver.rs 的 COMPACT_EVERY）
+            _ => (COMPACT_EVERY, COMPACT_KEEP),
+        };
+        if self.applied.index < self.compact_checked + every {
             return;
         }
-        self.next_compact = self.applied.index + COMPACT_EVERY;
-        let upto = self.durable_applied.saturating_sub(COMPACT_KEEP);
+        self.compact_checked = self.applied.index;
+        let upto = self.durable_applied.saturating_sub(keep);
         if upto <= self.node.store().snap_index() {
             return;
         }
@@ -160,8 +223,19 @@ impl Driver {
         let leader = r.state == StateRole::Leader;
         let role = RoleInfo { role: r.state, term: r.term, leader_id: r.leader_id as u32, ready: self.is_ready() };
         let cs = r.prs().conf().to_conf_state();
-        let ids = |v: &[u64]| v.iter().map(|x| *x as u32).collect::<Vec<u32>>();
-        let progress = if leader { r.prs().iter().map(|(id, p)| (*id as u32, p.matched)).collect() } else { vec![] };
+        let ids = |v: &[u64]| {
+            let mut ids: Vec<u32> = v.iter().map(|x| *x as u32).collect();
+            ids.sort(); // raft-rs 的成员是集合：排好序，输出稳定
+            ids
+        };
+        let mut progress: Vec<(u32, u64)> =
+            if leader { r.prs().iter().map(|(id, p)| (*id as u32, p.matched)).collect() } else { vec![] };
+        progress.sort();
+        // 最近一个选举超时里来过消息的成员（含自己）：挑接替 leader 的人时不挑已经死掉的（membership::heir）。用 `<`：从前任 leader
+        // 停下到自己当选至少隔了一个选举超时，前任刚好在边界上时也不算活着
+        let recent =
+            |id: &u32| *id == self.id || self.heard.get(&(*id as u64)).is_some_and(|t| self.ticks - t < ACTIVE_TICKS);
+        let active = progress.iter().map(|p| p.0).filter(recent).collect();
         let commit = r.raft_log.committed;
         let status = EngineStatus {
             applied: self.applied.index,
@@ -169,6 +243,8 @@ impl Driver {
             voters: ids(&cs.voters),
             learners: ids(&cs.learners),
             progress,
+            voters_outgoing: ids(&cs.voters_outgoing),
+            active,
         };
         self.metrics.term.set(r.term as f64);
         self.metrics.leader.set(if leader { 1.0 } else { 0.0 });
@@ -179,25 +255,20 @@ impl Driver {
     }
 
     /// 已提交的 GLOBAL plugins 与本节点的清单比对（3.7.2）。不一致 → 不就绪（执行器不建批次、读闸门不发 ReadIndex），
-    /// 写一条错误日志列出差异。实现注记（M3）：M8 起不一致时进程退出（退出码 3）。
+    /// 发布 `mismatch`，写一条错误日志列出差异。实现注记（M8）：cluster-mgr 看到 `mismatch` 就在任何角色上退出进程（退出码 3，
+    /// `cluster/plugins.rs`）——follower 不必等拿到新集群图（改清单的 leader 1 s 后就退出了，可能没人再给它图）；还没有清单的新节点
+    /// （applied 0）不算不一致。
     pub(super) fn check_plugins(&mut self, committed: Option<&PluginListV1>) {
         self.plugins_ok = committed == Some(&self.plugins);
-        if self.plugins_ok {
+        let mismatch = !self.plugins_ok && !(committed.is_none() && self.applied.index == 0);
+        self.published.mismatch.store(mismatch, Ordering::Relaxed);
+        if !mismatch {
             return;
         }
-        let Some(theirs) = committed else {
-            log::error("raft", "已应用的状态里没有 GLOBAL plugins（集群插件清单）——不当就绪 leader（3.7.2）");
-            return;
-        };
-        let missing: Vec<&String> = theirs.plugins.iter().filter(|p| !self.plugins.plugins.contains(p)).collect();
-        let extra: Vec<&String> = self.plugins.plugins.iter().filter(|p| !theirs.plugins.contains(p)).collect();
+        let why = plugins::why(&self.plugins, committed);
         log::error(
             "raft",
-            format_args!(
-                "本节点的插件集合与集群插件清单不一致：缺少 {missing:?}，多出 {extra:?}——不当就绪 leader（3.7.2）。\
-                 修复：开发集群多半是旧里程碑建的（新里程碑多了插件），wmfs dev down --purge 之后重新 wmfs dev up；\
-                 正式集群让全部节点启用同一组插件后重启"
-            ),
+            format_args!("本节点的插件集合与集群插件清单不一致：{why}——不当就绪 leader（3.7.2）。{}", plugins::FIX),
         );
     }
 }

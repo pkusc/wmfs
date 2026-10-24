@@ -5,7 +5,9 @@
 //! raft-rs 与引擎的 INFO 日志直接写 stderr（libtest 捕获不到），这里只留 WARN 及以上；要看全部日志就设 `WMFS_LOG=info`。
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_channel::{Receiver, bounded};
 use protobuf::Message as _;
@@ -94,6 +96,39 @@ pub fn bootstrap(voters: &[u64]) -> MemCrashBackend {
     b
 }
 
+/// 一个节点放下载的快照文件的临时目录（M8，3.4.1.7）：掉电重启时原样带到新的 Sim 里，丢弃时删掉。
+pub struct SnapDir(pub PathBuf);
+
+impl SnapDir {
+    pub fn new() -> SnapDir {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("wmfs-sim-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("建快照目录");
+        SnapDir(d)
+    }
+}
+
+impl Default for SnapDir {
+    fn default() -> SnapDir {
+        SnapDir::new()
+    }
+}
+
+impl Drop for SnapDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 一个新后端，里面是 join 的新节点的空状态（M8：空日志、空 ConfState，坑 P14；先由快照追上）。
+pub fn empty() -> MemCrashBackend {
+    quiet_logs();
+    let b = MemCrashBackend::new();
+    storage::bootstrap_empty(&open(&b), &[]).expect("写空状态");
+    b
+}
+
 /// 一个直接驱动的节点。
 pub struct Sim {
     pub id: u32,
@@ -101,6 +136,7 @@ pub struct Sim {
     pub db: Arc<Database>,
     pub driver: Driver,
     plugins: PluginListV1,
+    pub snaps: SnapDir,
 }
 
 /// 调试键空间里的一个 key。
@@ -115,18 +151,24 @@ impl Sim {
 
     /// 同 [`Sim::start`]，本节点的插件清单由测试给（与 GLOBAL plugins 不同的节点当选了也不就绪）。
     pub fn start_with(backend: MemCrashBackend, id: u32, plugins: PluginListV1) -> Sim {
-        quiet_logs();
-        let db = open(&backend);
-        let opts = DriverOpts { node_id: id, plugins: plugins.clone() };
-        let driver = Driver::open(db.clone(), opts).expect("Driver::open");
-        Sim { id, backend, db, driver, plugins }
+        Sim::start_in(backend, id, plugins, SnapDir::new())
     }
 
-    /// 掉电并重启：只留下已落盘的字节（先取快照、再丢掉旧节点）。
+    fn start_in(backend: MemCrashBackend, id: u32, plugins: PluginListV1, snaps: SnapDir) -> Sim {
+        quiet_logs();
+        let db = open(&backend);
+        let snap_dir = snaps.0.clone();
+        let opts = DriverOpts { node_id: id, plugins: plugins.clone(), snap_dir, adopt_local_plugins: false };
+        let driver = Driver::open(db.clone(), opts).expect("Driver::open");
+        Sim { id, backend, db, driver, plugins, snaps }
+    }
+
+    /// 掉电并重启：只留下已落盘的字节（先取快照、再丢掉旧节点）；快照目录原样留着（真实的文件在磁盘上）。
     pub fn crash(self) -> Sim {
-        let (b, id, plugins) = (self.backend.crash(), self.id, self.plugins.clone());
-        drop(self);
-        Sim::start_with(b, id, plugins)
+        let Sim { id, backend, db, driver, plugins, snaps } = self;
+        let b = backend.crash();
+        drop((driver, db, backend));
+        Sim::start_in(b, id, plugins, snaps)
     }
 
     /// 跑到就绪 leader（单节点：campaign 之后一两步就够）。
@@ -255,7 +297,11 @@ pub fn start_engine(b: &MemCrashBackend, plugins: PluginListV1) -> Arc<EmbeddedE
     quiet_logs();
     let db = Database::builder().create_with_backend(b.clone()).expect("在内存后端上打开 redb");
     let pipeline = Arc::new(ns_pipeline());
-    EmbeddedEngine::start(db, EngineOpts { node_id: 1, plugins, pipeline, cap_key: CAP_KEY }).expect("启动元数据引擎")
+    // 单节点的引擎收不到快照（没有元数据网络）：给一个不存在的目录（启动时清理快照残留，这里什么也不删）
+    let snap_dir = std::env::temp_dir().join("wmfs-engine-without-snapshots");
+    let adopt_local_plugins = false;
+    let o = EngineOpts { node_id: 1, plugins, pipeline, cap_key: CAP_KEY, rpc: None, snap_dir, adopt_local_plugins };
+    EmbeddedEngine::start(db, o).expect("启动元数据引擎")
 }
 
 /// 等引擎成为就绪 leader（最多 10 s）；插件清单不一致的引擎永远等不到（调用方别用它）。

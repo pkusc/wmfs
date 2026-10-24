@@ -11,24 +11,26 @@
 //! - raft 线程上的 redb 错误一律 fail-stop（写日志 + abort，0.2 第 5 条）；写方法返回 `EIO` 并已写好日志，
 //!   由调用方（driver）`or_abort`。
 //!
-//! 实现注记（M3）：`snapshot()` 回 `SnapshotTemporarilyUnavailable`——快照的导出与安装（3.4.1.7、规则 M5）在 M8；
-//! M3 的单节点集群没有需要快照的对端。
+//! 实现注记（M8）：`snapshot()` 经 [`Pins`]（`snapshot.rs`）导出——复用或新建一个 redb 读事务的 pin，raft 消息里只带 `SnapDesc`；
+//! [`RedbStorage::install_snapshot`] 是 follower 的安装（规则 M5）。init 与 join 写的初始状态、启动时读 applied 与 GLOBAL 记录的几个
+//! 函数在 `boot.rs`（这里原样转出，原来的路径照常可用）。
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 
 use protobuf::Message as _;
-use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
+use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
 use raft::{Error as RaftError, GetEntriesContext, RaftState, Storage, StorageError};
-use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 
+pub use super::boot::{bootstrap, bootstrap_empty, read_applied, read_global};
+use super::snapshot::{self, Pins};
 use super::{or_abort, redb_eio};
 use crate::base::{ErrCode, log};
-use crate::meta::schema::keys;
 use crate::meta::schema::raft_state::{
-    Applied, KEY_APPLIED, KEY_CONF_STATE, KEY_FORMAT, KEY_HARD_STATE, KEY_SNAP_META, MetaFormatV1, SnapMeta,
+    KEY_CONF_STATE, KEY_FORMAT, KEY_HARD_STATE, KEY_SNAP_META, MetaFormatV1, SnapMeta,
 };
-use crate::meta::schema::records::decode_v1;
 
 pub const RAFT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 pub const RAFT_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_state");
@@ -47,6 +49,8 @@ pub struct RedbStorage {
     last_index: u64, // 无条目时 = snap_index
     recent: VecDeque<Entry>,
     recent_bytes: usize,
+    pins: Arc<Pins>, // 快照的 pin（与 snap-serve 共用，3.4.1.7）
+    node_id: u32,    // 本节点：写进快照的 SnapDesc.source_node
 }
 
 impl RedbStorage {
@@ -83,6 +87,8 @@ impl RedbStorage {
             last_index,
             recent: VecDeque::new(),
             recent_bytes: 0,
+            pins: Arc::default(),
+            node_id: 0,
         };
         let from = last_index.saturating_sub(CACHE_ENTRIES as u64 - 1).max(snap.index + 1);
         if from <= last_index {
@@ -103,6 +109,38 @@ impl RedbStorage {
     /// 最近一次压缩点（first_index − 1）。
     pub fn snap_index(&self) -> u64 {
         self.snap_index
+    }
+
+    /// 快照的 pin 与本节点号（Driver 打开时交进来；单测里不交就是空的 pin 表、节点 0）。
+    pub fn set_snapshots(&mut self, node_id: u32, pins: Arc<Pins>) {
+        (self.node_id, self.pins) = (node_id, pins);
+    }
+
+    /// 规则 M5（follower，Ready 里 `snapshot()` 非空）：在外面传入的写事务里删掉 kv 表、按快照文件重建，清空 raft_log，
+    /// `snap_meta = (index, term)`、`conf_state` = 快照元数据里的；返回快照里的 state_version（调用方写 applied 与硬状态）。
+    pub fn install_snapshot(
+        &mut self,
+        tx: &WriteTransaction,
+        meta: &SnapshotMetadata,
+        file: &Path,
+    ) -> Result<u64, ErrCode> {
+        tx.delete_table(KV).map_err(|e| redb_eio("安装快照：删 kv 表", e))?;
+        let h = {
+            let mut kv = tx.open_table(KV).map_err(|e| redb_eio("安装快照：建 kv 表", e))?;
+            let mut put = |k: &[u8], v: &[u8]| kv.insert(k, v).map(|_| ()).map_err(|e| redb_eio("安装快照：写 kv", e));
+            snapshot::read_file(file, &mut put)?
+        };
+        if (h.index, h.term) != (meta.index, meta.term) {
+            log::error("raft", format_args!("快照文件 {} 不是 ({}, {}) 的", file.display(), meta.index, meta.term));
+            return Err(ErrCode::EIO);
+        }
+        tx.delete_table(RAFT_LOG).map_err(|e| redb_eio("安装快照：清空 raft_log", e))?;
+        tx.open_table(RAFT_LOG).map_err(|e| redb_eio("安装快照：建 raft_log", e))?;
+        put_state(tx, KEY_SNAP_META, &SnapMeta { index: meta.index, term: meta.term }.encode())?;
+        self.set_conf_state(tx, meta.get_conf_state())?;
+        (self.snap_index, self.snap_term, self.last_index) = (meta.index, meta.term, meta.index);
+        (self.recent, self.recent_bytes) = (VecDeque::new(), 0);
+        Ok(h.state_version)
     }
 
     /// 追加条目：先删 index ≥ `ents[0].index` 的旧条目（被新 leader 覆盖的部分）。
@@ -291,60 +329,11 @@ impl Storage for RedbStorage {
         Ok(self.last_index)
     }
 
+    /// 3.4.1.7 的导出（见 `snapshot.rs`）：开销很小，在 raft 线程上调用。
     fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
-        log::warn("raft", format_args!("节点 {to} 需要 index ≥ {request_index} 的快照：快照 M8 才实现（3.4.1.7）"));
-        Err(RaftError::Store(StorageError::SnapshotTemporarilyUnavailable))
-    }
-}
-
-/// init 写的 index = 1、term = 1 的初始状态（3.4.1.9，与 raft-rs 的 five_mem_node 示例一致）：
-/// `snap_meta = (1, 1)`、`hard_state = {term: 1, vote: 0, commit: 1}`、`conf_state = {voters}`、
-/// `applied = (1, 1, state_version = 1)`、`format`，以及初始 KV（3.4.3）。`Durability::Immediate`。
-pub fn bootstrap(db: &Database, voters: &[u64], kv: &[(Vec<u8>, Vec<u8>)]) -> Result<(), String> {
-    let err = |e: &dyn std::fmt::Display| format!("写元数据库的初始状态失败：{e}");
-    let tx = db.begin_write().map_err(|e| err(&e))?;
-    {
-        tx.open_table(RAFT_LOG).map_err(|e| err(&e))?;
-        let mut hs = HardState::default();
-        (hs.term, hs.commit) = (1, 1);
-        let cs = ConfState { voters: voters.to_vec(), ..Default::default() };
-        let mut st = tx.open_table(RAFT_STATE).map_err(|e| err(&e))?;
-        let format = MetaFormatV1 { version: 1, incompat: vec![] }.encode();
-        let applied = Applied { index: 1, term: 1, state_version: 1 }.encode();
-        let snap = SnapMeta { index: 1, term: 1 }.encode();
-        for (k, v) in [
-            (KEY_HARD_STATE, encode(&hs)),
-            (KEY_CONF_STATE, encode(&cs)),
-            (KEY_SNAP_META, snap.to_vec()),
-            (KEY_APPLIED, applied.to_vec()),
-            (KEY_FORMAT, format),
-        ] {
-            st.insert(k, v.as_slice()).map_err(|e| err(&e))?;
-        }
-        let mut t = tx.open_table(KV).map_err(|e| err(&e))?;
-        for (k, v) in kv {
-            t.insert(k.as_slice(), v.as_slice()).map_err(|e| err(&e))?;
-        }
-    }
-    tx.commit().map_err(|e| err(&e))
-}
-
-/// 读 `raft_state["applied"]`（与 KV 同事务更新，所以与读事务里的 KV 一致）。
-pub fn read_applied(rtx: &ReadTransaction) -> Result<Applied, String> {
-    let st = rtx.open_table(RAFT_STATE).map_err(|e| format!("打不开 raft_state 表：{e}"))?;
-    let v = st.get(KEY_APPLIED).map_err(|e| format!("读 raft_state[applied] 失败：{e}"))?;
-    let v = v.ok_or("raft_state 里没有 applied")?;
-    Applied::decode(v.value()).map_err(|e| format!("raft_state[applied] 损坏：{e}"))
-}
-
-/// 启动时读一条已应用的 GLOBAL 记录（3.2.7）：不存在 → `Ok(None)`；读盘出错或记录解不开 → 带键名的中文错误
-/// （坏了的记录不能当成"没有"或默认值，启动就此失败）。只在启动装配时用（还不在 raft / 执行器线程上）。
-pub fn read_global<T: serde::de::DeserializeOwned>(rtx: &ReadTransaction, name: &str) -> Result<Option<T>, String> {
-    let t = rtx.open_table(KV).map_err(|e| format!("打不开 kv 表：{e}"))?;
-    let v = t.get(keys::global(name).as_slice()).map_err(|e| format!("读 GLOBAL {name} 失败：{e}"))?;
-    match v {
-        None => Ok(None),
-        Some(v) => decode_v1(v.value()).map(Some).map_err(|e| format!("GLOBAL {name} 损坏，解不开（{e}）")),
+        let s = self.pins.export(&self.db, request_index, to, self.snap_index, self.node_id)?;
+        log::info("raft", format_args!("给节点 {to} 准备快照（index {}）", s.get_metadata().index));
+        Ok(s)
     }
 }
 
@@ -355,7 +344,7 @@ pub fn put_state(tx: &WriteTransaction, key: &str, v: &[u8]) -> Result<(), ErrCo
     Ok(())
 }
 
-fn encode(m: &dyn protobuf::Message) -> Vec<u8> {
+pub(super) fn encode(m: &dyn protobuf::Message) -> Vec<u8> {
     m.write_to_bytes().unwrap_or_else(|e| panic!("不变量破坏：protobuf 编码失败：{e}"))
 }
 

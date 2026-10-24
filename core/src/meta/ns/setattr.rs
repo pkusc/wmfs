@@ -24,15 +24,15 @@ use super::common::{
     MODE_MASK, Node, S_ISGID, attr_out, authz, bump_ctime, get, in_group, is_file, kill_suid, max_file_size, may_read,
     open_out, save, set_new_layout, write_rights,
 };
+use super::file_ops::gc_epoch;
 use super::xattr::sync_acl_mode;
 use crate::base::ErrCode;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvTxn, OpCtx};
 use crate::meta::rstat::{self, Delta};
-use crate::meta::schema::keys::{self, GC_EPOCH};
-use crate::meta::schema::kv;
-use crate::meta::schema::records::{F_HAS_ACL, F_INLINE, GcRecV1};
+use crate::meta::schema::keys;
+use crate::meta::schema::records::{F_HAS_ACL, F_INLINE};
 use crate::proto::meta::{MetaReply, SetAttrIn, TimeSet};
 
 pub fn setattr(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, set: &SetAttrIn) -> Result<MetaReply, ErrCode> {
@@ -128,9 +128,7 @@ fn truncate(v: &mut dyn KvTxn, c: &OpCtx, n: &mut Node, size: u64, epoch_seen: u
         let old = n.rec.layout.clone();
         set_new_layout(v, c, n)?;
         if let Some(l) = old {
-            let now = c.req.now_ms;
-            let rec = GcRecV1 { due_ms: now + c.settings.epoch_gc_grace_ms, chains: l.chains, created_ms: now };
-            kv::put(v, &keys::gc(GC_EPOCH, n.ino, l.epoch), &rec);
+            gc_epoch(v, c, n.ino, l.epoch, &l.chains);
         }
         v.delete(&keys::inline(n.ino));
     } else if was_inline {

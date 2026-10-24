@@ -10,7 +10,7 @@
 //!   layout 已经变了 → `STALE_LAYOUT`（调用方重新 Open）。数据节点回 `BAD_CAP` 时续一次再试，再失败 → `EACCES`（8.7，
 //!   [`FileClient::with_cap`]：读、写、截断、SyncChunks 都经它）。
 //! - **重新取 layout**（`STALE_LAYOUT` 之后，C4）：只换上 layout、cap 与属性，不前进"见过的 change_id"（`inode.rs`）；写句柄用
-//!   `ReopenHandle`（M7，ADR-0037 第 4 条），读与按路径截断用 `Open`。
+//!   `ReopenHandle`（M7，ADR-0037 第 4 条），读句柄也用 `ReopenHandle{write: false}`（M8 第一步，ADR-0038 第 7 条），按路径截断用 `Open`。
 //! - **目录句柄** = opendir 时按名字分页读出的完整快照（readdir 的 offset = 快照下标；POSIX 允许 readdir 反映某个快照），带属性
 //!   （readdirplus 用）；前面补上 `.` 与 `..`。实现注记（M7，ADR-0037 第 13 条）：`..` 的 inode 号是父目录（不改协议：客户端在
 //!   lookup、mkdir、readdirplus 与自己的 rename 时记下目录的父目录，[`FileClient::note_parent`]）；根目录的 `..` 是它自己；不知道时
@@ -245,14 +245,15 @@ impl FileClient {
 
     /// 重新取最新的 layout、cap 与属性（C4：`STALE_LAYOUT` 之后），只换上、不前进"见过的 change_id"。`how`：经写句柄
     /// （写回、同步写、ftruncate）→ `ReopenHandle{write}`（ADR-0037 第 4 条：属主不看权限位，所以属主经句柄写一个 0444 文件时
-    /// 碰上 layout 变化也照常重写进新 epoch；实现注记（M7）：以前只能 Open，回 `ESTALE`）；读 → `Open(O_RDONLY)`；按路径截断
+    /// 碰上 layout 变化也照常重写进新 epoch；实现注记（M7）：以前只能 Open，回 `ESTALE`）；读 → `ReopenHandle{write: false}`
+    /// （M8 第一步，ADR-0038 第 7 条：属主去掉自己的读权限之后读句柄照常可用；对其他人与 `Open` 只读的规则相同）；按路径截断
     /// （没有写句柄）→ `Open`，照常按当前权限：先试读写打开（顺便拿到读权限与 inline 内容），没有读权限再试只写。被授权拒绝
     /// → 原样回 `EACCES`（8.7 的 M7 注记：与 ADR-0036 的"其他用户之后可能 EACCES"一致；M6 把它映射成 `ESTALE`）。
     pub(super) fn reopen(&self, inode: &Inode, who: &Caller, how: Reopen) -> Result<(), ErrCode> {
         let ino = inode.ino;
         let r = match how {
             Reopen::Handle => self.meta.read(who, MetaOp::ReopenHandle { ino, write: true }),
-            Reopen::Read => self.meta.read(who, MetaOp::Open { ino, flags: O_RDONLY }),
+            Reopen::Read => self.meta.read(who, MetaOp::ReopenHandle { ino, write: false }),
             Reopen::Path => match self.meta.read(who, MetaOp::Open { ino, flags: O_RDWR }) {
                 Err(ErrCode::EACCES) => self.meta.read(who, MetaOp::Open { ino, flags: O_WRONLY }),
                 r => r,
@@ -375,7 +376,7 @@ impl FileClient {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Reopen {
     Handle, // 经写句柄：ReopenHandle（属主不看权限位）
-    Read,   // 读：Open(O_RDONLY)
+    Read,   // 读句柄：ReopenHandle{write: false}（属主不看权限位，M8 第一步）
     Path,   // 按路径截断：Open，按当前权限
 }
 

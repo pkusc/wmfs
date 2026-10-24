@@ -8,6 +8,10 @@
 //! （服务端身份 key 0）（[`open_data`]），监听之后起 target 心跳、给 Uninline 与后台任务共用的数据面客户端、后台调度器
 //! （[`start_background`]）。
 //! M7：管理 API 拿到元数据引擎（属性、用量、声明 vs 实际、changelog……）；启动时插件 manifest 里的属性名与属性注册表对账。
+//! M8：服务端之间的 RPC 客户端（key 0）在元数据引擎之前建好，交给引擎做元数据网络（raft-send、snap-recv、snap-serve），RaftMsg 与
+//! SnapshotFetch 登记到 RpcServer；hb 线程每拿到一张集群图就比对插件清单（不一致 → 退出码 3，3.7.2），raft 不知道 leader 时（只做数据的
+//! 节点）按认识的节点与 leader_hint 找（`node_hb.rs` 的文件头）；`--adopt-local-plugins`（[`StartOpts`]）；SIGTERM 时本节点是 leader 就先
+//! `transfer_leader` 给接替的人（`membership::heir`：活着、追上了的 voter 里 matched 最大的，最多等 3 s，[`Running::stop`]）。
 //! 信号（design.md 0.2 第 4 条）：main 在**创建任何线程之前** `sys::block_signals(&[SIGTERM, SIGINT])`，
 //! 调用 `start` 之后 `sys::wait_signals(..)`，收到后 [`Running::stop`] 再退出。
 
@@ -20,7 +24,7 @@ use wmfs_api::hex::hex;
 use wmfs_api::types::{Health, NodeAddrs};
 
 use crate::base::config::NodeConfig;
-use crate::base::{log, rand, sys};
+use crate::base::{clock, log, rand, sys};
 use crate::bg::scheduler::{self, BgDeps};
 use crate::bg::task::BgTask;
 use crate::buf::MemPool;
@@ -33,14 +37,16 @@ use crate::hooks::registry::PluginSet;
 use crate::hooks::traits::{CODEC_REPLICA, KeyLookup};
 use crate::init::{NodeFile, read_master};
 use crate::meta::attr_registry;
-use crate::meta::cluster::cluster_mgr;
+use crate::meta::cluster::{cluster_mgr, plugins};
 use crate::meta::engine::txn::{MetaEngine, RoleInfo};
 use crate::meta::engine::{self, EmbeddedEngine, EngineOpts};
+use crate::meta::raft::membership::{self, Members};
+use crate::meta::schema::records::NODE_REMOVED;
 use crate::meta::service::MetaService;
 use crate::mgmt::{MgmtCtx, MgmtServer, RoleFn};
 use crate::net::client::{Endpoint, RpcClient};
 use crate::net::server::{RpcServer, ServerId};
-use crate::proto::frame::{MSG_DATA_CALL, MSG_META_CALL, MSG_NODE_CALL};
+use crate::proto::frame::{MSG_DATA_CALL, MSG_META_CALL, MSG_NODE_CALL, MSG_RAFT, MSG_SNAPSHOT_FETCH};
 use crate::proto::handshake::{SERVER_KEY, cap_key, derive_secret};
 use crate::proto::peer::ClusterMap;
 
@@ -54,9 +60,21 @@ pub struct Running {
     pid_file: PathBuf,
 }
 
+/// 启动选项（`wmfs server` 的开关）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StartOpts {
+    pub adopt_local_plugins: bool, // 3.7.2 第 5 条的逃生口
+}
+
 /// 装配并启动本节点（返回时各线程已在运行）。`plugins` 由 `cli/src/registry.rs` 按 node.toml 装好并校验过。
-/// `version` 是 `wmfs --version` 的那一串（health 里报给别人）。错误是给人看的中文。
-pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &str) -> Result<Running, String> {
+/// `version` 是 `wmfs --version` 的那一串（health 里报给别人）；`opts` 是 `wmfs server` 的开关。错误是给人看的中文。
+pub fn start(
+    data_dir: &Path,
+    cfg: &NodeConfig,
+    plugins: PluginSet,
+    version: &str,
+    opts: StartOpts,
+) -> Result<Running, String> {
     let log_path = data_dir.join("logs/server.log");
     log::set_file(&log_path).map_err(|e| format!("打开日志 {} 失败：{e}", log_path.display()))?;
     let node = NodeFile::read(data_dir)?;
@@ -78,24 +96,35 @@ pub fn start(data_dir: &Path, cfg: &NodeConfig, plugins: PluginSet, version: &st
     for (name, attrs) in pipeline.consumed_attrs() {
         attr_registry::check_manifest_attrs(name, attrs)?; // 与属性注册表对账（3.8，M7）
     }
-    let opts = EngineOpts {
+    let key = wmfs_api::types::KeyFile { key_id: SERVER_KEY, secret: derive_secret(&master, SERVER_KEY) };
+    let peer = RpcClient::new(pool.clone(), pipeline.transports().to_vec(), key, cfg.net.clone())
+        .map_err(|e| format!("建服务端之间的 RPC 客户端失败：{e}"))?;
+    let eng_opts = EngineOpts {
         node_id: node.node_id,
         plugins: plugin_list,
         pipeline: pipeline.clone(),
         cap_key: cap_key(&master),
+        rpc: Some(peer.clone()),
+        snap_dir: data_dir.join("meta"),
+        adopt_local_plugins: opts.adopt_local_plugins,
     };
     let meta_path = data_dir.join("meta/meta.redb");
     if !meta_path.exists() {
         let hint = "这个数据目录是 M3 之前的 wmfs init 建的？开发集群请 wmfs dev down --purge 之后重新 wmfs dev up";
         return Err(format!("没有元数据库 {}（{hint}）", meta_path.display()));
     }
-    let meta = EmbeddedEngine::open(&meta_path, opts)?; // 出错时的消息里已经带了元数据库的路径
+    let meta = EmbeddedEngine::open(&meta_path, eng_opts)?; // 出错时的消息里已经带了元数据库的路径
     let keys: Arc<dyn KeyLookup + Send + Sync> = Arc::new(meta.keys(master));
     let rpc = RpcServer::new(ServerId { cluster_id, node_id: node.node_id }, pipeline.clone(), keys.clone(), &cfg.net);
     let svc = MetaService::start(meta.clone(), cfg.debug_ops)?;
     rpc.add_service(MSG_META_CALL, svc.clone());
     rpc.add_service(MSG_NODE_CALL, svc.clone());
-    let data_side = open_data(cfg, &pipeline, &pool, &rpc, &master, cluster_id)?;
+    if let Some(net) = meta.net() {
+        let n = net.clone();
+        rpc.add_oneway(MSG_RAFT, Arc::new(move |f| n.deliver(f)));
+        rpc.add_service(MSG_SNAPSHOT_FETCH, net);
+    }
+    let data_side = open_data(cfg, &pipeline, &pool, &rpc, &master, cluster_id, peer)?;
     let mut addrs = Vec::new();
     for t in pipeline.transports() {
         let (scheme, name) = (t.scheme(), t.manifest().name);
@@ -159,7 +188,7 @@ struct DataSide {
     peer: Arc<RpcClient>, // 服务端之间用的 RPC 客户端（服务端身份 key 0）：心跳、Uninline、后台任务
 }
 
-/// 数据面的前半段（监听之前）：打开 target、起 DataCall 服务、建服务端之间的 RPC 客户端（M5）。
+/// 数据面的前半段（监听之前）：打开 target、起 DataCall 服务（M5）；服务端之间的 RPC 客户端（key 0）已经建好。
 fn open_data(
     cfg: &NodeConfig,
     pipeline: &Arc<Pipeline>,
@@ -167,6 +196,7 @@ fn open_data(
     rpc: &Arc<RpcServer>,
     master: &[u8; 32],
     cluster_id: [u8; 16],
+    peer: Arc<RpcClient>,
 ) -> Result<DataSide, String> {
     let (store, _) =
         pipeline.chunk_store().ok_or("没有启用 chunk_store 插件（node.toml 的 [plugins] disable 里有 local-fs？）")?;
@@ -180,9 +210,6 @@ fn open_data(
     let map = Arc::new(MapHolder::new());
     let node = DataNode::new(pipeline.clone(), targets, pool.clone(), cluster_id, cap_key(master), map);
     rpc.add_service(MSG_DATA_CALL, DataService::start(node.clone())?);
-    let key = wmfs_api::types::KeyFile { key_id: SERVER_KEY, secret: derive_secret(master, SERVER_KEY) };
-    let peer = RpcClient::new(pool.clone(), pipeline.transports().to_vec(), key, cfg.net.clone())
-        .map_err(|e| format!("建服务端之间的 RPC 客户端失败：{e}"))?;
     Ok(DataSide { node, peer })
 }
 
@@ -200,10 +227,23 @@ fn start_background(
         let a = leader_addrs(eng.role().leader_id, &me, &|id| eng.node_addrs(id))?;
         Some(Endpoint { node: a.node_id, addrs: a.addrs })
     });
+    let eng = meta.clone();
+    let peers = Arc::new(move || {
+        let others = eng.nodes().into_iter().filter(|(id, n)| *id != node && n.state != NODE_REMOVED);
+        others.map(|(id, n)| Endpoint { node: id, addrs: n.addrs }).collect()
+    });
     let machine_id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default().trim().to_string();
     let host_id = cfg.debug.host_id.clone().unwrap_or_else(|| machine_id.clone());
     let (boot_id, pipeline) = (rand::random_u64(), side.node.pipeline.clone());
-    let hb = HbDeps { node, boot_id, host_id, machine_id, data: side.node, rpc: side.peer.clone(), leader };
+    let eng = meta.clone();
+    let on_map: Arc<dyn Fn(&ClusterMap) + Send + Sync> = Arc::new(move |m| {
+        let d = plugins::diff(&eng.local_plugins().plugins, &m.plugins.plugins);
+        if let Some(d) = d.filter(|_| !eng.adopt_local_plugins()) {
+            plugins::exit_mismatch(&d); // 每一张集群图都比对（3.7.2 第 3 条）
+        }
+    });
+    let rpc = side.peer.clone();
+    let hb = HbDeps { node, boot_id, host_id, machine_id, data: side.node, rpc, leader, peers, on_map };
     node_hb::start(hb)?;
     // 服务端用的数据面客户端：集群图直接取 leader 自己已应用的（总是最新的，不用另外刷新）
     let eng = meta.clone();
@@ -259,9 +299,20 @@ fn role_name(r: &RoleInfo, learner: bool) -> &'static str {
 }
 
 impl Running {
-    /// 收到 SIGTERM/SIGINT 之后：停元数据引擎（补一次 Immediate 提交，已应用的写全部落盘）、删掉 pid 文件。
-    /// 实现注记（M3）：多节点时先 transfer_leader 给 matched 最大的 voter（最多等 3 s，3.4.1.9）在 M8。
+    /// 收到 SIGTERM/SIGINT 之后：本节点是 leader、有接替的人（`membership::heir`：活着、追上了的 voter 里 matched 最大的）→ 先
+    /// `transfer_leader` 给它，最多等 3 s（3.4.1.9 的优雅退出）；再停元数据引擎（补一次 Immediate 提交，已应用的写全部落盘）、删掉 pid 文件。
     pub fn stop(&self) {
+        let to = membership::heir(&self.meta.status(), &self.meta.nodes(), self.node_id);
+        if self.meta.role().role == StateRole::Leader
+            && let Some(to) = to
+        {
+            log::info("server", format_args!("node{} 退出前把 leader 让给节点 {to}", self.node_id));
+            self.meta.transfer_leader(to);
+            let deadline = clock::mono_ms() + 3000;
+            while self.meta.role().role == StateRole::Leader && clock::mono_ms() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         self.meta.shutdown();
         let _ = std::fs::remove_file(&self.pid_file);
         log::info("server", format_args!("node{} 退出", self.node_id));

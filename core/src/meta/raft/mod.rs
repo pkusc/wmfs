@@ -8,10 +8,17 @@
 //! 线程归属（1.2）：`RawNode` 与 redb 写事务只属于 raft 线程；别的线程只经 [`driver::RaftInput`] 投递请求、
 //! 只读 [`driver::Published`] 里发布的角色与状态快照。Driver 设计成"输入一步、处理一次 Ready"的结构体方法，
 //! 确定性模拟（9.2）直接调用它，不起线程。
-//! 实现注记（M3）：快照的导出、带外传输与安装（3.4.1.7、规则 M5）、raft-send 线程（peers.rs）、成员变更的发起
-//! （membership.rs）属于 M8；M3 的单节点集群不会收到快照，也没有要发给别人的 raft 消息。
+//! - [`snapshot`]：快照的导出（pin）、快照文件的格式（3.4.1.7）；安装（规则 M5）是 `RedbStorage::install_snapshot`
+//! - [`peers`]：raft-send 线程（RaftMsg 的 protobuf 走 bulk）、收 RaftMsg、snap-recv 下载与 snap-serve 流式发出（1.2、3.4.1.7）
+//! - [`membership`]：成员变更的决定（learner 加入、一次 joint 变更提升为 3 voter、移除、leave-joint 兜底，3.4.1.9），cluster-mgr 调用
+//!
+//! 实现注记（M8）：以上三个模块随 M8 加入（M3 的单节点集群不会收到快照，也没有要发给别人的 raft 消息）。
 
+mod boot;
 pub mod driver;
+pub mod membership;
+pub mod peers;
+pub mod snapshot;
 pub mod storage;
 mod types;
 

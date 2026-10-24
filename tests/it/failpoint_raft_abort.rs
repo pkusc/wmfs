@@ -32,7 +32,10 @@ fn db_path(dir: &Path) -> PathBuf {
 fn open_engine(dir: &Path) -> Arc<EmbeddedEngine> {
     quiet_logs();
     let pipeline = Arc::new(Pipeline::new(PluginSet::new(&[])));
-    let opts = EngineOpts { node_id: 1, plugins: plugins(), pipeline, cap_key: CAP_KEY };
+    let snap_dir = dir.to_path_buf();
+    let (rpc, adopt_local_plugins) = (None, false);
+    let opts =
+        EngineOpts { node_id: 1, plugins: plugins(), pipeline, cap_key: CAP_KEY, rpc, snap_dir, adopt_local_plugins };
     let eng = EmbeddedEngine::open(&db_path(dir), opts).expect("打开元数据库");
     wait_ready(&eng);
     eng

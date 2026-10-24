@@ -7,10 +7,13 @@
 //! - [`targets`]：target 心跳的 leader 一侧（更新 TargetRecV1、记下用量）与 StatFs（M5）
 //! - [`settings`]：集群运行参数 `wmfs cluster set`（M7）
 //!
-//! join（M8）、集群插件清单的比对与退出（plugins.rs，M8）随里程碑加入。
+//! - [`join`]：`NodeOp::Join` 的 leader 一侧（插件清单比对、分配节点与 target 号、写记录，M8）
+//! - [`plugins`]：集群插件清单的比对与退出、`wmfs cluster plugins add|remove`、`--adopt-local-plugins`（M8）
 
 pub mod chains;
 pub mod cluster_mgr;
+pub mod join;
 pub mod map;
+pub mod plugins;
 pub mod settings;
 pub mod targets;

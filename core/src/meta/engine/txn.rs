@@ -48,11 +48,20 @@ pub trait MetaEngine: Send + Sync {
 
 /// 内部调用者用：bounded(1) 包一层（阻塞到批次有了确定结果）。
 pub fn txn_blocking(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp) -> Result<MetaReply, ErrCode> {
+    blocking(eng, ctx, op, false)
+}
+
+/// 同 [`txn_blocking`]，用于改变集群拓扑（链、target、节点、存储类）的内部操作：`exclusive`，本批最后一个（3.4.1.4 规则 5）。
+pub fn txn_blocking_exclusive(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp) -> Result<MetaReply, ErrCode> {
+    blocking(eng, ctx, op, true)
+}
+
+fn blocking(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp, exclusive: bool) -> Result<MetaReply, ErrCode> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     let done = Box::new(move |r| {
         let _ = tx.try_send(r);
     });
-    eng.txn(TxnRequest { ctx, op, done, exclusive: false });
+    eng.txn(TxnRequest { ctx, op, done, exclusive });
     rx.recv().unwrap_or(Err(ErrCode::NOT_LEADER))
 }
 
@@ -92,6 +101,9 @@ pub struct RoleInfo {
     pub ready: bool,
 }
 
+/// 实现注记（M8）：只增——`voters_outgoing`（joint 状态里旧配置的 voter，坑 P13 的 leave-joint 兜底看它），取自 raft 线程的
+/// `prs().conf().to_conf_state()`；`progress` 只有 leader 有（各成员的 matched）；`active` 也只有 leader 有：最近一个选举超时（1 s）
+/// 里收到过它的 raft 消息的成员（含自己）——挑接替 leader 的人时不挑已经死掉的（`membership::heir`）。
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct EngineStatus {
     pub applied: u64,
@@ -99,6 +111,25 @@ pub struct EngineStatus {
     pub voters: Vec<u32>,
     pub learners: Vec<u32>,
     pub progress: Vec<(u32, u64)>,
+    pub voters_outgoing: Vec<u32>,
+    pub active: Vec<u32>,
+}
+
+/// "追上"的余量（3.4.1.9：matched + 1000 ≥ commit）。
+pub const CAUGHT_UP: u64 = 1000;
+
+impl EngineStatus {
+    /// leader 看到的这个成员的日志复制到了哪里（不知道 → 0）。
+    pub fn matched(&self, id: u32) -> u64 {
+        self.progress.iter().find(|(i, _)| *i == id).map_or(0, |(_, m)| *m)
+    }
+
+    /// 追上了吗（3.4.1.9）：matched + 1000 ≥ commit，**并且确实确认过数据**（matched > 0）。实现注记（M8 审查）：只看前一半时，
+    /// commit 还不到 1000 的新集群里一个条目、一个快照都没收到的 learner（matched 0）也算追上，会被提升成 voter。
+    pub fn caught_up(&self, id: u32) -> bool {
+        let m = self.matched(id);
+        m > 0 && m + CAUGHT_UP >= self.commit
+    }
 }
 
 #[cfg(test)]

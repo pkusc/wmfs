@@ -4,8 +4,11 @@
 //! meta_engine（manifest 见 [`MANIFEST`] 与 `plugins/embedded-kv/manifest.toml`）。fail point `plugin.embedded-kv.meta_engine`
 //! 包在 `read/txn` 外层（4.10）。线程：`raft`（独占 RawNode 与 redb 写事务）、`meta-exec`（执行器）；读请求在调用者的
 //! 线程上执行（meta-read 线程、后台任务、管理 API 线程）。这两个线程上的 panic（不变量破坏）一律写日志并 abort（fail-stop）。
+//! 实现注记（M8）：给了服务端之间的 RPC 客户端（`EngineOpts.rpc`）就建元数据网络 [`RaftNet`]（raft-send、snap-recv、snap-serve，
+//! `meta/raft/peers.rs`），服务端装配时把它登记到 RpcServer（[`EmbeddedEngine::net`]）；成员变更（cluster-mgr 的
+//! `Membership`）经这里的 [`Members`] 实现提议 conf change、让出 leader、改节点记录。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -27,12 +30,14 @@ use crate::hooks::traits::KeyLookup;
 use crate::meta::attrs::AttrResolver;
 use crate::meta::cluster::map::MapCache;
 use crate::meta::raft::driver::{Driver, DriverOpts, ProposeOutcome, Published, RaftInput};
+use crate::meta::raft::peers::RaftNet;
 use crate::meta::raft::redb_eio;
 use crate::meta::raft::storage::{KV, read_global};
 use crate::meta::schema::keys;
 use crate::meta::schema::records::{
     ClusterInfoV1, ClusterSettingsV1, KeyMetaV1, NodeRecV1, PluginListV1, WriteBatchV1, decode_v1,
 };
+use crate::net::client::RpcClient;
 use crate::proto::handshake::{SERVER_KEY, derive_secret};
 use crate::proto::meta::MetaReply;
 use crate::proto::peer::ClusterMap;
@@ -62,6 +67,11 @@ pub struct EngineOpts {
     pub plugins: PluginListV1, // 本节点的插件清单（与已提交的 GLOBAL plugins 一致才就绪，3.7.2）
     pub pipeline: Arc<Pipeline>,
     pub cap_key: [u8; 32], // K_cap（由 cluster.key 派生，3.3.2）：闭包里签 cap 用（M5）
+    // 实现注记（M8）：服务端之间的 RPC 客户端（服务端身份 key 0；None = 单节点的组件测试，raft 消息无处可发）、下载的快照文件放在
+    // 哪（`<data_dir>/meta`）、`wmfs server --adopt-local-plugins`（3.7.2 第 5 条）
+    pub rpc: Option<Arc<RpcClient>>,
+    pub snap_dir: PathBuf,
+    pub adopt_local_plugins: bool,
 }
 
 /// 执行器闭包与只读回调能用到的一切（[`OpCtx`] 的来源）。插件拿不到 redb 本身。
@@ -133,6 +143,10 @@ pub struct EmbeddedEngine {
     hook: HookCall,
     gate_secs: Arc<Histogram>,
     raft: Mutex<Option<JoinHandle<()>>>,
+    node_id: u32,
+    plugins: PluginListV1,
+    adopt_local_plugins: bool,
+    net: Option<Arc<RaftNet>>,
 }
 
 impl EmbeddedEngine {
@@ -146,7 +160,9 @@ impl EmbeddedEngine {
     /// 读不到、不存在或解不开都拒绝启动：集群参数必须全集群一致（租约安全依赖它，3.2.8），不能悄悄换成默认值。
     pub fn start(db: Database, o: EngineOpts) -> Result<Arc<EmbeddedEngine>, String> {
         let db = Arc::new(db);
-        let driver = Driver::open(db.clone(), DriverOpts { node_id: o.node_id, plugins: o.plugins })?;
+        let (snap_dir, adopt_local_plugins) = (o.snap_dir.clone(), o.adopt_local_plugins);
+        let dopts = DriverOpts { node_id: o.node_id, plugins: o.plugins.clone(), snap_dir, adopt_local_plugins };
+        let driver = Driver::open(db.clone(), dopts)?;
         let published = driver.published();
         let rtx = db.begin_read().map_err(|e| format!("redb 读事务失败：{e}"))?;
         let missing = |k: &str| format!("元数据库里没有 GLOBAL {k}（不是 wmfs init 建的元数据库？）");
@@ -154,7 +170,9 @@ impl EmbeddedEngine {
         read_global::<ClusterSettingsV1>(&rtx, keys::G_SETTINGS)?.ok_or_else(|| missing(keys::G_SETTINGS))?;
         drop(rtx);
         let (raft_tx, raft_rx) = bounded(RAFT_QUEUE);
-        let raft = fail_stop_thread("raft", move || driver.run(raft_rx))?;
+        let net = o.rpc.map(|rpc| RaftNet::new(rpc, db.clone(), raft_tx.clone(), driver.pins(), o.snap_dir.clone()));
+        let net_for_raft = net.clone();
+        let raft = fail_stop_thread("raft", move || driver.run(raft_rx, net_for_raft))?;
         let h = |name, help, b| metrics::histogram(name, help, &[], b);
         let shared = Arc::new(EngineShared {
             db,
@@ -172,7 +190,37 @@ impl EmbeddedEngine {
         let gate_secs = h("wmfs_meta_read_gate_seconds", "线性一致读等 ReadIndex 的耗时", metrics::SECONDS_BUCKETS);
         super::dedup::register_metrics();
         let hook = HookCall::new(&MANIFEST, Hook::MetaEngine);
-        Ok(Arc::new(EmbeddedEngine { shared, exec_tx, hook, gate_secs, raft: Mutex::new(Some(raft)) }))
+        let raft = Mutex::new(Some(raft));
+        let (node_id, plugins) = (o.node_id, o.plugins);
+        Ok(Arc::new(EmbeddedEngine {
+            shared,
+            exec_tx,
+            hook,
+            gate_secs,
+            raft,
+            node_id,
+            plugins,
+            adopt_local_plugins,
+            net,
+        }))
+    }
+
+    /// 元数据网络（服务端装配时把 RaftMsg 与 SnapshotFetch 登记到 RpcServer；没有 RPC 客户端的组件测试是 None）。
+    pub fn net(&self) -> Option<Arc<RaftNet>> {
+        self.net.clone()
+    }
+
+    /// 本节点按 node.toml 装出来的插件清单（3.7.2）。
+    pub fn local_plugins(&self) -> &PluginListV1 {
+        &self.plugins
+    }
+    /// 是不是用 `wmfs server --adopt-local-plugins` 启动的（3.7.2 第 5 条的逃生口）。
+    pub fn adopt_local_plugins(&self) -> bool {
+        self.adopt_local_plugins
+    }
+    /// 已应用的集群插件清单与本地的不一致（cluster-mgr 看它，3.7.2）。
+    pub fn plugins_mismatch(&self) -> bool {
+        self.shared.published.plugins_mismatch()
     }
 
     /// 本地（不经 ReadIndex）读一个键的已应用值：认证用的 KEYMETA、health 里的 leader 地址这类"读到稍旧的也无妨"的地方用。
@@ -211,7 +259,7 @@ impl EmbeddedEngine {
         self.shared.published.changelog_seen()
     }
 
-    /// 等到有新的 changelog 记录提交（计数不再是 `seen`）或超时。
+    /// 等到有新的 changelog 记录提交、本节点失去 leader（计数不再是 `seen`，M8），或超时。
     pub fn wait_changelog(&self, seen: u64, timeout: Duration) -> u64 {
         self.shared.published.wait_changelog(seen, timeout)
     }
@@ -322,5 +370,6 @@ fn fail_stop_thread(name: &str, f: impl FnOnce() + Send + 'static) -> Result<Joi
         .map_err(|e| format!("起线程 {name} 失败：{e}"))
 }
 
+mod members;
 #[cfg(test)]
 mod tests;

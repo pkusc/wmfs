@@ -9,9 +9,11 @@
 //! 那一批在途请求只退避一次，退避期间不发新请求。
 //!
 //! - [`chunk`]：`wmfs debug chunk-path / chunk-header / corrupt-chunk`（M5；只在编进 local-fs 插件时有）
+//! - [`meta_hash`]：`wmfs debug meta-hash`（M8：各节点已应用的元数据状态的哈希是否一致）
 
 #[cfg(feature = "local-fs")]
 pub mod chunk;
+pub mod meta_hash;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

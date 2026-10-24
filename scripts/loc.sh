@@ -59,9 +59,18 @@ LIMIT=36000
 # 约 145 行；余下集群、链、会话、任务、存储类、key、feature、trace、qos、插件清单等约 15 组端点约 290）、cli 3800 → 4850（已约 3,800：M7 的策略命令、
 # 路径换算、changelog/cluster 约 455；余下 M8 的 join/node/cluster plugins/dev 多节点约 300、M9 chain 约 80、M10 key/session 约 130、M11 task/
 # datakey/feature 约 135、M12 锁约 150、M13 class 约 115、M14 mgr/trace/dev wait 约 165）。
-MODULES="wmfs-api:1100 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1180 core/hooks:1060
-core/meta/raft:1570 core/meta/engine:760 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
-core/data:3000 core/client:2200 core/bg:850 core/mgmt:790 core:720 plugins:5380 cli:4850 dashboard:880
+# M8（design.md 2.2 的 M8 注记）：新增约 1,950 行（预算约 1,310：留给 M8 的几件——uninline 的 fencing、OneWay 服务、插件清单的退出与逃生口、
+# 集群与节点的管理端点、debug meta-hash——都在这里做了）。重估五个：core/net 1180 → 1220（已约 1,180：OneWay 分发、send_oneway、wait_room；
+# 余下 M9 的 call_cb 后台建连约 40）、core/meta/raft 1570 → 1650（已约 1,630：快照、raft-send、成员变更都写完了，余下小改）、
+# core/meta/engine 760 → 800（已约 760，余下 M10 的配额与锁的对接约 40）、core 720 → 900（已约 840：join 的本地侧、server 的装配；
+# 余下 M9 的 nas-safe/hpc-rdma profile、M14 的 mgr 装配约 60）、cli 4850 → 4900（已约 4,140：M8 的命令实际约 345，原估 300；余下 M9–M14
+# 的子命令约 745）。
+# M8 审查修复（design.md 2.2 的 M8 审查注记）：新增约 275 行。重估三个：core/meta/raft 1650 → 1750（已约 1,725：raft-send 的退避与
+# 不认识的对端地址的查找、leader 发布的 active；余下小改约 25）、core/meta/engine 800 → 830（已约 790，余下 M10 的配额与锁的对接约 40）、
+# core/net 1220 → 1230（已约 1,190：流的有界通道；余下 M9 的 call_cb 后台建连约 40）。
+MODULES="wmfs-api:1100 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1230 core/hooks:1060
+core/meta/raft:1750 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
+core/data:3000 core/client:2200 core/bg:850 core/mgmt:790 core:900 plugins:5380 cli:4900 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

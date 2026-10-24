@@ -20,7 +20,7 @@ use crate::base::{ErrCode, lock, log};
 use crate::buf::Lane;
 use crate::hooks::traits::CacheKey;
 use crate::meta::schema::records::{F_INLINE, LayoutV1};
-use crate::proto::meta::{MetaOp, MetaReply, O_RDONLY};
+use crate::proto::meta::{MetaOp, MetaReply};
 
 /// cache_store 的块大小（4.11：1 MiB；chunk 更小时取 chunk 大小）。
 const BLOCK: u64 = 1 << 20;
@@ -78,9 +78,10 @@ impl FileClient {
         Err(ErrCode::ESTALE)
     }
 
-    /// 手上的 inline 副本不是当前版本的：读方式的 Open 取回最新的属性与内容（照常检查读权限），只换上、不前进"见过的 change_id"。
+    /// 手上的 inline 副本不是当前版本的：经读句柄重新取回最新的属性与内容（`ReopenHandle{write: false}`，M8 第一步：属主不看
+    /// 权限位，其他人照常检查读权限），只换上、不前进"见过的 change_id"。
     fn refetch_inline(&self, inode: &Inode, who: &Caller) -> Result<(), ErrCode> {
-        let o = expect_open_out(self.meta.read(who, MetaOp::Open { ino: inode.ino, flags: O_RDONLY }))?;
+        let o = expect_open_out(self.meta.read(who, MetaOp::ReopenHandle { ino: inode.ino, write: false }))?;
         lock(&inode.st).install(&o);
         Ok(())
     }

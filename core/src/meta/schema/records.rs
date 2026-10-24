@@ -196,6 +196,14 @@ pub struct NodeRecV1 {
     pub state: u8, // 1 Active，2 Draining，3 Removed
 }
 
+/// `NodeRecV1.meta_role`（指定的元数据角色，3.4.1.9）与 `NodeRecV1.state`。
+pub const META_NONE: u8 = 0;
+pub const META_LEARNER: u8 = 1;
+pub const META_VOTER: u8 = 2;
+pub const NODE_ACTIVE: u8 = 1;
+pub const NODE_DRAINING: u8 = 2;
+pub const NODE_REMOVED: u8 = 3;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TargetRecV1 {
     pub node: u32,

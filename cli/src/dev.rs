@@ -16,6 +16,9 @@
 //! 模板）：初始化新节点时按 `wmfs init --profile minimal` 建（default 类 1 副本、不写 replicas 属性、node.toml 停用 quota 与
 //! mclock）；已有的开发集群是按别的 profile 建的 → 报错并提示 `wmfs dev down --purge`（profile 写在初始 KV 里，不能事后改写）。
 //! `env`/`status` 拆到 `dev/info.rs`；后台起进程、等就绪、认 pid、等退出的几步与 `dev mount` 共用（`dev/proc.rs`）。
+//! M8：`up --nodes N`：node1 照常 init，第 2…N 个节点用 `wmfs join` 的本地侧加入（`dev/cluster.rs`），都起好之后等元数据成员到齐
+//! （N ≥ 3 时 3 个 voter，2 个节点是 1 voter + 1 learner；元数据成员都追上）才返回，最后打印一次集群警告；已有更多节点的开发集群照样
+//! 全部启动。`dev start n` 最后等这个节点追上（有 leader 时）。`dev leader` 打印就绪 leader 的节点号。
 
 use std::ffi::OsStr;
 use std::net::Ipv4Addr;
@@ -32,6 +35,7 @@ use wmfs_mgr::api::ApiClient;
 
 use crate::{fail, home, out};
 
+mod cluster;
 mod info;
 mod mount;
 mod proc;
@@ -43,7 +47,7 @@ use rdma::set_rdma;
 
 #[derive(clap::Subcommand)]
 pub enum DevCmd {
-    /// 起开发集群并等它就绪（M1 只支持 1 个节点）
+    /// 起开发集群并等它就绪（--nodes 3：第 2、3 个节点 join 进来，等到 3 个元数据 voter）
     Up {
         #[arg(long, default_value_t = 1)]
         nodes: u32,
@@ -74,6 +78,8 @@ pub enum DevCmd {
     Start { n: u32 },
     /// 打印第 n 个节点的日志
     Logs { n: u32 },
+    /// 打印就绪的元数据 leader 是第几个节点（例如 L=$(wmfs dev leader); wmfs dev kill $L）
+    Leader,
     /// 后台挂载一个客户端（wmfs mount，用 node1 的 client key），等它挂上；会打印集群警告
     Mount {
         mountpoint: PathBuf,
@@ -123,6 +129,7 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
             .map(|t| vec![t])
             .map_err(|e| format!("读 {} 失败：{e}", log_path(&d, n).display())),
         DevCmd::Wait { what, timeout } => wait::wait(&d, &what, timeout),
+        DevCmd::Leader => cluster::leader(&d),
         DevCmd::Mount { mountpoint, key_file, cache } => mount::mount(&d, &mountpoint, &key_file, &cache),
         DevCmd::Umount { mountpoint } => mount::umount(&d, &mountpoint),
         DevCmd::ClientPid { mountpoint } => mount::client_pid(&d, &mountpoint),
@@ -185,19 +192,22 @@ fn health(d: &Path, n: u32) -> Result<Health, String> {
     Ok(h)
 }
 
-fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>, profile: Profile) -> Result<Vec<String>, String> {
-    if nodes != 1 {
-        return Err("M1 的 wmfs dev up 只支持 --nodes 1（多节点要 wmfs join，M8 起）".into());
+fn up(d: &Path, want: u32, rdma: Option<Ipv4Addr>, profile: Profile) -> Result<Vec<String>, String> {
+    if !(1..=9).contains(&want) {
+        return Err("--nodes 只能是 1–9（第 n 个节点的端口是 19n00、19n80）".into());
     }
     std::fs::create_dir_all(d).map_err(|e| format!("建目录 {} 失败：{e}", d.display()))?;
     let marker = d.join(MARKER);
     sys::atomic_write(&marker, "wmfs dev 的开发目录（wmfs dev down --purge 只删除带这个标记的目录）\n".as_bytes())
         .map_err(|e| format!("写 {} 失败：{e}", marker.display()))?;
     let mut lines = Vec::new();
-    for n in 1..=nodes {
+    let count = want.max(nodes(d).last().copied().unwrap_or(0)); // 已有更多节点的开发集群：全部启动
+    for n in 1..=count {
         let nd = node_dir(d, n);
         if nd.join("NODE").exists() {
             check_profile(&nd, profile)?;
+        } else if n > 1 {
+            cluster::join(d, n, profile)?; // node1 已经在运行（上一轮起的）
         } else {
             let (rpc_port, mgmt_port) = ports(n);
             let o = InitOpts {
@@ -210,11 +220,7 @@ fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>, profile: Profile) -> Result<
                 debug_ops: true, // wmfs debug kv（M3 演示）
                 host_id: Some(format!("host-{n}")),
                 plugins: crate::registry::init_plugin_list(&profile.disabled_plugins())?,
-                targets: vec![TargetConfig {
-                    path: nd.join("targets/1").display().to_string(),
-                    labels: vec![],
-                    capacity: "20G".into(),
-                }],
+                targets: vec![dev_target(&nd)],
                 profile,
             };
             init_node(&o)?;
@@ -225,14 +231,23 @@ fn up(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>, profile: Profile) -> Result<
             ));
         }
         lines.push(start(d, n)?);
-        // 取不到集群图 = 节点没有成为就绪的 leader（例如旧里程碑建的开发集群插件清单不一致）：大声失败，别让后面的命令白等
-        let ws = warnings(d, n).map_err(|e| {
-            let log = log_path(d, n).display().to_string();
-            format!("{}\nnode{n} 起来了，但没能取到集群图：{e}（日志 {log}）", lines.join("\n"))
-        })?;
-        lines.extend(ws.iter().map(|w| format!("警告：{w}")));
     }
+    if count > 1 {
+        let m = cluster::wait_members(d, count).map_err(|e| format!("{}\n{e}", lines.join("\n")))?;
+        lines.push(m);
+    }
+    // 取不到集群图 = 没有就绪的 leader（例如旧里程碑建的开发集群插件清单不一致）：大声失败，别让后面的命令白等
+    let ws = warnings(d, 1).map_err(|e| {
+        let log = log_path(d, 1).display().to_string();
+        format!("{}\n节点起来了，但没能取到集群图：{e}（日志 {log}）", lines.join("\n"))
+    })?;
+    lines.extend(ws.iter().map(|w| format!("警告：{w}")));
     Ok(lines)
+}
+
+/// 开发节点的默认 target（`<节点目录>/targets/1`，容量上限 20 GiB，无标签；init 与 join 共用）。
+fn dev_target(nd: &Path) -> TargetConfig {
+    TargetConfig { path: nd.join("targets/1").display().to_string(), labels: vec![], capacity: "20G".into() }
 }
 
 /// 已有的节点是按 `want` 这个 profile 建的吗（看 node.toml 的 `[plugins] disable`：profile 的初始 KV 写进了元数据库，不能事后
@@ -259,7 +274,7 @@ fn warnings(d: &Path, n: u32) -> Result<Vec<String>, String> {
 }
 
 /// 启动第 n 个节点（已在运行就只报告），等它就绪：health 有响应，并且 pid 文件里就是这个进程
-/// （只看 health 的话，紧接着的 `dev status/down` 有可能还看不到 pid 文件）。
+/// （只看 health 的话，紧接着的 `dev status/down` 有可能还看不到 pid 文件）；有 leader 时再等它追上（M8，`cluster::wait_caught_up`）。
 fn start(d: &Path, n: u32) -> Result<String, String> {
     let nd = node_dir(d, n);
     if !nd.join("NODE").exists() {
@@ -273,6 +288,7 @@ fn start(d: &Path, n: u32) -> Result<String, String> {
     let pid = child.id() as i32;
     let ready = || health(d, n).is_ok() && running_pid(d, n) == Some(pid);
     wait_ready(&mut child, READY_TIMEOUT_MS, &log_path(d, n), &format!("node{n}"), ready)?;
+    cluster::wait_caught_up(d, n)?;
     Ok(format!("node{n} started（{}）", describe(&health(d, n).unwrap_or_default())))
 }
 

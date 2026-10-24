@@ -7,7 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod cluster;
 mod mgmt;
+pub use cluster::*; // M8 的管理端点：集群概览与节点、集群插件清单、元数据哈希（types/cluster.rs）
 pub use mgmt::*; // M7 的管理端点：目录属性、用量、声明 vs 实际、语义、changelog 与游标、集群运行参数（types/mgmt.rs）
 
 /// 所有错误回复的 body：`{"error": "<code>", "message": "<中文说明>"}`（7.1）。

@@ -38,14 +38,16 @@ fn obsolete_epochs_are_deleted_after_the_grace_period() {
     let c = client(&d, &run, "admin");
     let me = who(1000, 1000);
     let o = put(&c, &me, ROOT_INO, "f", &data(5 << 20)).unwrap();
-    let (ino, chain) = (o.attr.ino, o.layout.as_ref().unwrap().chains[0]);
-    assert!(epoch_dir_exists(&d, chain, ino, 1));
-    put(&c, &me, ROOT_INO, "f", b"short").unwrap(); // 覆盖：截断到 0，epoch 1 作废（GC 记录 kind 2）
-    assert!(get_raw(&run.meta, &keys::gc(GC_EPOCH, ino, 1)).unwrap().is_some(), "截断到 0 写了 GC 记录");
+    // 数据所在的 epoch 以 layout 为准（实现注记（M8）：非空内容的服务端 Uninline 会换 epoch，ADR-0035 第 11 条；这里是新建的空文件，仍是 1）
+    let (ino, l) = (o.attr.ino, o.layout.as_ref().unwrap());
+    let (chain, e) = (l.chains[0], l.epoch);
+    assert!(epoch_dir_exists(&d, chain, ino, e));
+    put(&c, &me, ROOT_INO, "f", b"short").unwrap(); // 覆盖：截断到 0，epoch e 作废（GC 记录 kind 2）
+    assert!(get_raw(&run.meta, &keys::gc(GC_EPOCH, ino, e)).unwrap().is_some(), "截断到 0 写了 GC 记录");
     std::thread::sleep(Duration::from_millis(800));
-    assert!(epoch_dir_exists(&d, chain, ino, 1), "宽限期之内不删（还拿着旧 layout 的读写来得及刷新）");
-    assert!(wait_for(15, || !epoch_dir_exists(&d, chain, ino, 1)), "过了宽限期，旧 epoch 的数据被删除");
-    assert!(wait_for(5, || get_raw(&run.meta, &keys::gc(GC_EPOCH, ino, 1)).unwrap().is_none()), "GC 记录也删了");
+    assert!(epoch_dir_exists(&d, chain, ino, e), "宽限期之内不删（还拿着旧 layout 的读写来得及刷新）");
+    assert!(wait_for(15, || !epoch_dir_exists(&d, chain, ino, e)), "过了宽限期，旧 epoch 的数据被删除");
+    assert!(wait_for(5, || get_raw(&run.meta, &keys::gc(GC_EPOCH, ino, e)).unwrap().is_none()), "GC 记录也删了");
     let ok = wmfs_core::api::metrics::counter("wmfs_gc_epochs_deleted_total", "", &[]);
     assert!(wait_for(5, || ok.get() >= 1), "gc 删完记录之后才计数：等它一下"); // 测试线程可能先看到记录没了
     run.stop();

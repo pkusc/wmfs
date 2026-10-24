@@ -6,7 +6,8 @@
 //! `debug chunk-path/chunk-header/corrupt-chunk`（按 local-fs 的路径规则找 chunk 文件：没编进 local-fs 插件就没有这三个子命令）。
 //! M6 加了 `mount`/`umount`（FUSE，`fuse/`）与 `dev mount/umount/client-pid`。M7 加了策略命令 `set/get/unset/usage/status`
 //! （`attr.rs`，挂载点路径的换算在 `pathmap.rs`）、`changelog tail`（`changelog.rs`）、`cluster set`（`cluster.rs`）与
-//! `debug rstat-check`。
+//! `debug rstat-check`。M8 加了 `join`、`server --adopt-local-plugins`、`node list|drain|remove|promote`（`node_admin.rs`）、
+//! `cluster plugins show|add|remove`、`dev up --nodes N`、`dev leader`、`debug meta-hash`。
 //! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod attr;
@@ -20,6 +21,7 @@ mod fs;
 mod fuse;
 mod leader;
 mod node;
+mod node_admin;
 mod pathmap;
 mod ping;
 mod registry;
@@ -52,11 +54,21 @@ enum Cmd {
     },
     /// 初始化一个新的单节点集群（目录、密钥、node.toml、元数据的初始状态），然后在前台运行它
     Init(node::InitArgs),
+    /// 加入一个已有的集群（带着本节点的插件清单，不一致就被拒绝），然后在前台运行它
+    Join(node::JoinArgs),
     /// 在前台运行一个已初始化的节点（SIGTERM / Ctrl-C 退出）
     Server {
-        /// 节点数据目录（wmfs init 建的）
+        /// 节点数据目录（wmfs init / wmfs join 建的）
         #[arg(long)]
         data_dir: PathBuf,
+        /// 逃生口：成为就绪 leader 时把集群插件清单改成本节点的（某个插件再也装不上时用，design.md 3.7.2）
+        #[arg(long)]
+        adopt_local_plugins: bool,
+    },
+    /// 节点运维：list（--json）、drain、remove、promote
+    Node {
+        #[command(subcommand)]
+        cmd: node_admin::NodeCmd,
     },
     /// 传输自检：握手认证 + Ping（可带 bulk），打印成功次数、延迟与吞吐
     Ping(ping::PingArgs),
@@ -94,7 +106,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: changelog::ChangelogCmd,
     },
-    /// 集群管理（set：集群运行参数）
+    /// 集群管理（set：集群运行参数；plugins show|add|remove：集群插件清单）
     Cluster {
         #[command(subcommand)]
         cmd: cluster::ClusterCmd,
@@ -120,6 +132,11 @@ enum DebugCmd {
         data_dir: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// 各节点已应用的元数据状态的哈希（等到各节点追平再比较；不一致时退出码 1）
+    MetaHash {
+        #[command(flatten)]
+        api: attr::ApiArgs,
     },
     /// 读写元数据 KV 的调试键空间（服务端要开 debug_ops，只接受 admin key）
     Kv {
@@ -150,15 +167,20 @@ enum DebugCmd {
 fn main() {
     let cli = Cli::parse();
     // 前台运行 server 的命令：在创建任何线程之前屏蔽 SIGTERM/SIGINT，最后由 main 线程 sigwait（design.md 0.2 第 4 条）
-    let serving =
-        matches!(&cli.cmd, Cmd::Server { .. } | Cmd::Mount(_)) || matches!(&cli.cmd, Cmd::Init(a) if !a.no_start);
+    let serving = matches!(&cli.cmd, Cmd::Server { .. } | Cmd::Mount(_))
+        || matches!(&cli.cmd, Cmd::Init(a) if !a.no_start)
+        || matches!(&cli.cmd, Cmd::Join(a) if !a.no_start);
     if serving && let Err(e) = sys::block_signals(&[sys::SIGTERM, sys::SIGINT]) {
         std::process::exit(fail(format!("屏蔽信号失败：{e}")));
     }
     let code = match cli.cmd {
         Cmd::Doctor { json } => doctor::run(json),
         Cmd::Init(a) => node::init(a),
-        Cmd::Server { data_dir } => node::server(&data_dir),
+        Cmd::Join(a) => node::join(a),
+        Cmd::Server { data_dir, adopt_local_plugins } => {
+            node::server(&data_dir, wmfs_core::server::StartOpts { adopt_local_plugins })
+        }
+        Cmd::Node { cmd } => node_admin::run_node(cmd),
         Cmd::Ping(a) => ping::run(a),
         Cmd::Failpoint { cmd } => failpoint::run(cmd),
         Cmd::Dev { cmd, dir } => dev::run(cmd, dir),
@@ -175,6 +197,7 @@ fn main() {
         Cmd::Debug { cmd: DebugCmd::RstatCheck { data_dir, json } } => debug::rstat_check(&data_dir, json),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),
+        Cmd::Debug { cmd: DebugCmd::MetaHash { api } } => debug::meta_hash::meta_hash(&api),
         #[cfg(feature = "local-fs")]
         Cmd::Debug { cmd: DebugCmd::ChunkPath(w) } => debug::chunk::chunk_path(&w),
         #[cfg(feature = "local-fs")]

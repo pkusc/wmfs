@@ -2,7 +2,8 @@
 //!
 //! - ureq 的 agent 必须 `proxy(None)`（本机设置了 http_proxy，不这样访问 127.0.0.1 会走代理失败）；
 //! - 地址列表（`WMFS_CLUSTER` 逗号分隔拆开）依次尝试：连不上就换下一个；遇到 409 `{"error":"not_leader","leader":"http://…"}`
-//!   就跟随 leader（最多 3 跳，不做服务端代理）；
+//!   就跟随 leader（最多 3 跳，不做服务端代理）；实现注记（M8）：回 503 `not_leader`（这个节点还不知道 leader，例如刚重启）也换下一个
+//!   地址，全都不行才把最后一个错误交给调用方；
 //! - 每个请求都签名：`Authorization: WMFS-HMAC key=<id>,ts=<unix_ms>,sig=<hex>`，要签名的文本由
 //!   `wmfs_api::auth::sign_input` 拼（与服务端同一个函数）；`/metrics` 与 `/api/v1/health` 服务端不检查签名，带着也无妨。
 //! - 非 2xx 的回复变成 [`ApiError`]（= 服务端的 `{"error","message"}` 加 HTTP 状态码）；连不上是 `status = 0`。
@@ -73,6 +74,10 @@ impl ApiClient {
                 {
                     base = base_url(l); // 不是 leader：跟随它给的地址
                     continue;
+                }
+                if status == 503 && v.get("error").and_then(Value::as_str) == Some("not_leader") {
+                    last = ApiError::from_reply(status, &v); // 这个节点还不知道 leader：问下一个地址
+                    break;
                 }
                 if !(200..300).contains(&status) {
                     return Err(ApiError::from_reply(status, &v));

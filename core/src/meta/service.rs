@@ -23,6 +23,9 @@
 //! 上做；`Uninline` 要的数据面客户端由服务端装配时 [`MetaService::set_data`] 交进来（没有 → `NOT_READY`）。同一个 inode 同时最多
 //! 一个 Uninline、全部加起来最多 `READ_THREADS / 2` = 4 个（`uninline::InFlight`，超出 → `BUSY`）：它们在 meta-read 线程上同步等
 //! 数据面，至少要留一半线程给心跳、集群图与普通读——数据节点正是经它们拉到新集群图，Uninline 才写得成。
+//!
+//! 实现注记（M8）：NodeCall 加了 `Join`（`meta/cluster/join.rs`：读、批次、再读一次集群图，也在 meta-read 线程上同步做）；被拒绝时
+//! 原因（例如插件清单的差异）放在 ERROR 帧的 `ErrorBody.msg` 里（`Responder::error_with`）。
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -34,6 +37,7 @@ use crate::base::types::{Principal, ReqCtx, Role};
 use crate::base::{ErrCode, clock, lock, log};
 use crate::client::data_client::DataClient;
 use crate::hooks::traits::ConnIdentity;
+use crate::meta::cluster::join;
 use crate::meta::cluster::map::filtered;
 use crate::meta::cluster::targets::{self, TargetUsage};
 use crate::meta::engine::txn::{MetaEngine, TxnOp, TxnRequest};
@@ -44,7 +48,7 @@ use crate::meta::uninline::{self, InFlight};
 use crate::net::server::{Responder, Service};
 use crate::proto::frame::{InFrame, MSG_NODE_CALL};
 use crate::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
-use crate::proto::peer::{NodeHeartbeat, NodeOp, NodeReply};
+use crate::proto::peer::{JoinReq, NodeHeartbeat, NodeOp, NodeReply};
 use crate::proto::{decode_body, encode_body};
 
 /// meta-read 线程数与它们的输入队列长度（1.2）。
@@ -67,6 +71,7 @@ enum ReadOp {
     Heartbeat(NodeHeartbeat),       // NodeOp::Heartbeat（M5）
     StatFs,                         // MetaOp::StatFs（M5）
     Uninline(u64),                  // MetaOp::Uninline（M5，ADR-0034）
+    Join(JoinReq),                  // NodeOp::Join（M8）
 }
 
 /// meta-read 线程与服务共用的状态。
@@ -115,6 +120,16 @@ impl MetaService {
                 .spawn(move || {
                     while let Ok(j) = rx.recv() {
                         let name = j.op.name();
+                        if let ReadOp::Join(req) = j.op {
+                            match join::join(&*shared.eng, &j.ctx, req) {
+                                Ok(rep) => stats.reply_raw(j.r, name, Ok(encode_body(&rep))),
+                                Err(f) => {
+                                    stats.counter(name, f.code).inc(); // 被拒的 join 也计入 wmfs_meta_ops_total
+                                    j.r.error_with(f.code, f.msg); // 带着原因（例如插件清单的差异）
+                                }
+                            }
+                            continue;
+                        }
                         stats.reply_raw(j.r, name, read_job(&shared, &j.ctx, j.op));
                     }
                 })
@@ -185,7 +200,11 @@ impl MetaService {
                 let ctx = base_ctx(&ReqHead::default(), r.identity(), f.hdr.trace_id, 0, 0, vec![]);
                 self.read(ctx, ReadOp::Heartbeat(hb), r); // 角色表已保证只有 Server 能发（3.3.3）
             }
-            other => self.stats.reply(r, other.name(), Err(ErrCode::FEATURE_UNSUPPORTED)), // Join M8、SyncDone M9……
+            NodeOp::Join(req) => {
+                let ctx = base_ctx(&ReqHead::default(), r.identity(), f.hdr.trace_id, 0, 0, vec![]);
+                self.read(ctx, ReadOp::Join(req), r); // 角色表已保证只有 Server 能发（3.3.3）
+            }
+            other => self.stats.reply(r, other.name(), Err(ErrCode::FEATURE_UNSUPPORTED)), // SyncDone M9……
         }
     }
 }
@@ -198,6 +217,7 @@ impl ReadOp {
             ReadOp::Heartbeat(_) => "Heartbeat",
             ReadOp::StatFs => "StatFs",
             ReadOp::Uninline(_) => "Uninline",
+            ReadOp::Join(_) => "Join",
         }
     }
 }
@@ -271,8 +291,15 @@ fn read_job(sh: &Shared, ctx: &ReqCtx, op: ReadOp) -> Result<Vec<u8>, ErrCode> {
     match op {
         ReadOp::Heartbeat(hb) => targets::heartbeat(eng, ctx, &sh.usage, hb),
         ReadOp::StatFs => targets::statfs(eng, ctx, &sh.usage).map(|r| encode_body(&r)),
+        // 走不到这里：meta-read 线程的循环先单独处理了 Join（它要带原因回复）；写出这一支只为 match 穷尽
+        ReadOp::Join(_) => Err(ErrCode::INTERNAL),
         ReadOp::Uninline(ino) => {
             let data = sh.data.get().ok_or(ErrCode::NOT_READY)?;
+            // 先确认自己是就绪的 leader（M8 审查）：换 leader 之后旧 leader 的 InFlight 里可能还挂着那次卡住的 uninline，不先查的话
+            // 它会对同一个 inode 回 BUSY 而不是 NOT_LEADER{hint}，客户端就一直在旧 leader 上退避、等它做完
+            if !eng.role().ready {
+                return Err(ErrCode::NOT_LEADER);
+            }
             sh.uninlining.begin(ino)?; // 这个 inode 已经在做、或已经有 4 个在做 → BUSY（见文件头）
             let r = uninline::run(eng, data, ctx, ino);
             sh.uninlining.end(ino);

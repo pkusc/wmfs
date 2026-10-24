@@ -2,7 +2,8 @@
 //!
 //! 依次问 `--cluster` / `WMFS_CLUSTER` 里每个管理地址的 `/api/v1/health`，直到有人说出 leader 的 rpc 地址（最多 30 s：
 //! 刚启动的节点要先选出 leader）；自称 `candidate`（已当选、还没应用本任期的空条目）的节点再等一会儿，免得第一个请求碰上
-//! `NOT_READY`、打出一串重试日志。30 s 后还是 `candidate`，多半是插件清单不一致（旧里程碑建的开发集群）：报错里给出修法。
+//! `NOT_READY`、打出一串重试日志。30 s 后还是 `candidate`（选不出就绪的 leader，例如没有多数派）：报错里给出看日志的提示——插件清单
+//! 不一致的节点 M8 起会以退出码 3 退出（见 server.log），不会一直停在 candidate。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,14 +37,22 @@ pub fn connect(cluster: &[String], key: KeyFile) -> Result<Leader, String> {
     Ok(Leader { rpc, ep, addrs })
 }
 
-/// 依次问每个管理地址的 health，直到有人说出 leader（见文件头）。
+/// 依次问每个管理地址的 health，直到找到 leader（见文件头）。实现注记（M8）：只信"自己说自己是就绪 leader"的节点；follower 说的
+/// leader 先问一下它自己的 health（刚被 kill 的 leader 在 follower 眼里还会是 leader，直到选出新的）。
 fn find_leader(cluster: &[String], key: &KeyFile) -> Result<NodeAddrs, String> {
     let deadline = clock::mono_ms() + FIND_TIMEOUT.as_millis() as u64;
+    let health = |a: &str| ApiClient::new(vec![a.to_string()], key.clone()).get::<Health>("/api/v1/health");
     loop {
         let (mut last, mut candidate) = (String::new(), false);
         for a in cluster {
-            match ApiClient::new(vec![a.clone()], key.clone()).get::<Health>("/api/v1/health") {
-                Ok(Health { leader: Some(l), meta_role, .. }) if meta_role != "candidate" => return Ok(l),
+            match health(a) {
+                Ok(Health { leader: Some(l), meta_role, .. }) if meta_role == "leader" => return Ok(l),
+                Ok(Health { leader: Some(l), meta_role, .. }) if meta_role != "candidate" => {
+                    if health(&l.mgmt_addr).is_ok_and(|h| h.meta_role == "leader") {
+                        return Ok(l);
+                    }
+                    last = format!("{a} 说 leader 是 node{}，但它没有回答自己是就绪的 leader", l.node_id);
+                }
                 Ok(h) => {
                     candidate |= h.meta_role == "candidate";
                     last = format!("{a} 的元数据角色是 {}，还不知道 leader", h.meta_role);
@@ -53,8 +62,8 @@ fn find_leader(cluster: &[String], key: &KeyFile) -> Result<NodeAddrs, String> {
         }
         if clock::mono_ms() > deadline {
             let fix = if candidate {
-                "节点一直没有成为就绪的 leader：多半是插件清单不一致（旧里程碑建的开发集群，见 server.log），\
-                 请 wmfs dev down --purge 之后重新 wmfs dev up"
+                "节点一直没有成为就绪的 leader：多数派的节点在运行吗？插件清单不一致的节点会以退出码 3 退出（见 server.log；\
+                 旧里程碑建的开发集群请 wmfs dev down --purge 之后重新 wmfs dev up）"
             } else {
                 "可以先 wmfs dev wait leader"
             };

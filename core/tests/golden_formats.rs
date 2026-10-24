@@ -1,10 +1,12 @@
-//! 金样：chunk 文件固定头与块表（design.md 3.2.4）、块的 AES-GCM 附加数据、target 超级块（3.2.3）。
+//! 金样：chunk 文件固定头与块表（design.md 3.2.4）、块的 AES-GCM 附加数据、target 超级块（3.2.3）、元数据快照文件（3.4.1.7，M8）。
 
 mod common;
 
 use common::Golden;
 use wmfs_core::data::format::*;
 use wmfs_core::data::superblock::TargetSuperblock;
+use wmfs_core::meta::raft::snapshot::{SnapWriter, record_crc};
+use wmfs_core::proto::peer::{SnapHeader, SnapTrailer};
 
 fn header(chunk_size: u32, logical_len: u32) -> ChunkHeader {
     let (block_size, nblocks, header_len_4k) = layout_for(chunk_size).expect("合法的 chunk_size");
@@ -83,5 +85,29 @@ fn golden_target_superblock() {
     let b = sb.encode();
     assert_eq!(TargetSuperblock::decode(&b), Ok(sb));
     g.add("TARGET", b);
+    g.check();
+}
+
+/// follower 下载的快照文件 `meta/snap-recv-<index>-<term>.snap`：`WMFSSNP1` ‖ u32 小端长度 + postcard(SnapHeader) ‖ 每条记录
+/// `klen u32 小端 ‖ vlen u32 小端 ‖ key ‖ value` ‖ `WMFSEND!` ‖ pairs u64 小端 ‖ crc32c u32 小端（覆盖每条记录的四个部分）。
+#[test]
+fn golden_snapshot_file() {
+    let mut g = Golden::new("snapshot");
+    let d = std::env::temp_dir().join(format!("wmfs-golden-snap-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let h = SnapHeader {
+        index: 0x1_0000_0005,
+        term: 3,
+        state_version: 0x2_0000_0007,
+        conf_state: vec![8, 1, 8, 2],
+        pairs_total: 2,
+    };
+    let kv = vec![(b"\x01k1".to_vec(), b"v".to_vec()), (b"\x2fkey2".to_vec(), vec![0xAB; 3])];
+    let mut w = SnapWriter::create(&d, h).unwrap();
+    w.pairs(&kv).unwrap();
+    let crc32c = kv.iter().fold(0, |c, (k, v)| record_crc(c, k, v));
+    let path = w.finish(&SnapTrailer { pairs: 2, crc32c }).unwrap();
+    g.add("SnapFile", std::fs::read(&path).unwrap());
+    std::fs::remove_dir_all(&d).unwrap();
     g.check();
 }

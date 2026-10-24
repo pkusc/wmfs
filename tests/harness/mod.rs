@@ -8,7 +8,10 @@
 //! - [`mem_target`]：内存版 TargetStore `MemTargetStore`（模拟 fsync 与掉电，M5，9.3）
 //! - [`data`]：不经 RPC、直接在一个 DataNode 上读写 chunk（M5，9.1 的"chunk 格式"）
 //! - [`node`]：完整的单节点（init + server::start）与连到它的客户端、参考客户端的 put/get（M5）
+//! - [`cluster`]：同一个进程里的多节点集群（init + join + server::start），客户端跟随 leader（M8）
+//! - [`sim_net`]：确定性 raft 模拟的多节点部分：几个 Driver 与它们之间的内存总线（丢、延迟、重排、分区、崩溃、快照下载，M8）
 
+pub mod cluster;
 pub mod data;
 pub mod mem_crash;
 pub mod mem_target;
@@ -17,3 +20,4 @@ pub mod meta_rpc;
 pub mod net;
 pub mod node;
 pub mod ns;
+pub mod sim_net;

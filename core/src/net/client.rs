@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use wmfs_api::metrics::{self, Counter, Gauge};
 use wmfs_api::types::KeyFile;
 
@@ -58,6 +58,10 @@ pub struct Endpoint {
 
 type Callback = Box<dyn FnOnce(Result<InFrame, ErrCode>) + Send>;
 
+/// 流收到的帧最多攒几帧（每帧 ≤ 1 MiB）：接收方处理得慢时连接的读线程在这里等，TCP 的背压一直传到发送方（实现注记（M8 审查）：
+/// 快照下载不会把整个 kv 表攒在内存里）。代价是同一条连接上别的回复也跟着慢下来（最多这么多帧的处理时间）。
+const STREAM_WINDOW: usize = 16;
+
 /// 在途请求的等待者：一次性回调（call/start/call_cb）或流（stream）。
 enum Waiter {
     Once(Callback),
@@ -65,11 +69,13 @@ enum Waiter {
 }
 
 impl Waiter {
+    /// 以 `r` 结束（超时、连接断开……）。流的通道满了就不等（这里可能在 rpc-timer 线程上）：发送端随之丢掉，接收方读完已有的帧之后
+    /// 看到通道断开，按连接断开（`ECONNRESET`）结束。
     fn finish(self, r: Result<InFrame, ErrCode>) {
         match self {
             Waiter::Once(cb) => cb(r),
             Waiter::Stream(tx) => {
-                let _ = tx.send(r);
+                let _ = tx.try_send(r);
             }
         }
     }
@@ -203,11 +209,19 @@ impl RpcClient {
         self.submit(to, fam, f, timeout, Waiter::Once(cb));
     }
 
-    /// 流式（SnapshotFetch，永远走 control_scheme）：timeout 是相邻两帧之间的上限
+    /// 流式（SnapshotFetch，永远走 control_scheme）：timeout 是相邻两帧之间的上限；收到的帧最多攒 [`STREAM_WINDOW`] 帧（背压）
     pub fn stream(&self, to: &Endpoint, f: OutFrame, timeout: Duration) -> Result<StreamRx, ErrCode> {
-        let (tx, rx) = unbounded();
+        let (tx, rx) = bounded(STREAM_WINDOW);
         self.submit(to, Family::Control, f, timeout, Waiter::Stream(tx));
         Ok(StreamRx { rx, done: false })
+    }
+
+    /// OneWay 帧（RaftMsg，永远走 control_scheme）：取（必要时新建，最多等 `timeout`）到对端的连接，放进它的发送队列就返回。
+    /// 没有回复，所以不进在途表；失败（建连失败、队列满……）原样返回，调用方丢掉这一帧（raft 会重发）。
+    pub fn send_oneway(&self, to: &Endpoint, f: OutFrame, timeout: Duration) -> Result<(), ErrCode> {
+        let deadline = clock::mono_ms() + timeout.as_millis() as u64 + 1; // +1：见文件头的实现注记 ④
+        let (s, a) = self.route(to, Family::Control)?;
+        self.connection(&s, &a, deadline)?.send(f)
     }
 
     /// 选连接、登记在途、交给写线程。本地的任何失败也记进在途表、由 rpc-timer（100 ms 内）以该错误码结束：

@@ -3,7 +3,8 @@
 **钩子**：meta_engine（唯一型，altitude 0）　**热路径**：否
 **fail point**：`plugin.embedded-kv.meta_engine`（包在 `read` / `txn` 外层；触发 = 这次读或写直接得到配置的错误码）
 **指标**：`wmfs_raft_term`、`wmfs_raft_is_leader`、`wmfs_raft_commit_index`、`wmfs_raft_applied_index`、`wmfs_raft_persist_seconds`、
-`wmfs_raft_msg_dropped_total`、`wmfs_meta_batch_ops`、`wmfs_meta_batch_bytes`、`wmfs_meta_commit_seconds`、
+`wmfs_raft_msg_sent_total`、`wmfs_raft_msg_dropped_total`、`wmfs_raft_snapshot_sent_total`、`wmfs_raft_snapshot_installed_total`（M8）、
+`wmfs_meta_batch_ops`、`wmfs_meta_batch_bytes`、`wmfs_meta_commit_seconds`、
 `wmfs_meta_batch_stale_total`（应恒为 0）、`wmfs_meta_read_gate_seconds`、`wmfs_meta_ops_total{op,code}`
 
 代码在 core（`core/src/meta/raft/` 与 `core/src/meta/engine/`）：元数据 Raft 是契约层（design.md 3.4.1，ADR-0019），
@@ -27,6 +28,10 @@ raft 日志、raft 的硬状态和"状态机"（键值表）在同一个 redb �
 - **fail-stop**：raft 线程或执行器线程上 redb 出错、或任何内部不变量被破坏，进程立即退出（写一行错误日志后 abort）——
   状态机写到一半继续运行比崩溃更危险；重启后由 raft 日志恢复。
 - **日志压缩**：每应用 1 万条检查一次，删掉"已落盘的已应用位置"之前 1 万条以外的旧日志。
+- **三副本（M8 起）**：3 个元数据节点各有一份完整的 `meta.redb`。新节点 `wmfs join` 进来先当 learner（只复制、不投票），追上之后
+  由 leader 上的 cluster-mgr 用一次"联合共识"变更把 1 个 voter 直接变成 3 个；落后太多（需要的日志已被压缩）的节点从 leader
+  下载一份**快照**：leader 开一个 redb 只读事务（不挡写），按键的顺序把整个键值表流式发过去，对方写成文件、校验、fsync 之后才
+  整个换掉自己的键值表。leader 挂了约 1–3 s 选出新的，客户端用同一个请求序号重试。`wmfs debug meta-hash` 比较各副本的状态。
 
 ## 配置
 
@@ -37,4 +42,6 @@ raft 日志、raft 的硬状态和"状态机"（键值表）在同一个 redb �
 - 单节点：`kill -9`、在落盘的任一步 abort（fail point `raft.persist.before_commit` / `raft.persist.after_commit` /
   `raft.apply.before`）之后重启，确认过的写一个不丢（`scripts/accept.sh M3`）；
 - 确定性模拟：在模拟掉电的内存存储上，随机在任意一次 fsync 处"断电"再重启，确认过的写一个不丢（1000 个随机种子）。
-- **真实设备上的掉电**本机无法验证（需要 root 的 dm-log-writes 或 LazyFS 环境，ADR-0015）；三副本、成员变更与快照在 M8。
+- 三副本（M8）：确定性模拟里 3 个节点随机掉电、丢消息、分区、重排、换 leader、成员变更、走快照（1000 个种子）；多进程的开发集群里
+  3000 次 mkdir 中途 `kill -9` leader、连续 10 轮杀 leader、小压缩阈值下重启的节点装快照追上（`scripts/accept.sh M8`）。
+- **真实设备上的掉电**本机无法验证（需要 root 的 dm-log-writes 或 LazyFS 环境，ADR-0015）；多台机器的真实网络分区也只在模拟里测。

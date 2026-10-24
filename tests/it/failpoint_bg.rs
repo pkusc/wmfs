@@ -22,13 +22,16 @@ fn a_failed_or_crashed_step_is_retried_and_replaying_it_is_harmless() {
     let c = client(&d, &run, "admin");
     let me = who(1000, 1000);
     let o = put(&c, &me, ROOT_INO, "f", &[7u8; 300_000]).unwrap();
-    put(&c, &me, ROOT_INO, "f", b"x").unwrap(); // 截断到 0：epoch 1 作废
-    let (ino, chain) = (o.attr.ino, o.layout.as_ref().unwrap().chains[0]);
-    let chunk0 = committed_path(&target_dir(&d), &ChunkId { chain, ino, epoch: 1, idx: 0 });
-    let dir = chunk0.parent().unwrap().to_path_buf(); // epoch 1 的目录
+    // 数据所在的 epoch 以 layout 为准（实现注记（M8）：非空内容的服务端 Uninline 会换 epoch，ADR-0035 第 11 条）
+    let (ino, l) = (o.attr.ino, o.layout.as_ref().unwrap());
+    let (chain, epoch) = (l.chains[0], l.epoch);
+    let chunk0 = committed_path(&target_dir(&d), &ChunkId { chain, ino, epoch, idx: 0 });
+    let dir = chunk0.parent().unwrap().to_path_buf(); // 这个 epoch 的目录
+    assert!(dir.exists());
+    put(&c, &me, ROOT_INO, "f", b"x").unwrap(); // 截断到 0：这个 epoch 作废
     assert!(wait_for(20, || !dir.exists()), "旧 epoch 最终被删除");
     assert!(wait_for(10, || errors.get() >= before + 2), "两次失败都计入了 wmfs_task_errors_total");
-    assert!(get_raw(&run.meta, &keys::gc(GC_EPOCH, ino, 1)).unwrap().is_none(), "重放之后记录也删了，没有出错");
+    assert!(get_raw(&run.meta, &keys::gc(GC_EPOCH, ino, epoch)).unwrap().is_none(), "重放之后记录也删了，没有出错");
     let hits = |n: &str| metrics::counter("wmfs_failpoint_hits_total", "", &[("name", n)]).get();
     assert_eq!((hits("plugin.gc.bg_task"), hits("bg.step.crash_after_effect")), (1, 1));
     run.stop();
