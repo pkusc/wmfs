@@ -9,7 +9,8 @@
 //! - **跟随 leader**：回 `NOT_LEADER` 且带 `leader_hint`（leader 在 control_scheme 上的 rpc 地址）→ 换到它立即重试
 //!   （连续跟随最多 [`MAX_HINT_HOPS`] 次，之后照常退避）；没有 hint → 退避后换下一个已知节点（`connect` 给的种子与
 //!   集群图里的节点）。实现注记（M4）：core 里没有 HTTP 客户端，"按 health 找 leader"由调用方（CLI）在 `connect` 之前做，
-//!   给出种子；之后没有 hint 时在认识的节点之间轮换（不是 leader 的节点回 `NOT_LEADER`，换下一个）。
+//!   给出种子；之后没有 hint 时在认识的节点之间轮换（不是 leader 的节点回 `NOT_LEADER`，换下一个）。实现注记（M9 审查）：`ETIMEDOUT`
+//!   也换下一个——被冻住（SIGSTOP）的 leader 既不回复也不断开，以前要等它恢复或连接保活断开才换，客户端停顿远超"leader 切换 1–3 s"。
 //! - **重试**（3.3.8）：可重试的错误（1000–1007、1019、`ECONNRESET`、`ETIMEDOUT`）按指数退避重试，10 ms 起、×2、上限 1 s，
 //!   直到总期限（[`MetaClientOpts::op_timeout`]：CLI 30 s，挂载参数 `--op-timeout` 默认 120 s）。每次重试写一行 INFO 日志
 //!   （`wmfs fs --verbose` 能看到）。超时之后的重试成功时，回复里的 ctime 早于重试的时刻 = 第一次其实已经执行、这是去重表
@@ -278,8 +279,8 @@ impl MetaClient {
             } else {
                 log::info("meta-client", format_args!("{what}：{code}，退避重试（第 {attempt} 次，{backoff} ms 后）"));
             }
-            if code == ErrCode::NOT_LEADER || code == ErrCode::ECONNRESET {
-                self.rotate(); // 没有 hint：换下一个认识的节点试试
+            if matches!(code, ErrCode::NOT_LEADER | ErrCode::ECONNRESET | ErrCode::ETIMEDOUT) {
+                self.rotate(); // 没有 hint、连不上或卡住（例如被冻住的 leader）：换下一个认识的节点试试
             }
             std::thread::sleep(Duration::from_millis(backoff));
             backoff = (backoff * 2).min(BACKOFF_MAX_MS);

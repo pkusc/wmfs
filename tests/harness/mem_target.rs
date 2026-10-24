@@ -3,7 +3,8 @@
 //! 用来验证本体按 R1–R6 调用了 fdatasync 与目录 fsync（`kill -9` 不丢页缓存，真实磁盘上测不出来）。`p/` 里的 pending 文件掉电后
 //! 还在（真实磁盘上没写完的 pending 文件也可能留下一部分），启动清理（`clear_temp`）必须把它们扔掉。
 //! 另有制造损坏的工具：把已提交的文件截短（"rename 已持久、数据只落了一部分"，XFS 上掉电可能出现，3.2.5）、翻转任意比特，以及
-//! 在 `p/` 里放一个写了一半的 pending 文件。删除（R4）不落盘：掉电后被删的版本可能"复活"。
+//! 在 `p/` 里放一个写了一半的 pending 文件。删除（R4）不落盘：掉电后被删的版本可能"复活"。另可让接下来几次 `commit_pending` 失败
+//! （EIO，pending 文件留着：像 rename 之前的 fdatasync 失败）。
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,7 @@ struct State {
     committed: BTreeMap<ChunkId, Arc<Vec<u8>>>, // 看得见的已提交版本（包括还没落盘的）
     durable: BTreeMap<ChunkId, Arc<Vec<u8>>>,   // 已落盘的已提交版本：掉电之后剩下的就是它
     pending: BTreeMap<ChunkId, Vec<u8>>,
+    fail_commits: u32, // 接下来这么多次 commit_pending 失败
 }
 
 #[derive(Clone, Default)]
@@ -42,8 +44,13 @@ impl MemTargetStore {
     pub fn crash(&self) -> MemTargetStore {
         let st = lock(&self.st);
         let (durable, pending) = (st.durable.clone(), st.pending.clone());
-        let after = State { committed: durable.clone(), durable, pending };
+        let after = State { committed: durable.clone(), durable, pending, fail_commits: 0 };
         MemTargetStore { st: Arc::new(Mutex::new(after)) }
+    }
+
+    /// 让接下来 `n` 次 `commit_pending` 失败（EIO，pending 留着）。
+    pub fn fail_commits(&self, n: u32) {
+        lock(&self.st).fail_commits = n;
     }
 
     /// 掉电，而且 `id` 的版本"rename 已持久、数据只落了前 `keep` 字节"（XFS 上可能出现，3.2.5）。
@@ -80,6 +87,14 @@ impl MemTargetStore {
     /// 已提交版本的原始字节（测试比对用）。
     pub fn committed_bytes(&self, id: &ChunkId) -> Option<Vec<u8>> {
         lock(&self.st).committed.get(id).map(|v| (**v).clone())
+    }
+
+    /// 直接放一个已提交（并已落盘）的版本（同步要删掉的"源没有的 chunk"，M9）。
+    pub fn put_committed(&self, id: &ChunkId, bytes: Vec<u8>) {
+        let mut st = lock(&self.st);
+        let v = Arc::new(bytes);
+        st.committed.insert(*id, v.clone());
+        st.durable.insert(*id, v);
     }
 
     /// 在 `p/` 里放一个 pending 文件（例如写了一半的）。
@@ -126,6 +141,10 @@ impl TargetStore for MemTargetStore {
 
     fn commit_pending(&self, id: &ChunkId, sync: bool) -> Result<(), ErrCode> {
         let mut st = lock(&self.st);
+        if st.fail_commits > 0 {
+            st.fail_commits -= 1;
+            return Err(ErrCode::EIO);
+        }
         let v = Arc::new(st.pending.remove(id).ok_or(ErrCode::ENOENT)?);
         st.committed.insert(*id, v.clone());
         if sync {

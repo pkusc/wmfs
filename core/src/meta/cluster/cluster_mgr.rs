@@ -8,12 +8,17 @@
 //!   以退出码 3 退出（`plugins::exit_mismatch`）；`--adopt-local-plugins` 的节点不退出，等它当选、就绪（它不看清单）之后提交一个批次把
 //!   清单改成本地的（`plugins::reset`，changelog `PluginListReset`，日志大声警告）。
 //! - 成员变更（3.4.1.9）：就绪的 leader 上每 1 s 一次 `Membership::tick`（learner 加入、joint 提升为 3 voter、移除、drain 时让出 leader、
-//!   leave-joint 兜底）。会话与 target 租约、两阶段驱逐、链管理、修复在 M9、M10。
+//!   leave-joint 兜底）。会话租约与两阶段驱逐在 M10。
+//!
+//! 实现注记（M9）：链管理器（target 租约、boot_id、唯一幸存者、回来、修复、drain、新 target，`chain_mgr.rs`）在就绪的 leader 上每轮
+//! （200 ms）一次。
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use super::chain_mgr::ChainMgr;
 use super::plugins;
+use super::targets::TargetUsage;
 use crate::base::types::ReqCtx;
 use crate::base::{ErrCode, clock, log};
 use crate::meta::changelog;
@@ -29,13 +34,13 @@ const PERIOD: Duration = Duration::from_millis(200);
 const LAG_EVERY: u64 = 25;
 const MEMBERS_EVERY: u64 = 5;
 
-/// 起 cluster-mgr 线程；引擎被丢弃或停止（`shutdown`）后线程自己退出。
-pub fn start(eng: &Arc<EmbeddedEngine>) -> Result<(), String> {
+/// 起 cluster-mgr 线程；引擎被丢弃或停止（`shutdown`）后线程自己退出。`usage` = leader 内存里的 target 心跳情况（元数据服务记）。
+pub fn start(eng: &Arc<EmbeddedEngine>, usage: Arc<TargetUsage>) -> Result<(), String> {
     let weak: Weak<EmbeddedEngine> = Arc::downgrade(eng);
     std::thread::Builder::new()
         .name("cluster-mgr".into())
         .spawn(move || {
-            let mut members = Membership::default();
+            let (mut members, mut chains) = (Membership::default(), ChainMgr::default());
             for round in 1u64.. {
                 std::thread::sleep(PERIOD);
                 let Some(eng) = weak.upgrade() else { return };
@@ -51,6 +56,7 @@ pub fn start(eng: &Arc<EmbeddedEngine>) -> Result<(), String> {
                         members.tick(&*eng, &eng.status(), clock::mono_ms());
                     }
                 }
+                chains.tick(&eng, &usage); // 不是就绪的 leader 时它只把链的指标归零
                 if round % LAG_EVERY == 0 {
                     let _ = eng.local_scan(&mut |v| changelog::refresh_lag(v)); // 只是指标：出错就等下一次
                 }
@@ -66,7 +72,7 @@ fn mismatch(eng: &EmbeddedEngine) {
     let committed =
         eng.local_get(&keys::global(G_PLUGINS)).ok().flatten().and_then(|b| decode_v1::<PluginListV1>(&b).ok());
     let why = plugins::why(local, committed.as_ref());
-    if !eng.adopt_local_plugins() {
+    if !eng.adopting() {
         plugins::exit_mismatch(&why);
     }
     if !eng.role().ready {

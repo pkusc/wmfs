@@ -21,6 +21,7 @@ use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health, NodeAddrs};
 
 use crate::base::{ErrCode, log};
 use crate::hooks::traits::KeyLookup;
+use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::engine::EmbeddedEngine;
 use crate::mgmt::{api, auth, cluster};
 
@@ -39,6 +40,7 @@ pub struct MgmtCtx {
     pub keys: Arc<dyn KeyLookup + Send + Sync>,
     pub failpoints_api: bool,
     pub meta: Option<Arc<EmbeddedEngine>>,
+    pub usage: Option<Arc<TargetUsage>>, // leader 内存里的 target 心跳情况（M9：链成员的状态，`mgmt/cluster.rs`）
     pub polls: AtomicUsize,
 }
 
@@ -206,7 +208,8 @@ mod tests {
             ..Default::default()
         };
         let keys = Arc::new(InitKeys::new(MASTER, 0));
-        let ctx = MgmtCtx { health, role: None, keys, failpoints_api, meta: None, polls: AtomicUsize::new(0) };
+        let (meta, usage, polls) = (None, None, AtomicUsize::new(0));
+        let ctx = MgmtCtx { health, role: None, keys, failpoints_api, meta, usage, polls };
         m.start(Arc::new(ctx)).unwrap();
         addr
     }

@@ -8,16 +8,17 @@
 //! 实现注记（M4）：警告只有"短链"一类（ADR-0016）——存储类声明的副本数大于它可用的故障域数、链的成员少于声明的副本数；
 //! 故障域重叠、2 voter 无高可用等随 M8/M9 加入，目录属性上的 `replicas`（例如 init 写的 /home replicas=3）随 M7 加入。
 //! 警告变化时（含 leader 第一次建图）写 WARN 日志（3.1.5：server 日志里一定看得到）。
-//! 实现注记（M8）：加了三条——元数据节点不少于 2 个而 voter 不到 3 个（"元数据没有高可用"，3.4.1.9）、几个节点的 machine_id 相同
-//! （"故障域重叠"，1.1）、有多个成员的链（数据的链式复制在 M9：在那之前文件数据只在 head 上，实际 1 副本——不能让 `durability` 的
-//! "实际 3"看起来像真的）。
+//! 实现注记（M8）：加了两条——元数据节点不少于 2 个而 voter 不到 3 个（"元数据没有高可用"，3.4.1.9）、几个节点的 machine_id 相同
+//! （"故障域重叠"，1.1）。实现注记（M9）：链降级按 **Serving** 成员数算（Syncing 成员还在追数据，不算副本）；没有 Serving 成员的链单独
+//! 一条（"链 X 等待最后的副本"，semantics.md 第 7 节）；一个节点公布了别的节点没有的数据传输（例如 rdma）→ 它们之间的复制会退回
+//! control_scheme（3.3.3："在 wmfs status 里警告 n→m 的复制未走 <scheme>"）。M8 的"数据的链式复制在 M9 实现"一条删掉了。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 
-use super::chains::candidates;
+use super::chains::{candidates, serving_count};
 use crate::base::{ErrCode, lock, log};
 use crate::meta::engine::txn::KvScan;
 use crate::meta::schema::keys::{
@@ -62,9 +63,26 @@ fn rows<T: DeserializeOwned>(v: &dyn KvScan, tag: u8) -> Result<Vec<(u64, T)>, E
     kv::scan_tag(v, tag)?.iter().map(|(k, b)| Ok((kv::key_id(k), decode_v1(b)?))).collect()
 }
 
-/// 集群警告（见文件头：短链、没有可用的 target、元数据没有高可用、故障域重叠、M9 之前只有 1 副本）。
+/// 集群警告（见文件头：链降级与不可用排在最前面——`wmfs status` 的第一行；然后是短链、没有可用的 target、元数据没有高可用、故障域重叠、
+/// 复制退回 control_scheme）。
 pub fn warnings(m: &ClusterMap) -> Vec<String> {
     let mut w = Vec::new();
+    let short: Vec<_> = m.chains.iter().filter(|(_, c)| serving_count(c) < c.replicas as usize).collect();
+    if let Some((id, c)) = short.first() {
+        let (s, y) = (serving_count(c), c.members.len() - serving_count(c));
+        w.push(format!(
+            "有 {} 条链少于声明副本数（降级：例如 chain {id} 声明 {} 副本、Serving {s} 个、Syncing {y} 个；加入节点或离线的节点回来后自动补齐）",
+            short.len(),
+            c.replicas
+        ));
+    }
+    for (id, c) in m.chains.iter().filter(|(_, c)| serving_count(c) == 0) {
+        let who = c.last_serving.map_or("最后的副本".to_string(), |t| format!("最后的副本 target {t}"));
+        w.push(format!(
+            "链 {id} 等待{who}回来：没有 Serving 成员，这条链上的数据不可用（不会用可能过期的副本顶替；管理员可以 \
+             wmfs chain force-serving {id} <target> 明确接受可能的数据丢失）"
+        ));
+    }
     for k in &m.classes {
         let fd = candidates(m, k).iter().map(|(_, node)| *node).collect::<BTreeSet<u32>>().len();
         if fd == 0 {
@@ -77,34 +95,30 @@ pub fn warnings(m: &ClusterMap) -> Vec<String> {
             ));
         }
     }
-    let live: Vec<_> = m.nodes.iter().map(|(_, n)| n).filter(|n| n.state != NODE_REMOVED).collect();
-    let voters = live.iter().filter(|n| n.meta_role == META_VOTER).count();
-    let meta = live.iter().filter(|n| n.meta_role != META_NONE).count(); // learner 与 voter
+    let live: Vec<_> = m.nodes.iter().filter(|(_, n)| n.state != NODE_REMOVED).collect();
+    let voters = live.iter().filter(|(_, n)| n.meta_role == META_VOTER).count();
+    let meta = live.iter().filter(|(_, n)| n.meta_role != META_NONE).count(); // learner 与 voter
     if meta >= 2 && voters < 3 {
         w.push(format!(
             "元数据只有 {voters} 个 voter（共 {meta} 个元数据节点）：没有高可用，坏了 voter 的多数元数据就不可用；推荐 1 个或 ≥ 3 个元数据节点"
         ));
     }
     let mut machines = BTreeMap::new();
-    for n in live.iter().filter(|n| !n.machine_id.is_empty()) {
+    for (_, n) in live.iter().filter(|(_, n)| !n.machine_id.is_empty()) {
         *machines.entry(n.machine_id.as_str()).or_insert(0) += 1;
     }
     if let Some(k) = machines.values().copied().filter(|k| *k > 1).max() {
         w.push(format!("故障域重叠：{k} 个节点在同一台机器上（machine_id 相同），这不是真正的容错"));
     }
-    if m.chains.iter().any(|(_, c)| c.members.len() > 1) {
-        w.push(
-            "数据的链式复制在 M9 实现：现在有多个成员的链只有 head（第一个成员）存数据，文件数据实际只有 1 副本".into(),
-        );
-    }
-    let short: Vec<_> = m.chains.iter().filter(|(_, c)| c.members.len() < c.replicas as usize).collect();
-    if let Some((id, c)) = short.first() {
-        w.push(format!(
-            "有 {} 条链少于声明副本数（例如 chain {id}：声明 {} 副本、实际 {} 个成员；加入节点后自动补齐）",
-            short.len(),
-            c.replicas,
-            c.members.len()
-        ));
+    for (a, na) in &live {
+        for (b, nb) in live.iter().filter(|(b, _)| b != a) {
+            let missing = na.addrs.iter().map(|(x, _)| x).filter(|x| !nb.addrs.iter().any(|(y, _)| y == *x));
+            for x in missing {
+                w.push(format!(
+                    "节点 {a}→{b} 的数据复制不能走 {x}（节点 {b} 没有公布 {x} 地址），会退回 control_scheme"
+                ));
+            }
+        }
     }
     w
 }

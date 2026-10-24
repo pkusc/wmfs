@@ -8,33 +8,58 @@
 //! - `GET /api/v1/cluster/plugins`、`POST /api/v1/cluster/plugins {add, remove}`（admin）：集群插件清单（`meta/cluster/plugins.rs`）。
 //! - `GET /api/v1/debug/meta-hash`：**每个节点都回答本节点的**（不跟随 leader）——已应用到哪、kv 表的哈希（`wmfs debug meta-hash`）。
 //!
-//! 前三组只有就绪的元数据 leader 回答（`api.rs` 的 leader_gate，ADR-0038 第 2 条；读写途中失去 leader 也照这条回，`failed_at`）；读是
+//! - M9：`GET /api/v1/chains`（全部链：成员与状态、期望长度、incarnation、last_serving，`wmfs chain list/show`）、
+//!   `POST /api/v1/chains/<id>/force-serving?target=`（admin，body 必须是 `{"i_accept_data_loss": true}`；`chain_mgr::force_serving`）。
+//!   成员的 `state`：链记录里的 `serving`/`syncing`；leader 最近 2 s 没听到它的心跳 → `unheard`，听到的 boot_id 与集群图里的不同（刚重启、
+//!   链管理器还没处理）→ `restarting`（审查后加的取值：`wmfs dev wait chains-serving` 不把它们算作 Serving）。
+//!
+//! 前三组（与链）只有就绪的元数据 leader 回答（`api.rs` 的 leader_gate，ADR-0038 第 2 条；读写途中失去 leader 也照这条回，`failed_at`）；读是
 //! 线性一致读、写是 seq 0 的执行器闭包（复用 `api.rs` 的 `read` / `write` / `write_exclusive`）。
 
 use super::api::{failed_at, read, write, write_exclusive};
 use super::auth;
 use super::http::{MgmtCtx, Reply, err, json};
-use crate::api::types::{ClusterReply, NodeInfo, NodeOpReply, PluginsReply, PluginsReq};
+use crate::api::types::{
+    ChainInfo, ChainMember, ChainsReply, ClusterReply, ForceServingReq, NodeInfo, NodeOpReply, PluginsReply, PluginsReq,
+};
+use crate::api::url::param;
 use crate::base::types::ReqCtx;
-use crate::base::{ErrCode, Failed};
+use crate::base::{ErrCode, Failed, clock};
 use crate::meta::changelog::{self, Change};
-use crate::meta::cluster::plugins;
+use crate::meta::cluster::chains::{self, SERVING};
+use crate::meta::cluster::targets::TargetUsage;
+use crate::meta::cluster::{chain_mgr, plugins};
 use crate::meta::engine::EmbeddedEngine;
 use crate::meta::engine::txn::{EngineStatus, MetaEngine};
 use crate::meta::schema::keys;
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{
-    META_LEARNER, META_NONE, META_VOTER, NODE_ACTIVE, NODE_DRAINING, NODE_REMOVED, NodeRecV1,
+    ChainRecV1, META_LEARNER, META_NONE, META_VOTER, NODE_ACTIVE, NODE_DRAINING, NODE_REMOVED, NodeRecV1,
 };
+use crate::proto::peer::ClusterMap;
 
 /// 这个路径归这里管吗（`meta-hash` 另走 [`meta_hash`]）。
 pub fn handles(path: &str) -> bool {
-    matches!(path, "/api/v1/cluster" | "/api/v1/cluster/plugins") || path.starts_with("/api/v1/nodes/")
+    matches!(path, "/api/v1/cluster" | "/api/v1/cluster/plugins" | "/api/v1/chains")
+        || path.starts_with("/api/v1/nodes/")
+        || path.starts_with("/api/v1/chains/")
 }
 
-/// leader_gate 之后的分派。
-pub(super) fn serve(eng: &EmbeddedEngine, req: &ReqCtx, method: &str, path: &str, body: &[u8]) -> Reply {
+/// leader_gate 之后的分派（`usage` = leader 内存里的 target 心跳情况，链成员的状态用）。
+pub(super) fn serve(
+    eng: &EmbeddedEngine,
+    usage: Option<&TargetUsage>,
+    req: &ReqCtx,
+    (method, path, query): (&str, &str, &str),
+    body: &[u8],
+) -> Reply {
+    let (term, now) = (eng.role().term, clock::mono_ms());
+    let heard = |t: u32| usage.and_then(|u| u.heard(t, term, now));
     let r = match (method, path) {
+        ("GET", "/api/v1/chains") => read(eng, req, |_v, c| Ok(chains(c.map, &heard))).map(|x| json(200, &x)),
+        ("POST", p) if p.starts_with("/api/v1/chains/") => {
+            force(eng, req, p, query, body, &heard).map(|x| json(200, &x))
+        }
         ("GET", "/api/v1/cluster") => overview(eng, req).map(|x| json(200, &x)),
         ("GET", "/api/v1/cluster/plugins") => {
             read(eng, req, |_v, c| Ok(PluginsReply { plugins: c.map.plugins.plugins.clone() })).map(|x| json(200, &x))
@@ -122,7 +147,9 @@ fn node_op(eng: &EmbeddedEngine, req: &ReqCtx, path: &str) -> Result<NodeOpReply
     let (id, op) = rest.split_once('/').ok_or_else(bad)?;
     let id: u32 = id.parse().map_err(|_| bad())?;
     let (op, message) = match op {
-        "drain" => ("NodeDrain", "已标记为 drain：它不再当 leader、不再被提升为 voter（链的迁走在 M9）"),
+        "drain" => {
+            ("NodeDrain", "已标记为 drain：它不再当 leader、不再被提升为 voter；链管理器把它的 target 从链里迁走")
+        }
         "remove" => ("NodeRemove", "已标记为移除：cluster-mgr 接着把它移出元数据 raft（之后它不再参与投票）"),
         "promote" => ("NodePromote", "已指定为元数据 voter：先以 learner 加入，追上之后提升"),
         _ => return Err(bad()),
@@ -154,4 +181,67 @@ fn node_op(eng: &EmbeddedEngine, req: &ReqCtx, path: &str) -> Result<NodeOpReply
         Ok(n)
     })?;
     Ok(NodeOpReply { node: info(id, &n, &st, eng.role().leader_id), message: message.into() })
+}
+
+/// leader 最近听到的 target 的 boot_id（没听到 → None）。
+type Heard<'a> = &'a dyn Fn(u32) -> Option<u64>;
+
+/// 一条链给管理 API 看的样子：`want` 见 `chains::want`（与链管理器同一口径）；成员的 `state` 见文件头。
+fn chain_info(m: &ClusterMap, id: u32, c: &ChainRecV1, heard: Heard) -> ChainInfo {
+    let rec = |t: u32| m.targets.iter().find(|(i, _)| *i == t).map(|(_, r)| r);
+    let state = |t: u32, s: u8| match heard(t) {
+        None => "unheard",
+        Some(b) if rec(t).is_some_and(|r| r.boot_id != 0 && r.boot_id != b) => "restarting",
+        Some(_) if s == SERVING => "serving",
+        Some(_) => "syncing",
+    };
+    let class = m.classes.iter().find(|k| k.id == c.class_id);
+    ChainInfo {
+        id,
+        ver: c.ver,
+        incarnation: c.incarnation,
+        class: class.map_or(format!("#{}", c.class_id), |k| k.name.clone()),
+        replicas: c.replicas,
+        want: chains::want(m, c) as u8,
+        members: c
+            .members
+            .iter()
+            .map(|(t, s)| ChainMember { target: *t, node: rec(*t).map_or(0, |r| r.node), state: state(*t, *s).into() })
+            .collect(),
+        last_serving: c.last_serving,
+        removed: c.removed.iter().map(|(t, _)| *t).collect(),
+    }
+}
+
+fn chains(m: &ClusterMap, heard: Heard) -> ChainsReply {
+    let chains = m.chains.iter().map(|(id, c)| chain_info(m, *id, c, heard)).collect();
+    ChainsReply { chains, warnings: m.warnings.clone() }
+}
+
+/// `POST /api/v1/chains/<id>/force-serving?target=`（见文件头）。
+fn force(
+    eng: &EmbeddedEngine,
+    req: &ReqCtx,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    heard: Heard,
+) -> Result<ChainInfo, Failed> {
+    let bad =
+        || Failed::new(ErrCode::EINVAL, format!("{path}：应为 /api/v1/chains/<链号>/force-serving?target=<target 号>"));
+    let id: u32 = path
+        .strip_prefix("/api/v1/chains/")
+        .and_then(|r| r.strip_suffix("/force-serving"))
+        .ok_or_else(bad)?
+        .parse()
+        .map_err(|_| bad())?;
+    let target: u32 = param(query, "target").and_then(|t| t.parse().ok()).ok_or_else(bad)?;
+    let ok = serde_json::from_slice::<ForceServingReq>(body).is_ok_and(|r| r.i_accept_data_loss);
+    if !ok {
+        let msg = "force-serving 可能丢掉别的成员独有的写：body 必须是 {\"i_accept_data_loss\": true}";
+        return Err(Failed::new(ErrCode::EINVAL, msg));
+    }
+    let rec = write_exclusive(eng, req, move |v, c| chain_mgr::force_serving(v, c, id, target))?;
+    let map = read(eng, req, |_v, c| Ok(c.map.clone()))?;
+    Ok(chain_info(&map, id, &rec, heard))
 }

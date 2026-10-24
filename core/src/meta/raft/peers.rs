@@ -8,8 +8,8 @@
 //!   MsgSnapshot 不退避，它的结局由看门狗兜底）。
 //!   对端地址取本节点已应用的 NodeRecV1（新节点在快照之前用 join 预写的，`boot.rs`）；查不到——这个节点在本地已应用的状态之后才加入，
 //!   例如落后到要走快照的 follower 碰上新加入的 leader——就问认识的节点要集群图（[`RaftNet::discover`]，实现注记（M8 审查））。
-//! - **收**：连接读线程收到 RaftMsg → [`RaftNet::deliver`]：MsgSnapshot **先不 step**，交给 snap-recv 线程下载（已有下载在进行就丢掉，
-//!   raft 会重发），其余直接投给 raft 线程（队列满就丢）。
+//! - **收**：连接读线程收到 RaftMsg → [`RaftNet::deliver`]：MsgSnapshot **先不 step**，交给 snap-recv 线程下载（正在下载就记下最新的
+//!   一条、那次结束后接着下载：leader 报告失败后马上重发，丢了要等 60 s 的看门狗，M9 验证），其余直接投给 raft 线程（队列满就丢）。
 //! - **snap-recv**：向 `SnapDesc.source_node` 发 `SnapshotFetch`（流，相邻两帧最多等 10 min），按 `snapshot.rs` 的格式写文件、校验、
 //!   fsync，**之后**才把原 MsgSnapshot 交给 raft 线程（Ready 里安装，规则 M5）。
 //! - **snap-serve**：`SnapshotFetch` 的服务（只给 Server 角色，3.3.3 的角色表）：找到对应的 pin，起一个 `snap-serve` 线程用 StreamChunk
@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -69,7 +69,7 @@ pub struct RaftNet {
     snap_dir: PathBuf,
     queues: Mutex<HashMap<u64, Sender<Message>>>,
     found: Mutex<(u64, HashMap<u64, Endpoint>)>, // 问别人找到的地址，与上一次去问的时刻（discover）
-    receiving: AtomicBool,
+    recv: Mutex<RecvQueue>,
     serving: AtomicUsize,
     sent: Arc<Counter>,
     dropped: Arc<Counter>,
@@ -95,7 +95,7 @@ impl RaftNet {
             snap_dir,
             queues: Mutex::new(HashMap::new()),
             found: Mutex::new((0, HashMap::new())),
-            receiving: AtomicBool::new(false),
+            recv: Mutex::new(RecvQueue::default()),
             serving: AtomicUsize::new(0),
             sent: c("wmfs_raft_msg_sent_total", "发给其他元数据副本的 raft 消息数"),
             dropped: c("wmfs_raft_msg_dropped_total", "没能发出的 raft 消息数"),
@@ -245,23 +245,24 @@ impl RaftNet {
             let _ = self.raft_tx.try_send(RaftInput::Msg(m)); // 满了就丢：raft 会重发
             return;
         }
-        if self.receiving.swap(true, Ordering::SeqCst) {
-            return; // 已有下载在进行：丢掉这一条，raft 会重发
-        }
+        let Some(m) = lock(&self.recv).arrive(m) else { return }; // 正在下载别的：记下了，那次结束后接着处理
         let w = self.this.clone();
         let spawned = std::thread::Builder::new().name("snap-recv".into()).spawn(move || {
-            if let Some(net) = w.upgrade() {
-                match net.download(&m) {
-                    Ok(()) => {
-                        let _ = net.raft_tx.send(RaftInput::Msg(m)); // 文件已经就位：现在才交给 raft 线程
-                    }
-                    Err(e) => log::warn("raft", format_args!("下载快照失败：{e}（leader 稍后重发）")),
+            let Some(net) = w.upgrade() else { return };
+            let mut next = Some(m);
+            while let Some(m) = next {
+                let index = m.get_snapshot().get_metadata().index;
+                let r = net.download(&m);
+                if let Err(e) = &r {
+                    log::warn("raft", format_args!("下载快照失败：{e}（leader 稍后重发）"));
+                } else {
+                    let _ = net.raft_tx.send(RaftInput::Msg(m)); // 文件已经就位：现在才交给 raft 线程
                 }
-                net.receiving.store(false, Ordering::SeqCst);
+                next = lock(&net.recv).done(r.is_ok(), index);
             }
         });
         if spawned.is_err() {
-            self.receiving.store(false, Ordering::SeqCst);
+            *lock(&self.recv) = RecvQueue::default(); // 这一条与期间记下的都丢掉：看门狗兜底
         }
     }
 
@@ -304,6 +305,32 @@ impl RaftNet {
         })?;
         tx.wait_room(8)?;
         tx.send(encode_body(&SnapTrailer { pairs, crc32c }), vec![], true)
+    }
+}
+
+/// snap-recv 的排队（见文件头）：同时只下载一个；下载期间到的 MsgSnapshot 只留最新的一条，那次下载结束后接着处理。
+#[derive(Default)]
+struct RecvQueue {
+    busy: bool,
+    next: Option<Message>,
+}
+
+impl RecvQueue {
+    /// 一条 MsgSnapshot 到了：空闲 → 还给调用方（由它起 snap-recv 线程下载）；正在下载 → 记下（替换更早记下的那条）。
+    fn arrive(&mut self, m: Message) -> Option<Message> {
+        if self.busy {
+            self.next = Some(m);
+            return None;
+        }
+        self.busy = true;
+        Some(m)
+    }
+
+    /// 一次下载结束（`ok`：`index` 处的快照已下载好、交给了 raft 线程）：接着下载的那条；没有、或它不比刚下载好的新 → None（空闲）。
+    fn done(&mut self, ok: bool, index: u64) -> Option<Message> {
+        let next = self.next.take().filter(|n| !ok || n.get_snapshot().get_metadata().index > index);
+        self.busy = next.is_some();
+        next
     }
 }
 
@@ -367,3 +394,6 @@ impl Service for RaftNet {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

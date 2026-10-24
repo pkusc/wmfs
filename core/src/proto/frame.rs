@@ -310,4 +310,18 @@ mod tests {
             let _ = FrameHeader::decode(&b);
         }
     }
+
+    /// 附录 C 的 C-5：客户端流量占满普通槽位时，前驱发来的转发（PeerCall）照样有缓冲收（复制 lane）；别的请求取不到 → BUSY。
+    #[test]
+    fn peer_call_bulk_comes_from_the_replication_lane() {
+        use crate::buf::{MemPool, PoolConfig};
+        let pool = MemPool::new(&PoolConfig { s_mb: 1, m_slots: 2, l_slots: 1, repl_lane: true }).unwrap();
+        let held: Vec<Buf> = std::iter::from_fn(|| pool.get(1, Lane::Normal, Duration::ZERO).ok()).collect();
+        assert_eq!(held.len(), 6, "S 档 8 槽里 6 个普通槽位都被占了");
+        let mut h = FrameHeader::new(FrameKind::Request, MSG_DATA_CALL, 1, 0);
+        h.bulk_len = 100;
+        assert_eq!(bulk_buf(&pool, &h, None, Duration::ZERO).err(), Some(ErrCode::BUSY));
+        h.msg_type = MSG_PEER_CALL;
+        assert!(bulk_buf(&pool, &h, None, Duration::ZERO).is_ok(), "转发用复制 lane 的槽位");
+    }
 }

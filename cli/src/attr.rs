@@ -226,7 +226,9 @@ pub fn status(a: StatusArgs) -> i32 {
             let ok = if x.mismatched { "✗ 不一致" } else { "✓" };
             let from =
                 if x.source == DEFAULT_SOURCE { "默认值".to_string() } else { format!("来源 {}", x.source) };
-            s += &format!("\n  {:<12} 声明 {}（{from}），实际 {}  {ok}", x.key, x.declared, x.actual.new_files);
+            let short =
+                x.actual.short_files.map_or(String::new(), |n| format!("；已有文件里实际副本少于声明的 {n} 个"));
+            s += &format!("\n  {:<12} 声明 {}（{from}），实际 {}{short}  {ok}", x.key, x.declared, x.actual.new_files);
         }
         s
     };

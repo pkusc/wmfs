@@ -12,13 +12,13 @@
 
 use super::DataNode;
 use super::format::{
-    BLK_COMPRESSED, BLK_ENCRYPTED, BlockEntry, CMP_NONE, ChunkHeader, ENC_NONE, INCOMPAT_BLOCK_COMPRESS,
-    INCOMPAT_BLOCK_ENCRYPT, block_aad, encode_table, layout_for,
+    BLK_COMPRESSED, BLK_ENCRYPTED, BlockEntry, CHUNK_HEADER_LEN, CMP_NONE, ChunkHeader, ENC_NONE,
+    INCOMPAT_BLOCK_COMPRESS, INCOMPAT_BLOCK_ENCRYPT, block_aad, encode_table, layout_for,
 };
 use super::read::Committed;
 use crate::base::types::ChunkId;
 use crate::base::{ErrCode, clock};
-use crate::buf::{Buf, Lane, POOL_WAIT};
+use crate::buf::{Buf, BufSlice, Lane, POOL_WAIT};
 use crate::hooks::traits::{BlockMeta, TransformCtx, TransformKind};
 use crate::proto::cap::CapV1;
 
@@ -63,14 +63,29 @@ pub enum ChunkEdit<'a> {
 type Placed = (u64, usize, usize);
 
 /// 一个新版本：写进 pending 文件的内容（头 + 块表在偏移 0，各改动块的存储字节在各自的固定偏移）与要原样复制的区间。
+/// 实现注记（M9）：另记着改动了哪些块表条目（重新编码的块按 `out` 里的顺序，之后是变成洞的块），增量转发给后继用（`packed.rs`）。
 pub struct NewVersion {
     head: Vec<u8>,
     out: Option<Buf>,            // 改动块的存储字节依次放在这里
     blocks: Vec<Placed>,         // 各改动块
     pub copies: Vec<(u64, u64)>, // (偏移, 长度)：从已提交版本同偏移复制
+    changed: Vec<u32>,           // 改动了块表条目的块（重新编码的在前，变成洞的在后）
+    table: Vec<BlockEntry>,
 }
 
 impl NewVersion {
+    /// 增量转发的固定头（含覆盖新块表的 header_crc）与改动块的 (块号, 72 字节块表条目)（3.3.6 的 ForwardWrite）。
+    pub fn forward_parts(&self) -> (Vec<u8>, Vec<(u32, Vec<u8>)>) {
+        let blocks = self.changed.iter().map(|b| (*b, self.table[*b as usize].encode().to_vec())).collect();
+        (self.head[..CHUNK_HEADER_LEN].to_vec(), blocks)
+    }
+
+    /// 改动块的存储字节（增量转发的 bulk，按 `forward_parts` 的顺序）：冻结缓冲、给出切片，不拷贝（3.6.3）。
+    pub fn into_bulk(self) -> Vec<BufSlice> {
+        let n: usize = self.blocks.iter().map(|(_, _, n)| *n).sum();
+        self.out.filter(|_| n > 0).map(|b| vec![b.freeze().slice(0, n as u32)]).unwrap_or_default()
+    }
+
     /// `write_pending` 的 writes。
     pub fn writes(&self) -> Vec<(u64, &[u8])> {
         let out = self.out.as_ref().map_or(&[][..], |b| b.as_slice());
@@ -151,6 +166,7 @@ pub fn build(
         }
         None => (vec![BlockEntry::default(); nb as usize], 0),
     };
+    let base = table.clone();
     let unknown = corrupt && old.is_none(); // 头坏了：不知道旧块在哪
     let (plains, new_len) = match edit {
         ChunkEdit::Write { extents, data } => {
@@ -180,18 +196,20 @@ pub fn build(
             (cut_boundary(node, id, old, &table, new_len, bs)?, old_len.min(new_len))
         }
     };
-    let changed: Vec<u32> = plains.iter().map(|(b, _)| *b).collect();
+    let mut changed: Vec<u32> = plains.iter().map(|(b, _)| *b).collect();
     let mut header = new_header(node, cap, id, h4k, nb, version, new_len);
     let (out, blocks) = encode_blocks(node, cap, id, &header, &mut table, plains)?;
     let copies = (0..nb)
         .filter(|b| table[*b as usize].stored_len > 0 && !changed.contains(b))
         .map(|b| (header.block_offset(b), table[b as usize].stored_len as u64))
         .collect();
+    let holed: Vec<u32> = (0..nb).filter(|b| table[*b as usize] != base[*b as usize] && !changed.contains(b)).collect();
+    changed.extend(holed);
     header.features_incompat = incompat_of(&table);
     let tb = encode_table(&table);
     let mut head = header.encode(&tb).to_vec();
     head.extend_from_slice(&tb);
-    Ok(NewVersion { head, out, blocks, copies })
+    Ok(NewVersion { head, out, blocks, copies, changed, table })
 }
 
 /// 写：涉及的每个块的新明文（块号, 明文）。整块覆盖 → 直接用新数据；部分覆盖一个有数据的旧块 → 先解码它再打补丁（读改写）。

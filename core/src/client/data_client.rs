@@ -2,7 +2,8 @@
 //!
 //! - 写类请求（WriteChunk、TruncateChunk、SyncChunks、DeleteEpoch）发给链的 head（第一个 Serving 成员）；读发给一个 Serving 成员
 //!   （`prefer_node` 上的优先），回 `CHUNK_DIRTY` 就改问 `extra` 指的那个 target，回 `CHECKSUM_MISMATCH`/`CORRUPT` 就换下一个副本——
-//!   全部副本都坏了才 `EIO`（单副本时就是 `EIO`：诚实报错，不返回错误的数据）。
+//!   全部副本都坏了才 `EIO`（单副本时就是 `EIO`：诚实报错，不返回错误的数据）；连不上、超时、`FENCED` 也马上换下一个 Serving 副本
+//!   （M9，8.3），都试过了才退避重试。
 //! - 链、target、节点地址都来自集群图（`map()`）；集群图里还没有这条链、或者回了 `STALE_CHAIN`/`NOT_SERVING`，就调用 `refresh`
 //!   （调用方给的"拉一张新集群图"，C6）再重试。可重试的错误（1000–1007、1019、`ECONNRESET`、`ETIMEDOUT`）按 3.3.8 退避（10 ms 起、
 //!   ×2、上限 1 s），直到总期限（默认 120 s）；`CHUNK_NOT_FOUND` 原样交给调用方（C5：先 GetAttr 确认 epoch 没变，再当空洞读 0）。
@@ -161,6 +162,11 @@ impl DataClient {
         }
     }
 
+    /// 集群图里这条链此刻有没有 Serving 成员（gc 跳过不可用的链上的记录，不必等满总期限，M9）。
+    pub fn chain_serving(&self, chain: u32) -> bool {
+        (self.map)().chains.iter().any(|(id, c)| *id == chain && c.members.iter().any(|(_, s)| *s == SERVING))
+    }
+
     /// 只给 gc（管理权限 cap）
     pub fn delete_epoch(&self, cap: &[u8], chain: u32, ino: u64, epoch: u32) -> Result<u64, ErrCode> {
         let op = |ver| DataOp::DeleteEpoch { chain, chain_ver: ver, ino, epoch };
@@ -181,10 +187,10 @@ impl DataClient {
     ) -> Result<InFrame, ErrCode> {
         let deadline = clock::mono_ms().saturating_add(self.op_timeout.as_millis() as u64);
         let trace_id = rand::random_u64();
-        let (mut backoff, mut skip, mut redirect) = (BACKOFF_START_MS, Vec::new(), None);
+        let (mut backoff, mut skip, mut down, mut redirect) = (BACKOFF_START_MS, Vec::new(), Vec::new(), None);
         loop {
             let map = (self.map)();
-            let code = match pick(&map, chain, &to, &skip, redirect.take()) {
+            let code = match pick(&map, chain, &to, &skip, &down, redirect.take()) {
                 Err(e) => e,
                 Ok((ver, target, ep)) => {
                     let recv_into = match &mut to {
@@ -196,7 +202,7 @@ impl DataClient {
                     let body = encode_body(&DataCall { cap: cap.to_vec(), op: op(ver) });
                     let hdr = FrameHeader::new(FrameKind::Request, MSG_DATA_CALL, 0, trace_id);
                     let f = OutFrame { hdr, body, bulk: bulk.to_vec(), recv_into };
-                    match self.rpc.call(&ep, Family::Data, f, self.rpc_timeout) {
+                    let code = match self.rpc.call(&ep, Family::Data, f, self.rpc_timeout) {
                         Ok(f) => match f.error() {
                             None => return Ok(f),
                             // 重定向也受总期限约束（过了期限就按下面的可重试错误处理：到期返回 CHUNK_DIRTY）
@@ -212,10 +218,21 @@ impl DataClient {
                             Some(e) => ErrCode(e.code),
                         },
                         Err(e) => e,
+                    };
+                    // 实现注记（M9）：读遇到连不上、超时、FENCED 的副本 → 马上换下一个 Serving 副本（8.3）；都试过了才退避重试
+                    let transient = matches!(code, ErrCode::ECONNRESET | ErrCode::ETIMEDOUT | ErrCode::FENCED);
+                    if transient && matches!(to, To::Read { .. }) && !down.contains(&target) {
+                        down.push(target);
+                        continue;
                     }
+                    code
                 }
             };
-            if (code == ErrCode::STALE_CHAIN || code == ErrCode::NOT_SERVING)
+            // 实现注记（M9）：连不上、超时、FENCED 也拉一次新集群图——链上的成员可能刚被换掉（数据链重配，3.4.2.10），
+            // 不必等会话心跳（3 s）才发现
+            let stale =
+                [ErrCode::STALE_CHAIN, ErrCode::NOT_SERVING, ErrCode::FENCED, ErrCode::ECONNRESET, ErrCode::ETIMEDOUT];
+            if stale.contains(&code)
                 && let Some(f) = &self.refresh
             {
                 f();
@@ -223,6 +240,7 @@ impl DataClient {
             if !retryable(code) || clock::mono_ms().saturating_add(backoff) >= deadline {
                 return Err(code);
             }
+            down.clear(); // 退避之后连不上的副本也再试一次
             std::thread::sleep(Duration::from_millis(backoff));
             backoff = (backoff * 2).min(BACKOFF_MAX_MS);
         }
@@ -247,6 +265,7 @@ fn pick(
     chain: u32,
     to: &To,
     skip: &[u32],
+    down: &[u32],
     redirect: Option<u32>,
 ) -> Result<(u64, u32, Endpoint), ErrCode> {
     let (_, c) = map.chains.iter().find(|(id, _)| *id == chain).ok_or(ErrCode::NOT_SERVING)?;
@@ -254,13 +273,15 @@ fn pick(
     let mut serving: Vec<u32> = c.members.iter().filter(|(_, s)| *s == SERVING).map(|(t, _)| *t).collect();
     let target = match (to, redirect) {
         (To::Head, _) => *serving.first().ok_or(ErrCode::NOT_SERVING)?,
+        (To::Read { .. }, Some(t)) if down.contains(&t) => return Err(ErrCode::NOT_SERVING), // last serving 连不上：退避
         (To::Read { .. }, Some(t)) => t,
         (To::Read { prefer, .. }, None) => {
-            serving.retain(|t| !skip.contains(t));
+            serving.retain(|t| !skip.contains(t) && !down.contains(t));
             if let Some(n) = prefer {
                 serving.sort_by_key(|t| node_of(*t) != Some(*n)); // 稳定排序：同节点的在前，其余保持链序
             }
-            *serving.first().ok_or(if skip.is_empty() { ErrCode::NOT_SERVING } else { ErrCode::EIO })?
+            let none = if skip.is_empty() || !down.is_empty() { ErrCode::NOT_SERVING } else { ErrCode::EIO };
+            *serving.first().ok_or(none)?
         }
     };
     let node = node_of(target).ok_or(ErrCode::NOT_SERVING)?;

@@ -1,6 +1,7 @@
 //! `wmfs dev` 的多节点部分（design.md 7.2，roadmap M8）：`dev up --nodes N` 的第 2…N 个节点用 `wmfs join` 的本地侧加入（种子 = node1
 //! 的 rpc 地址，cluster.key 就是 node1 的那个文件——`wmfs dev` 在单机上，3.4.3），起好之后等元数据成员齐了才返回（[`wait_members`]）；
 //! `dev start n` 最后等这个节点追上（[`wait_caught_up`]）；`dev leader` 打印就绪 leader 的节点号（`L=$(wmfs dev leader); wmfs dev kill $L`）。
+//! M9：`dev restart-all`（[`restart_all`]，3.7.2 第 4 条）。
 
 use std::path::Path;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use wmfs_core::buf::PoolConfig;
 use wmfs_core::init::{JoinOpts, Profile, join_node, read_master};
 use wmfs_mgr::api::ApiClient;
 
-use super::{admin_key, dev_target, health, mgmt_addr, node_dir, nodes, ports};
+use super::{admin_key, dev_target, health, mgmt_addr, node_dir, nodes, ports, running_pid, start, stop};
 use crate::registry;
 
 /// 等元数据成员齐、等一个重启的节点追上的期限。
@@ -110,4 +111,37 @@ pub fn leader(d: &Path) -> Result<Vec<String>, String> {
     found
         .map(|n| vec![n.to_string()])
         .ok_or_else(|| "现在没有就绪的元数据 leader（可以先 wmfs dev wait leader）".into())
+}
+
+/// `wmfs dev restart-all`：按各节点当前的 node.toml 依次重启全部节点——先 follower、最后 leader（SIGTERM 时它先让位），每个都等它追上；
+/// 开始时集群是好的（都在运行、有就绪的 leader）就每重启一个都等链全部恢复 Serving（`dev wait chains-serving`）再重启下一个，不然冗余
+/// 会一路降到 1 份。停着的节点直接起（`cluster plugins add|remove` 之后节点都因清单不一致退出了：改好各节点的 node.toml 再
+/// restart-all）。最后等就绪的 leader 与元数据成员到齐，并确认没有节点起来之后又退出（例如 node.toml 还与集群插件清单不一致：退出码 3）。
+pub fn restart_all(d: &Path) -> Result<Vec<String>, String> {
+    let all = nodes(d);
+    let leader = all.iter().copied().find(|n| health(d, *n).is_ok_and(|h| h.meta_role == "leader"));
+    let healthy = leader.is_some() && all.iter().all(|n| running_pid(d, *n).is_some());
+    let mut order: Vec<u32> = all.iter().copied().filter(|n| Some(*n) != leader).collect();
+    order.extend(leader);
+    let mut lines = Vec::new();
+    for n in order {
+        stop(d, n)?;
+        lines.push(start(d, n)?);
+        if healthy {
+            lines.extend(super::wait::wait(d, &["chains-serving".to_string()], 120)?.pop());
+        }
+    }
+    let count = all.len() as u32;
+    lines.extend(super::wait::wait(d, &["leader".to_string()], 60)?);
+    if count > 1 {
+        lines.push(wait_members(d, count)?);
+    }
+    let deadline = clock::mono_ms() + 1500; // 清单不一致的节点在启动后约 1.2 s 退出（3.7.2：1 s 后退出）
+    while clock::mono_ms() < deadline {
+        if let Some(n) = all.iter().find(|n| running_pid(d, **n).is_none()) {
+            return Err(format!("node{n} 起来之后又退出了（插件配置与集群插件清单不一致？看 wmfs dev logs {n}）"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(lines)
 }

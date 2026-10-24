@@ -57,7 +57,7 @@ fn usage_status_semantics_json_golden() {
         declared: "3".into(),
         source: "/home".into(),
         effect: "新文件 + 协调器".into(),
-        actual: AttrActual { new_files: "1".into() },
+        actual: AttrActual { new_files: "1".into(), short_files: None },
         mismatched: true,
     };
     let s = StatusReply { path: "/".into(), warnings: vec!["w".into()], attrs: vec![a] };
@@ -65,6 +65,8 @@ fn usage_status_semantics_json_golden() {
         &s,
         r#"{"path":"/","warnings":["w"],"attrs":[{"key":"replicas","declared":"3","source":"/home","effect":"新文件 + 协调器","actual":{"new_files":"1"},"mismatched":true}]}"#,
     );
+    let a2 = AttrActual { new_files: "3".into(), short_files: Some(1 << 33) }; // M9：replicas 的 short_files
+    same(&a2, r#"{"new_files":"3","short_files":8589934592}"#);
     let m = SemanticsReply {
         consistency: vec!["c".into()],
         relaxations: vec!["r".into()],

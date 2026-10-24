@@ -9,7 +9,12 @@
 //!
 //! - [`join`]：`NodeOp::Join` 的 leader 一侧（插件清单比对、分配节点与 target 号、写记录，M8）
 //! - [`plugins`]：集群插件清单的比对与退出、`wmfs cluster plugins add|remove`、`--adopt-local-plugins`（M8）
+//!
+//! - [`chain_plan`]：链管理器的决定（纯函数：离线、重启、唯一幸存者、回来、修复、drain、新 target，M9）
+//! - [`chain_mgr`]：链管理器在 cluster-mgr 线程上的一轮、SyncDone、force-serving、调小租约的过渡（M9）
 
+pub mod chain_mgr;
+pub mod chain_plan;
 pub mod chains;
 pub mod cluster_mgr;
 pub mod join;

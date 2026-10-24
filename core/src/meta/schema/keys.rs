@@ -56,6 +56,7 @@ pub const G_CLUSTER: &str = "cluster"; // ClusterInfoV1
 pub const G_FEATURES: &str = "features"; // FeatureSetV1
 pub const G_SETTINGS: &str = "settings"; // ClusterSettingsV1
 pub const G_PLUGINS: &str = "plugins"; // PluginListV1，集群插件清单（3.7.2）
+pub const G_SETTINGS_PREV: &str = "settings_prev"; // ClusterSettingsV1：调小租约之前的值（ADR-0038 第 5 条，M9 起）
 
 // ---- 保留 inode：1 = 根；2..=15 保留；普通 inode 从 16 开始分配、单调、永不复用 ----
 pub const ROOT_INO: u64 = 1;

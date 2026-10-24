@@ -6,7 +6,9 @@
 //! - **修改**（[`change`]）：`wmfs cluster plugins add|remove <钩子:名字>`（admin），写 changelog `PluginListChange`、`map_epoch += 1`；
 //!   之后各节点因不一致退出，用新配置重启全部节点。
 //! - **逃生口**（[`reset`]）：`wmfs server --adopt-local-plugins` 的节点成为就绪 leader 时不退出，而是提交一个批次把清单改成本地的
-//!   （changelog `PluginListReset`，日志大声警告），其他节点随后按新清单比对。
+//!   （changelog `PluginListReset`，日志大声警告），其他节点随后按新清单比对。实现注记（M9，ADR-0039 第 6 条）：这个参数只管到本地清单
+//!   第一次与已应用的集群清单一致、或已应用的集群清单变了（逃生口被别的节点用过了）为止，之后照常比对——配置与改好的清单不同的节点
+//!   照常以退出码 3 退出，两个配置不同的节点不会把清单来回改成各自的（`raft/types.rs` 的 `Published::adopting`）。
 
 use std::time::Duration;
 
@@ -23,8 +25,9 @@ use crate::meta::schema::records::PluginListV1;
 pub const EXIT_MISMATCH: i32 = 3;
 
 /// 修法（日志与报错里都给出）。
-pub const FIX: &str = "修复：让全部节点启用同一组插件后重启（node.toml 的 [plugins] disable；改集群清单用 wmfs cluster plugins add|remove）；\
-     某个插件再也装不上时，在一个元数据节点上用 wmfs server --data-dir D --adopt-local-plugins 启动（3.7.2 第 5 条）；\
+pub const FIX: &str = "修复：让全部节点启用同一组插件后重启（node.toml 的 [plugins] disable；改集群清单用 wmfs cluster plugins add|remove；\
+     开发集群改好 node.toml 之后 wmfs dev restart-all）；某个插件再也装不上时，在全部元数据节点上（同一份插件配置）都用 \
+     wmfs server --data-dir D --adopt-local-plugins 启动，当选的节点改好清单之后去掉参数重启（3.7.2 第 5 条）；\
      开发集群多半是旧里程碑建的，wmfs dev down --purge 之后重新 wmfs dev up";
 
 /// 本地清单与集群清单的差异（相同 → None），例如「缺少 authz:deny-uid；多出 qos:fifo」。

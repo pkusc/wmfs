@@ -6,7 +6,10 @@
 #        数据完整……）；
 #     ② 再起一个同样的部署，在 wmfs-tools 容器里跑 fio verify、pjdfstest 子集、fsx（没有镜像 → SKIP，不算通过也不算失败）。
 #     M7 起冒烟里有目录属性的 set/get 与递归用量。
-#   nas-safe（M9 起）、hpc-rdma（有 Soft-RoCE 时）还没有。
+#   nas-safe（M9 起的阶段版：3 节点、replicas=3）：① tests/profiles/nas_safe.rs（写入中依次 kill -9 每个节点、fsync 过的文件全部完好）；
+#     ② 再起一个 nas-safe 部署跑 Jepsen-lite（tests/it/jepsen_register.rs：寄存器在随机 kill / SIGSTOP 下线性一致），之后等链全部 Serving、
+#     跑不变式检查器（tests/it/replica_check.rs）。
+#   hpc-rdma：本机没有 RDMA 设备，显示 SKIP（不算通过，也不算失败）。
 # 输出：每项一行 ✓ / ✗ / SKIP，最后一行 "minimal PASS" 或 "minimal FAIL"。用开发集群的端口 19100/19180（要空闲），开发目录是临时的，
 # 结束时 wmfs dev down --purge（先卸载挂载、再停节点），不留挂载与进程。
 set -u
@@ -18,6 +21,8 @@ unset WMFS_GOLDEN_UPDATE WMFS_FAILPOINTS
 
 PROFILE="${1:-}"
 fail=0
+LOG="$(mktemp "${TMPDIR:-/tmp}/wmfs-profile-$PROFILE-XXXX.log")"
+trap 'rm -f "$LOG"' EXIT
 ok() { echo "✓ $1"; }
 bad() {
     echo "✗ $1"
@@ -26,13 +31,12 @@ bad() {
 
 case "$PROFILE" in
 minimal)
-    if cargo test --release -p wmfs --test profile_minimal -- --ignored >/tmp/wmfs-profile-$$.log 2>&1; then
+    if cargo test --release -p wmfs --test profile_minimal -- --ignored >"$LOG" 2>&1; then
         ok "冒烟：目录与文件、改名、链接、截断、inline 与 chunk 文件、目录属性 set/get 与递归用量、kill -9 / 重启后 fsync 过的数据完整"
     else
-        tail -30 /tmp/wmfs-profile-$$.log
+        tail -30 "$LOG"
         bad "冒烟（cargo test -p wmfs --test profile_minimal -- --ignored）"
     fi
-    rm -f /tmp/wmfs-profile-$$.log
     if docker image inspect wmfs-tools >/dev/null 2>&1; then
         dev="$(mktemp -d "${TMPDIR:-/tmp}/wmfs-profile-dev-XXXX")"
         export WMFS_DEV_DIR="$dev"
@@ -48,12 +52,43 @@ minimal)
         echo "SKIP 容器内 fio verify、pjdfstest 子集、fsx（原因：没有镜像 wmfs-tools，先运行 scripts/build-tools-image.sh）"
     fi
     ;;
-nas-safe | hpc-rdma)
-    echo "$PROFILE 从 M9 起才有（design.md 9.7 的分阶段执行）"
-    exit 2
+nas-safe)
+    # M9–M11 的阶段版（design.md 9.7）：3 节点、TCP、/home replicas=3（trash、audit 在 M12 起）。两部分都有总期限（timeout 连同测试起的
+    # 节点与挂载进程一起结束），超时或失败之后照样 wmfs dev down --purge 兜底：不留进程、挂载与目录。
+    pdir="$(mktemp -d "${TMPDIR:-/tmp}/wmfs-profile-nas-safe-XXXX")"
+    if WMFS_PROFILE_DIR="$pdir" timeout 1200 cargo test --release -p wmfs --test profile_nas_safe -- --ignored --nocapture \
+        >"$LOG" 2>&1; then
+        ok "写入中依次 kill -9 每个节点：客户端 0 个错误；fsync 过的文件全部完好；节点回来之后先 Syncing、后 Serving，副本差距归零"
+    else
+        tail -30 "$LOG"
+        bad "单点故障无错误 + 已确认写不丢（cargo test -p wmfs --test profile_nas_safe -- --ignored）"
+    fi
+    WMFS_DEV_DIR="$pdir" wmfs dev down --purge >/dev/null 2>&1
+    dev="$(mktemp -d "${TMPDIR:-/tmp}/wmfs-profile-dev-XXXX")"
+    export WMFS_DEV_DIR="$dev"
+    if wmfs dev up --nodes 3 --profile nas-safe >/dev/null &&
+        timeout 600 cargo test --release -p wmfs-testkit --test jepsen_register -- --ignored --nocapture >"$LOG" 2>&1; then
+        ok "Jepsen-lite：寄存器（单个 chunk）在随机 kill -9 / SIGSTOP 下线性一致"
+    else
+        tail -30 "$LOG"
+        bad "Jepsen-lite（cargo test -p wmfs-testkit --test jepsen_register -- --ignored）"
+    fi
+    # 捣乱过后（节点回来、重同步期间寄存器一直在写）：链全部 Serving 之后所有副本一致
+    if wmfs dev wait chains-serving --timeout 120 >"$LOG" 2>&1 &&
+        cargo test --release -p wmfs-testkit --test replica_check -- --ignored >>"$LOG" 2>&1; then
+        ok "不变式检查器：捣乱之后所有 Serving 副本的已提交版本与内容一致"
+    else
+        tail -30 "$LOG"
+        bad "不变式检查器（cargo test -p wmfs-testkit --test replica_check -- --ignored）"
+    fi
+    wmfs dev down --purge >/dev/null 2>&1
+    ;;
+hpc-rdma)
+    echo "SKIP hpc-rdma（原因：本机没有可用的 RDMA 设备，人类决定本机不做 RDMA 实机测试）"
+    exit 0
     ;;
 *)
-    echo "用法：scripts/profiles.sh minimal"
+    echo "用法：scripts/profiles.sh minimal | nas-safe | hpc-rdma"
     exit 2
     ;;
 esac

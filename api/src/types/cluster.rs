@@ -1,6 +1,7 @@
 //! M8 的管理端点的请求/响应结构（design.md 7.1、3.4.1.9、3.7.2）：集群概览与节点（`GET /api/v1/cluster`、
 //! `POST /api/v1/nodes/<id>/{drain,remove,promote}`）、集群插件清单（`GET/POST /api/v1/cluster/plugins`）、各节点的元数据哈希
-//! （`GET /api/v1/debug/meta-hash`，`wmfs debug meta-hash` 用）。字段只增不改（ADR-0005）；JSON 金样在 `cluster/tests.rs`。
+//! （`GET /api/v1/debug/meta-hash`，`wmfs debug meta-hash` 用）。M9：链（`GET /api/v1/chains`、`POST /api/v1/chains/<id>/force-serving`）。
+//! 字段只增不改（ADR-0005）；JSON 金样在 `cluster/tests.rs`。
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,44 @@ pub struct MetaHashReply {
     pub state_version: u64,
     pub keys: u64,
     pub hash: String,
+}
+
+/// `GET /api/v1/chains` 里一条链的一个成员（链序）：`state` 是 `serving` 或 `syncing`。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ChainMember {
+    pub target: u32,
+    pub node: u32,
+    pub state: String,
+}
+
+/// 一条链（M9）：版本、incarnation、存储类、声明副本数、期望长度 `want`（= min(声明副本数, 这个存储类能用的节点数)，`wmfs dev wait
+/// chains-serving` 等的就是"每条链都有 want 个成员且全部 Serving"）、成员、最后一个 Serving 成员被移除时记下的 `last_serving`、最近被
+/// 移除的 target（rejoin_window 内回来可直接以 Syncing 追加）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ChainInfo {
+    pub id: u32,
+    pub ver: u64,
+    pub incarnation: u32,
+    pub class: String,
+    pub replicas: u8,
+    pub want: u8,
+    pub members: Vec<ChainMember>,
+    pub last_serving: Option<u32>,
+    pub removed: Vec<u32>,
+}
+
+/// `GET /api/v1/chains`：全部链与集群警告。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ChainsReply {
+    pub chains: Vec<ChainInfo>,
+    pub warnings: Vec<String>,
+}
+
+/// `POST /api/v1/chains/<id>/force-serving?target=` 的请求体：必须明确写 `{"i_accept_data_loss": true}`（7.1）。回复是改完的
+/// [`ChainInfo`]。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ForceServingReq {
+    pub i_accept_data_loss: bool,
 }
 
 #[cfg(test)]

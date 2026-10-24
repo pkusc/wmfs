@@ -68,9 +68,13 @@ LIMIT=36000
 # M8 审查修复（design.md 2.2 的 M8 审查注记）：新增约 275 行。重估三个：core/meta/raft 1650 → 1750（已约 1,725：raft-send 的退避与
 # 不认识的对端地址的查找、leader 发布的 active；余下小改约 25）、core/meta/engine 800 → 830（已约 790，余下 M10 的配额与锁的对接约 40）、
 # core/net 1220 → 1230（已约 1,190：流的有界通道；余下 M9 的 call_cb 后台建连约 40）。
+# M9（design.md 2.2 的 M9 注记）：新增约 2,000 行（预算约 2,220）。重估两个已达 90% 的：core/mgmt 790 → 950（已约 745：M9 的链端点约 65；
+# 余下 M10–M14 的约 12 组端点约 200）、core 900 → 920（已约 855；余下 M14 的 mgr 装配约 60）。
+# M9 审查修复（design.md 2.2 的 M9 审查修复注记）：再新增约 150 行（M9 合计约 2,140，预算约 2,220），没有模块超过估算，估算都不变。
+# M9 验证修复（design.md 2.2 的 M9 验证修复注记）：再新增约 23 行。重估一个：core/meta/raft 1750 → 1780（已约 1,757：snap-recv 的排队；余下小改约 25）。
 MODULES="wmfs-api:1100 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1230 core/hooks:1060
-core/meta/raft:1750 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
-core/data:3000 core/client:2200 core/bg:850 core/mgmt:790 core:900 plugins:5380 cli:4900 dashboard:880
+core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
+core/data:3000 core/client:2200 core/bg:850 core/mgmt:950 core:920 plugins:5380 cli:4900 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

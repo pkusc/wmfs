@@ -203,3 +203,33 @@ path = "it/raft_sim_cluster.rs"
 [[test]]
 name = "raft_pitfalls_m8"
 path = "it/raft_pitfalls_m8.rs"
+
+# M9：链式复制（design.md 9.3 的 CRAQ 组件测试；fail point 是进程级的，用到 fail point 的各自一个测试程序）。
+[[test]]
+name = "craq"
+path = "it/craq.rs"
+
+# M9 审查发现的边界情况：同步期间写到中间的 Syncing 成员、新成员先于同步源换图、规则 2 之后的重新驱动（C-9）、I5、DeleteEpoch 沿链、
+# 多块 chunk 的部分覆盖与截断（不用 fail point：可以与别的用例同进程并行跑）。
+[[test]]
+name = "craq_edges"
+path = "it/craq_edges.rs"
+
+[[test]]
+name = "failpoint_chain"
+path = "it/failpoint_chain.rs"
+
+[[test]]
+name = "failpoint_sync"
+path = "it/failpoint_sync.rs"
+
+# M9：Jepsen-lite（寄存器负载直接用 DataClient 读写单个 chunk）与不变式检查器，都对着一个跑着的开发集群（固定端口：#[ignore]，
+# 由 scripts/accept.d/m9.sh 跑）；检查器本身的单元测试照常跑。
+[[test]]
+name = "jepsen_register"
+path = "it/jepsen_register.rs"
+
+[[test]]
+name = "replica_check"
+path = "it/replica_check.rs"
+

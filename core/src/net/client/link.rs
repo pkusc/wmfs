@@ -90,7 +90,7 @@ impl RpcClient {
     }
 
     /// 连接表里到 `key` 的、还没断的连接。
-    fn live_conn(&self, key: &(String, String)) -> Option<ConnHandle> {
+    pub(super) fn live_conn(&self, key: &(String, String)) -> Option<ConnHandle> {
         self.conns().get(key).filter(|h| !h.is_closed()).cloned()
     }
 

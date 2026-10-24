@@ -13,7 +13,8 @@
 //!
 //! 实现注记（M1）：① Hello 里要声明本端角色，而密钥文件里没有角色：[`RpcClient::new`] 按 init 的约定推断
 //! （key 0 = server、key 1 = admin、其余 = client），别的 key 用 [`RpcClient::new_with_role`] 明确给出；
-//! ② `call_cb` 在还没有连接时会在调用线程上建连（M9 的 repl 线程用它之前改成后台建连）——实现注记（M3，ADR-0031 第 11 条）：
+//! ② `call_cb` 在还没有连接时不在调用线程上建连（实现注记（M9）：repl/io 线程从不等网络，1.2 规则 3）：调用先登记在途表、到期照样
+//! 由 rpc-timer 结束，建连与发送交给一个短命的 `rpc-dial` 线程——实现注记（M3，ADR-0031 第 11 条）：
 //! 建连按 `(scheme, 地址)` 单飞，多个线程同时对同一对端发第一次调用时只有一个线程建连，其余等它的结果（成功就共享这条连接，
 //! 失败就都拿到同一个错误，再各自按 3.3.8 重试）；③ 一次调用的任何本地失败
 //! （选路失败、建连或握手失败、入队失败、请求帧超过传输上限）都先记进在途表，由 rpc-timer 在 100 ms 内结束——
@@ -193,7 +194,7 @@ impl RpcClient {
         let cb = move |r| {
             let _ = tx.try_send(r);
         };
-        self.submit(to, fam, f, timeout, Waiter::Once(Box::new(cb)));
+        self.submit(to, fam, f, timeout, Waiter::Once(Box::new(cb)), false);
         Ok(PendingCall { rx })
     }
 
@@ -206,13 +207,13 @@ impl RpcClient {
         timeout: Duration,
         cb: Box<dyn FnOnce(Result<InFrame, ErrCode>) + Send>,
     ) {
-        self.submit(to, fam, f, timeout, Waiter::Once(cb));
+        self.submit(to, fam, f, timeout, Waiter::Once(cb), true); // 没有连接时在后台建连（见文件头 ②）
     }
 
     /// 流式（SnapshotFetch，永远走 control_scheme）：timeout 是相邻两帧之间的上限；收到的帧最多攒 [`STREAM_WINDOW`] 帧（背压）
     pub fn stream(&self, to: &Endpoint, f: OutFrame, timeout: Duration) -> Result<StreamRx, ErrCode> {
         let (tx, rx) = bounded(STREAM_WINDOW);
-        self.submit(to, Family::Control, f, timeout, Waiter::Stream(tx));
+        self.submit(to, Family::Control, f, timeout, Waiter::Stream(tx), false);
         Ok(StreamRx { rx, done: false })
     }
 
@@ -224,22 +225,54 @@ impl RpcClient {
         self.connection(&s, &a, deadline)?.send(f)
     }
 
-    /// 选连接、登记在途、交给写线程。本地的任何失败也记进在途表、由 rpc-timer（100 ms 内）以该错误码结束：
-    /// 于是回调恰好一次，而且只在连接读线程或 rpc-timer 线程上执行（3.12），不在调用方线程上。
-    fn submit(&self, to: &Endpoint, fam: Family, mut f: OutFrame, timeout: Duration, w: Waiter) {
+    /// 登记在途、选连接、交给写线程。本地的任何失败也记进在途表、由 rpc-timer（100 ms 内）以该错误码结束：
+    /// 于是回调恰好一次，而且只在连接读线程或 rpc-timer 线程上执行（3.12），不在调用方线程上。`background` = 还没有连接时
+    /// 在 `rpc-dial` 线程上建连（`call_cb`，见文件头 ②）。
+    fn submit(&self, to: &Endpoint, fam: Family, mut f: OutFrame, timeout: Duration, w: Waiter, background: bool) {
         let timeout_ms = timeout.as_millis() as u64;
         let deadline = clock::mono_ms() + timeout_ms + 1; // +1：见文件头的实现注记 ④
         let id = self.next_req.fetch_add(1, Ordering::Relaxed);
-        let mut p = Pending { conn: 0, deadline, timeout_ms, fail: ErrCode::ETIMEDOUT, w };
-        let h = self.route(to, fam).and_then(|(s, a)| self.connection(&s, &a, deadline));
-        if let Ok(h) = &h {
-            p.conn = h.id();
-        }
-        self.track().insert(id, p);
+        let route = self.route(to, fam);
+        let live = route.as_ref().ok().and_then(|(s, a)| self.live_conn(&(s.clone(), a.clone())));
+        let conn = live.as_ref().map_or(0, |h| h.id());
+        self.track().insert(id, Pending { conn, deadline, timeout_ms, fail: ErrCode::ETIMEDOUT, w });
         self.update_gauge();
         f.hdr.req_id = id;
-        if let Err(e) = h.and_then(|h| h.send(f)) {
-            self.fail_soon(id, e);
+        match (route, live) {
+            (Err(e), _) => self.fail_soon(id, e),
+            (Ok(_), Some(h)) => {
+                if let Err(e) = h.send(f) {
+                    self.fail_soon(id, e);
+                }
+            }
+            (Ok((s, a)), None) if background => {
+                let me = self.me.clone();
+                let dial = move || {
+                    if let Some(rpc) = me.upgrade() {
+                        rpc.dial_and_send(id, &s, &a, f, deadline);
+                    }
+                };
+                if std::thread::Builder::new().name("rpc-dial".into()).spawn(dial).is_err() {
+                    self.fail_soon(id, ErrCode::ECONNRESET);
+                }
+            }
+            (Ok((s, a)), None) => self.dial_and_send(id, &s, &a, f, deadline),
+        }
+    }
+
+    /// 建连（同一对端单飞）再发出在途调用 `id`；它这期间已经到期结束了就不发。
+    fn dial_and_send(&self, id: u64, scheme: &str, addr: &str, f: OutFrame, deadline: u64) {
+        match self.connection(scheme, addr, deadline) {
+            Ok(h) => {
+                match self.track().get_mut(&id) {
+                    Some(p) => p.conn = h.id(),
+                    None => return, // 已经超时结束了
+                }
+                if let Err(e) = h.send(f) {
+                    self.fail_soon(id, e);
+                }
+            }
+            Err(e) => self.fail_soon(id, e),
         }
     }
 
@@ -262,7 +295,14 @@ impl RpcClient {
             && let Some(a) = find(&self.net.control_scheme)
         {
             let counter = || {
-                let l = [("from", want.as_str()), ("to", self.net.control_scheme.as_str())];
+                let (to_s, n) = (self.net.control_scheme.as_str(), to.node);
+                log::warn(
+                    "rpc",
+                    format_args!(
+                        "节点 {n} 没有公布 {want} 地址：服务端之间的数据复制退回 {to_s}（只在第一次时写这一行）"
+                    ),
+                );
+                let l = [("from", want.as_str()), ("to", to_s)];
                 metrics::counter("wmfs_transport_fallback_total", "服务端之间数据族退回 control_scheme 的次数", &l)
             };
             self.fallback.get_or_init(counter).inc();

@@ -95,3 +95,40 @@ fn writes_stop_at_the_capacity_limit_but_truncates_still_work() {
     assert_eq!(read_at(&node, 0, 0, 200).unwrap().0[..100], [1u8; 100][..]);
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// ADR-0038 第 5 条（M9）：调小租约时同一个批次在 GLOBAL `settings_prev` 里记下修改前的值（已经有就每项取较大的），调大不记；
+/// 链管理器在（最近一次调小之后的）一个旧租约周期之后删掉它（授予方在这之前按 max(当前值, settings_prev) 判定过期）。
+#[test]
+fn shrinking_a_lease_records_the_previous_settings_until_one_old_lease_passes() {
+    use wmfs_core::base::types::ReqCtx;
+    use wmfs_core::meta::cluster::settings;
+    use wmfs_core::meta::engine::txn::{TxnOp, txn_blocking};
+    use wmfs_core::meta::schema::keys::{self, G_SETTINGS_PREV};
+    use wmfs_core::meta::schema::records::{ClusterSettingsV1, decode_v1};
+    use wmfs_core::proto::meta::MetaReply;
+    use wmfs_testkit::harness::meta::get_raw;
+    use wmfs_testkit::harness::node::{init, start, wait_for};
+    let d = std::env::temp_dir().join(format!("wmfs-lease-prev-{}", std::process::id()));
+    init(&d);
+    let run = start(&d);
+    let set = |name: &'static str, ms: u64| {
+        let op: TxnOp = Box::new(move |v, c| settings::apply(v, c, &[(name.into(), ms)]).map(|_| MetaReply::Ok));
+        txn_blocking(&*run.meta, ReqCtx::internal(), op).unwrap();
+    };
+    let prev = || {
+        get_raw(&run.meta, &keys::global(G_SETTINGS_PREV)).unwrap().map(|b| decode_v1::<ClusterSettingsV1>(&b).unwrap())
+    };
+    set("session_lease", 45_000); // 调大：不记
+    assert!(prev().is_none());
+    set("target_lease", 4000); // 调小：记下修改前的值
+    let p = prev().expect("调小时记下修改前的值");
+    assert_eq!((p.target_lease_ms, p.session_lease_ms), (8000, 45_000));
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    set("target_lease", 3000); // 再调小：每项取较大的；从这次修改起重新计一个旧租约周期
+    assert_eq!(prev().unwrap().target_lease_ms, 8000);
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(prev().is_some(), "第一次调小之后已过 9 s，但第二次之后还不到一个旧租约周期（8 s）：不删");
+    assert!(wait_for(20, || prev().is_none()), "一个旧租约周期之后由链管理器删掉");
+    run.stop();
+    std::fs::remove_dir_all(&d).unwrap();
+}

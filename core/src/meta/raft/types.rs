@@ -40,20 +40,32 @@ pub enum ProposeOutcome {
 /// 实现注记（M8）：失去 leader 身份时也加一（在发布了新角色之后：长轮询醒来看到自己不再是 leader，立即回 409/503，不挂到超时）；
 /// `mismatch` = 本节点已应用的 GLOBAL plugins 与本地插件清单不一致（还没有清单、applied 0 的新节点不算）——cluster-mgr 在任何角色上
 /// 据此退出（退出码 3），`--adopt-local-plugins` 的节点则在当选就绪之后把清单改成本地的（3.7.2）。
+/// 实现注记（M9，ADR-0039 第 6 条）：`adopting` = 还在用逃生口：本地清单第一次与已应用的集群清单一致、或已应用的集群清单变了（逃生口
+/// 已被别的节点用过）之后清掉，之后照常比对（raft 线程、cluster-mgr 与节点心跳拿到集群图时的比对共用它）。
 pub struct Published {
     pub(super) role: Mutex<RoleInfo>,
     pub(super) status: Mutex<EngineStatus>,
     changelog: Mutex<u64>,
     changelog_cv: Condvar,
     pub(super) mismatch: AtomicBool,
+    pub(super) adopting: AtomicBool,
 }
 
 impl Published {
-    pub(super) fn new() -> Published {
+    pub(super) fn new(adopt: bool) -> Published {
         let role = RoleInfo { role: StateRole::Follower, term: 0, leader_id: 0, ready: false };
         let (changelog, changelog_cv) = (Mutex::new(0), Condvar::new());
         let (status, mismatch) = (Mutex::new(EngineStatus::default()), AtomicBool::new(false));
-        Published { role: Mutex::new(role), status, changelog, changelog_cv, mismatch }
+        let adopting = AtomicBool::new(adopt);
+        Published { role: Mutex::new(role), status, changelog, changelog_cv, mismatch, adopting }
+    }
+    /// 还在用 `--adopt-local-plugins` 的逃生口吗（见类型的说明）。
+    pub fn adopting(&self) -> bool {
+        self.adopting.load(Ordering::Relaxed)
+    }
+    /// 逃生口用过了：之后照常比对插件清单。
+    pub fn adopt_done(&self) {
+        self.adopting.store(false, Ordering::Relaxed);
     }
     /// 已应用的集群插件清单与本地的不一致（见类型的说明）。
     pub fn plugins_mismatch(&self) -> bool {

@@ -8,6 +8,7 @@ use common::Golden;
 use wmfs_core::base::types::Role;
 use wmfs_core::data::format::*;
 use wmfs_core::data::superblock::{TARGET_FORMAT_VERSION, TARGET_INCOMPAT_KNOWN, TARGET_MAGIC, TARGET_SB_LEN};
+use wmfs_core::meta::cluster::chains::{SERVING, SYNCING, TARGET_OFFLINE, TARGET_UP};
 use wmfs_core::meta::ns::acl;
 use wmfs_core::meta::ns::xattr::{ACL_ACCESS, ACL_DEFAULT};
 use wmfs_core::meta::schema::keys::*;
@@ -37,6 +38,10 @@ fn golden_constants() {
         ("Role.Client", Role::Client.as_u8()),
         ("Role.Server", Role::Server.as_u8()),
         ("REC_V1", REC_V1),
+        ("chain_member.SERVING", SERVING), // M9 追加：3.2.8 写了数值的成员状态与 target 状态（0.2 第 11 条）
+        ("chain_member.SYNCING", SYNCING),
+        ("target_state.UP", TARGET_UP),
+        ("target_state.OFFLINE", TARGET_OFFLINE),
         ("KIND_FILE", KIND_FILE),
         ("KIND_DIR", KIND_DIR),
         ("KIND_SYMLINK", KIND_SYMLINK),
@@ -179,6 +184,7 @@ fn golden_constants() {
         ("G_FEATURES", G_FEATURES.as_bytes()),
         ("G_SETTINGS", G_SETTINGS.as_bytes()),
         ("G_PLUGINS", G_PLUGINS.as_bytes()),
+        ("G_SETTINGS_PREV", G_SETTINGS_PREV.as_bytes()), // M9 追加（ADR-0038 第 5 条）
         ("raft_state.KEY_HARD_STATE", KEY_HARD_STATE.as_bytes()),
         ("raft_state.KEY_CONF_STATE", KEY_CONF_STATE.as_bytes()),
         ("raft_state.KEY_SNAP_META", KEY_SNAP_META.as_bytes()),

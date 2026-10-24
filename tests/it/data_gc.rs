@@ -76,3 +76,31 @@ fn orphans_wait_until_nobody_has_them_open() {
     run.stop();
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// M9（M5 留下的）：一条记录的 DeleteEpoch 失败（这里：它的链在集群图里根本没有——"某条链的成员暂时不可用"的极端情形）只跳过这一条、
+/// 下一轮再试，同一页里排在它后面的记录照样删（M5 的写法在这一条上返回错误，整页卡住）；不可用的链不发请求，不等满总期限。
+#[test]
+fn a_failing_delete_epoch_skips_only_its_own_record() {
+    use wmfs_core::meta::schema::records::{GcRecV1, encode_v1};
+    use wmfs_testkit::harness::meta::put_raw;
+    let d = tmp("skip");
+    init(&d);
+    let run = start(&d);
+    set_settings(&run.meta, |s| s.epoch_gc_grace_ms = 0);
+    let c = client(&d, &run, "admin");
+    let me = who(1000, 1000);
+    // 排在最前面的一条（ino 2 是保留号，key 最小）：链 99 不存在，它的 DeleteEpoch 一直失败
+    let bad = GcRecV1 { due_ms: 0, chains: vec![99], created_ms: 0 };
+    put_raw(&run.meta, keys::gc(GC_EPOCH, 2, 1), encode_v1(&bad)).unwrap();
+    let o = put(&c, &me, ROOT_INO, "f", &data(1 << 20)).unwrap();
+    let (ino, l) = (o.attr.ino, o.layout.as_ref().unwrap());
+    let (chain, e) = (l.chains[0], l.epoch);
+    put(&c, &me, ROOT_INO, "f", b"short").unwrap(); // 截断到 0：epoch e 作废
+    let t0 = std::time::Instant::now();
+    assert!(wait_for(60, || !epoch_dir_exists(&d, chain, ino, e)), "后面那条照样被删掉了");
+    assert!(t0.elapsed() < Duration::from_secs(20), "不可用的链上的记录不等满 30 s 的总期限：{:?}", t0.elapsed());
+    assert!(wait_for(5, || get_raw(&run.meta, &keys::gc(GC_EPOCH, ino, e)).unwrap().is_none()));
+    assert!(get_raw(&run.meta, &keys::gc(GC_EPOCH, 2, 1)).unwrap().is_some(), "失败的那条留着，下一轮再试");
+    run.stop();
+    std::fs::remove_dir_all(&d).unwrap();
+}

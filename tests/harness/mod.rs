@@ -10,9 +10,13 @@
 //! - [`node`]：完整的单节点（init + server::start）与连到它的客户端、参考客户端的 put/get（M5）
 //! - [`cluster`]：同一个进程里的多节点集群（init + join + server::start），客户端跟随 leader（M8）
 //! - [`sim_net`]：确定性 raft 模拟的多节点部分：几个 Driver 与它们之间的内存总线（丢、延迟、重排、分区、崩溃、快照下载，M8）
+//! - [`craq`]：CRAQ 组件测试——一个进程里几个数据服务经 mem 传输互连，集群图由测试下发（M9，9.3）
+//! - [`linear`]：寄存器历史的线性一致性检查（Wing-Gong 回溯，M9 的 Jepsen-lite）
 
 pub mod cluster;
+pub mod craq;
 pub mod data;
+pub mod linear;
 pub mod mem_crash;
 pub mod mem_target;
 pub mod meta;

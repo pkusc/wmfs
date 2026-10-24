@@ -74,9 +74,9 @@ pub struct Driver {
     compact_checked: u64, // 上一次检查日志压缩时的 applied（规则 M3）
     plugins: PluginListV1,
     plugins_ok: bool,
-    adopt: bool,       // --adopt-local-plugins（见 DriverOpts）
-    snap_dir: PathBuf, // 下载的快照文件（3.4.1.7）
-    pins: Arc<Pins>,   // 导出的快照 pin（与 snap-serve 共用）
+    seen_plugins: Option<PluginListV1>, // 上一次比对时已应用的集群清单（变了 = 逃生口已被用过，ADR-0039 第 6 条）
+    snap_dir: PathBuf,                  // 下载的快照文件（3.4.1.7）
+    pins: Arc<Pins>,                    // 导出的快照 pin（与 snap-serve 共用）
     was_leader: bool,
     lost_leader: bool,         // 这一轮失去了 leader 身份：发布了新角色之后再唤醒 changelog 长轮询
     heard: BTreeMap<u64, u64>, // 每个对端最近一次来消息时的 tick（leader 据此发布 active）
@@ -118,7 +118,7 @@ impl Driver {
             compact_checked: a.index,
             plugins: o.plugins,
             plugins_ok: false,
-            adopt: o.adopt_local_plugins,
+            seen_plugins: committed_plugins.clone(),
             snap_dir: o.snap_dir,
             pins,
             was_leader: false,
@@ -126,7 +126,7 @@ impl Driver {
             heard: BTreeMap::new(),
             stopped: false,
             outbox: Vec::new(),
-            published: Arc::new(Published::new()),
+            published: Arc::new(Published::new(o.adopt_local_plugins)),
             metrics: Metrics::new(),
         };
         d.check_plugins(committed_plugins.as_ref());
@@ -315,7 +315,7 @@ impl Driver {
 
     /// leader 就绪（3.4.1.4 规则 3）：`state == Leader && apply_to_current_term() && 插件清单一致`（`--adopt-local-plugins` 时不看清单）。
     pub fn is_ready(&self) -> bool {
-        self.elected() && (self.plugins_ok || self.adopt)
+        self.elected() && (self.plugins_ok || self.published.adopting())
     }
 
     /// 已当选且本任期的空条目已应用（前任提交的一切都已在状态机里）。

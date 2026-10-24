@@ -19,6 +19,8 @@
 //! M8：`up --nodes N`：node1 照常 init，第 2…N 个节点用 `wmfs join` 的本地侧加入（`dev/cluster.rs`），都起好之后等元数据成员到齐
 //! （N ≥ 3 时 3 个 voter，2 个节点是 1 voter + 1 learner；元数据成员都追上）才返回，最后打印一次集群警告；已有更多节点的开发集群照样
 //! 全部启动。`dev start n` 最后等这个节点追上（有 leader 时）。`dev leader` 打印就绪 leader 的节点号。
+//! M9：`dev stop n`（SIGTERM）、`dev pause|resume n`（SIGSTOP/SIGCONT，模拟卡死）、`dev restart-all`（`dev/cluster.rs`，3.7.2 第 4 条：
+//! 按各节点当前的 node.toml 依次重启全部节点）、`dev wait chains-serving`（`dev/wait.rs`）、`up --profile nas-safe`。
 
 use std::ffi::OsStr;
 use std::net::Ipv4Addr;
@@ -55,8 +57,8 @@ pub enum DevCmd {
         /// 每次 up 都按这次的参数改写 node.toml：不带 --rdma 就改回只用 tcp；节点已在运行时要先 wmfs dev down 再 up 才生效
         #[arg(long, value_name = "IP")]
         rdma: Option<Ipv4Addr>,
-        /// 按某个 profile 的部署模板建新节点（design.md 9.7、3.4.3）：default 或 minimal（1 节点、TCP、default 类 1 副本、停用 quota 与
-        /// mclock）；nas-safe、hpc-rdma 在 M9 起。已有的开发集群是按别的 profile 建的 → 报错（先 wmfs dev down --purge）
+        /// 按某个 profile 的部署模板建新节点（design.md 9.7、3.4.3）：default、minimal（1 节点、TCP、default 类 1 副本、停用 quota 与
+        /// mclock）或 nas-safe（阶段版：/home replicas=3）。已有的开发集群是按别的 profile 建的 → 报错（先 wmfs dev down --purge）
         #[arg(long, default_value = "default")]
         profile: String,
     },
@@ -76,6 +78,14 @@ pub enum DevCmd {
     Kill { n: u32 },
     /// 启动第 n 个节点（已初始化过的）并等它就绪
     Start { n: u32 },
+    /// 停掉第 n 个节点（SIGTERM：leader 先让位；10 s 后仍在就 SIGKILL）
+    Stop { n: u32 },
+    /// 冻住第 n 个节点（SIGSTOP，模拟卡死；wmfs dev resume 让它继续）
+    Pause { n: u32 },
+    /// 让冻住的第 n 个节点继续运行（SIGCONT）
+    Resume { n: u32 },
+    /// 按各节点当前的 node.toml 依次重启全部节点（先 follower、最后 leader，每个都等它追上）：改了插件配置之后用
+    RestartAll,
     /// 打印第 n 个节点的日志
     Logs { n: u32 },
     /// 打印就绪的元数据 leader 是第几个节点（例如 L=$(wmfs dev leader); wmfs dev kill $L）
@@ -94,9 +104,10 @@ pub enum DevCmd {
     Umount { mountpoint: PathBuf },
     /// 打印某个开发挂载点的挂载进程号
     ClientPid { mountpoint: PathBuf },
-    /// 等某个条件成立（满足立即返回 0；超时返回 1 并打印当前状态）。M3 只有 leader（有就绪的元数据 leader）
+    /// 等某个条件成立（满足立即返回 0；超时返回 1 并打印当前状态）：leader（有就绪的元数据 leader）、chains-serving（每条链都达到
+    /// 期望长度且全部 Serving；等的过程中状态变了就打印一行）
     Wait {
-        /// 条件（及其参数），例如 leader
+        /// 条件（及其参数），例如 leader、chains-serving
         #[arg(required = true, num_args = 1..)]
         what: Vec<String>,
         /// 最多等多少秒
@@ -125,6 +136,10 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
         DevCmd::Status { json } => info::status(&d, json),
         DevCmd::Kill { n } => kill(&d, n),
         DevCmd::Start { n } => start(&d, n).map(|line| vec![line]),
+        DevCmd::Stop { n } => stop_cmd(&d, n),
+        DevCmd::Pause { n } => signal(&d, n, sys::SIGSTOP, "已冻住（SIGSTOP）"),
+        DevCmd::Resume { n } => signal(&d, n, sys::SIGCONT, "继续运行（SIGCONT）"),
+        DevCmd::RestartAll => cluster::restart_all(&d),
         DevCmd::Logs { n } => std::fs::read_to_string(log_path(&d, n))
             .map(|t| vec![t])
             .map_err(|e| format!("读 {} 失败：{e}", log_path(&d, n).display())),
@@ -308,11 +323,40 @@ fn kill(d: &Path, n: u32) -> Result<Vec<String>, String> {
     if running_pid(d, n).is_none() {
         return Ok(vec![format!("node{n} 没有在运行")]);
     }
+    sigkill(d, n)?;
+    Ok(vec![format!("node{n} 已被 kill -9")])
+}
+
+/// 发 SIGKILL、等它退出（最多 3 s），删掉它来不及删的 pid 文件。
+fn sigkill(d: &Path, n: u32) -> Result<(), String> {
     if !signal_and_wait(d, n, sys::SIGKILL, 3000) {
         return Err(format!("node{n} 收到 SIGKILL 后 3 s 仍在"));
     }
     let _ = std::fs::remove_file(node_dir(d, n).join("run/server.pid"));
-    Ok(vec![format!("node{n} 已被 kill -9")])
+    Ok(())
+}
+
+/// `wmfs dev stop n`：没有这个节点 → 报错。
+fn stop_cmd(d: &Path, n: u32) -> Result<Vec<String>, String> {
+    if !node_dir(d, n).join("NODE").exists() {
+        return Err(format!("没有 node{n}（{} 还没有初始化）", node_dir(d, n).display()));
+    }
+    let was = if running_pid(d, n).is_some() { "已停止" } else { "没有在运行" };
+    stop(d, n).map(|()| vec![format!("node{n} {was}")])
+}
+
+/// 给本开发集群的第 n 个节点发一个信号（只认 pid 文件里、命令行确实是这个节点的 `wmfs server`）。
+fn signal(d: &Path, n: u32, sig: i32, what: &str) -> Result<Vec<String>, String> {
+    let pid = running_pid(d, n).ok_or(format!("node{n} 没有在运行"))?;
+    sys::send_signal(pid, sig).map_err(|e| format!("给 node{n} 发信号失败：{e}"))?;
+    Ok(vec![format!("node{n} {what}")])
+}
+
+/// 停掉第 n 个节点：SIGCONT（被冻住的也能处理 SIGTERM）→ SIGTERM，等它退出（leader 先让位）；10 s 后仍在就 SIGKILL。
+fn stop(d: &Path, n: u32) -> Result<(), String> {
+    let Some(pid) = running_pid(d, n) else { return Ok(()) };
+    let _ = sys::send_signal(pid, sys::SIGCONT); // 被冻住（SIGSTOP）的进程收到 SIGTERM 也不会退出：先让它继续运行
+    if signal_and_wait(d, n, sys::SIGTERM, 10_000) { Ok(()) } else { sigkill(d, n) }
 }
 
 fn down(d: &Path, purge: bool) -> Result<Vec<String>, String> {
@@ -321,14 +365,10 @@ fn down(d: &Path, purge: bool) -> Result<Vec<String>, String> {
     }
     let mut lines = mount::stop_all(d); // 先挂载、后节点：节点停了以后挂载点上的命令会卡到 --op-timeout（7.2 的清理顺序）
     for n in nodes(d) {
-        let Some(pid) = running_pid(d, n) else { continue };
-        let _ = sys::send_signal(pid, sys::SIGCONT); // 被冻住（SIGSTOP）的进程收到 SIGTERM 也不会退出：先让它继续运行
-        if !signal_and_wait(d, n, sys::SIGTERM, 5000) {
-            if !signal_and_wait(d, n, sys::SIGKILL, 3000) {
-                return Err(format!("停不掉 node{n}"));
-            }
-            let _ = std::fs::remove_file(node_dir(d, n).join("run/server.pid")); // 被 SIGKILL 的进程来不及删自己的 pid 文件
+        if running_pid(d, n).is_none() {
+            continue;
         }
+        stop(d, n)?;
         lines.push(format!("node{n} 已停止"));
     }
     if purge {

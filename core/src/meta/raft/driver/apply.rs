@@ -258,9 +258,16 @@ impl Driver {
     /// 发布 `mismatch`，写一条错误日志列出差异。实现注记（M8）：cluster-mgr 看到 `mismatch` 就在任何角色上退出进程（退出码 3，
     /// `cluster/plugins.rs`）——follower 不必等拿到新集群图（改清单的 leader 1 s 后就退出了，可能没人再给它图）；还没有清单的新节点
     /// （applied 0）不算不一致。
+    /// 实现注记（M9，ADR-0039 第 6 条）：一致了、或已应用的集群清单变了（逃生口被用过了），就不再豁免（`Published::adopt_done`）。
+    /// 实现注记（M9）：applied 0 的节点一律不算——只做数据的节点不在 raft 里，它的 kv 只有 join 时预写的、之后不再更新的旧清单（按它
+    /// 比对的话，改清单之后按新配置重启的节点会因旧清单退出）；它由心跳线程按每一张集群图比对（`server.rs` 的 `on_map`）。
     pub(super) fn check_plugins(&mut self, committed: Option<&PluginListV1>) {
         self.plugins_ok = committed == Some(&self.plugins);
-        let mismatch = !self.plugins_ok && !(committed.is_none() && self.applied.index == 0);
+        if self.plugins_ok || self.seen_plugins.as_ref() != committed {
+            self.published.adopt_done();
+        }
+        self.seen_plugins = committed.cloned();
+        let mismatch = !self.plugins_ok && self.applied.index > 0;
         self.published.mismatch.store(mismatch, Ordering::Relaxed);
         if !mismatch {
             return;

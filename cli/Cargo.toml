@@ -50,3 +50,9 @@ workspace = true
 [[test]]
 name = "profile_minimal"
 path = "../tests/profiles/minimal.rs"
+
+# nas-safe profile 的阶段版（design.md 9.7，M9 起）：同上，由 scripts/profiles.sh nas-safe 跑。
+[[test]]
+name = "profile_nas_safe"
+path = "../tests/profiles/nas_safe.rs"
+

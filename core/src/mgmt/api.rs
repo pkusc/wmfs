@@ -60,7 +60,8 @@ pub(super) fn serve(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&st
         return super::changelog::serve(ctx, eng, &req, method, path, query, body);
     }
     if super::cluster::handles(path) {
-        return super::cluster::serve(eng, &req, method, path, body); // M8：集群概览、节点、集群插件清单
+        let usage = ctx.usage.as_deref();
+        return super::cluster::serve(eng, usage, &req, (method, path, query), body); // M8：集群、节点、插件清单；M9：链
     }
     let r = match (method, path) {
         ("GET", "/api/v1/attr") => {

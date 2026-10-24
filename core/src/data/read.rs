@@ -53,6 +53,11 @@ pub fn open(node: &DataNode, store: &dyn TargetStore, id: &ChunkId) -> Result<Op
     Ok(Some(Committed { header, table: decode_table(&table)?, reader }))
 }
 
+/// `id` 的已提交版本号（不存在、头坏了 → None）。
+pub fn committed_version(node: &DataNode, t: &Target, id: &ChunkId) -> Option<u64> {
+    open(node, &*t.store, id).ok().flatten().map(|c| c.header.chunk_version)
+}
+
 impl Committed {
     /// 第 i 块的明文（`len()` = plain_len）；洞 → None。存储字节读不全、解码或校验不符 → `CHECKSUM_MISMATCH`。
     pub fn block(&mut self, node: &DataNode, id: &ChunkId, i: u32) -> Result<Option<Buf>, ErrCode> {

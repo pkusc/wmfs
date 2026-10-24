@@ -85,10 +85,14 @@ pub struct UsageReply {
 }
 
 /// 一个属性的"实际"（3.10）。M7：`new_files` = 这个目录下的新文件此刻实际得到的值（例如 replicas 是
-/// min(声明, 可用故障域数)）；逐文件扫描已有文件的统计在 M11 加入（只增）。
+/// min(声明, 可用故障域数)）；逐文件扫描已有文件的统计在 M11 加入（只增）。实现注记（M9）：`replicas` 多一个 `short_files`——子树里
+/// 已有文件中实际副本数（= min(layout.replicas, 它的每条链此刻的 Serving 成员数)）少于声明的个数（3.10 表里 replicas 一行的最小部分；
+/// 别的键没有这一项，不输出）。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct AttrActual {
     pub new_files: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_files: Option<u64>,
 }
 
 /// `GET /api/v1/status` 里一个属性的声明 vs 实际。

@@ -37,9 +37,9 @@ use crate::base::types::{Principal, ReqCtx, Role};
 use crate::base::{ErrCode, clock, lock, log};
 use crate::client::data_client::DataClient;
 use crate::hooks::traits::ConnIdentity;
-use crate::meta::cluster::join;
 use crate::meta::cluster::map::filtered;
 use crate::meta::cluster::targets::{self, TargetUsage};
+use crate::meta::cluster::{chain_mgr, join};
 use crate::meta::engine::txn::{MetaEngine, TxnOp, TxnRequest};
 use crate::meta::ns;
 use crate::meta::schema::keys;
@@ -48,7 +48,7 @@ use crate::meta::uninline::{self, InFlight};
 use crate::net::server::{Responder, Service};
 use crate::proto::frame::{InFrame, MSG_NODE_CALL};
 use crate::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
-use crate::proto::peer::{JoinReq, NodeHeartbeat, NodeOp, NodeReply};
+use crate::proto::peer::{NodeOp, NodeReply};
 use crate::proto::{decode_body, encode_body};
 
 /// meta-read 线程数与它们的输入队列长度（1.2）。
@@ -68,17 +68,16 @@ struct ReadJob {
 enum ReadOp {
     Meta(MetaOp),
     Map { since: u64, full: bool }, // NodeOp::GetClusterMap；full = 带 keys、datakeys（只给 server 角色）
-    Heartbeat(NodeHeartbeat),       // NodeOp::Heartbeat（M5）
+    Node(NodeOp),                   // NodeOp::Heartbeat（M5）、Join（M8）、SyncDone（M9）
     StatFs,                         // MetaOp::StatFs（M5）
     Uninline(u64),                  // MetaOp::Uninline（M5，ADR-0034）
-    Join(JoinReq),                  // NodeOp::Join（M8）
 }
 
 /// meta-read 线程与服务共用的状态。
 struct Shared {
     eng: Arc<dyn MetaEngine>,
     live: Arc<Live>,
-    usage: TargetUsage,
+    usage: Arc<TargetUsage>,
     data: OnceLock<Arc<DataClient>>, // Uninline 用的数据面客户端（服务端装配时交进来）
     uninlining: InFlight,            // 正在做的 Uninline（见文件头）
 }
@@ -106,13 +105,8 @@ impl MetaService {
         let stats = Arc::new(OpStats::default());
         let live = Arc::new(Live::default());
         let uninlining = InFlight::new(READ_THREADS / 2);
-        let shared = Arc::new(Shared {
-            eng: eng.clone(),
-            live,
-            usage: TargetUsage::default(),
-            data: OnceLock::new(),
-            uninlining,
-        });
+        let shared =
+            Arc::new(Shared { eng: eng.clone(), live, usage: Arc::default(), data: OnceLock::new(), uninlining });
         for i in 0..READ_THREADS {
             let (rx, stats, shared) = (rx.clone(), stats.clone(), shared.clone());
             std::thread::Builder::new()
@@ -120,7 +114,7 @@ impl MetaService {
                 .spawn(move || {
                     while let Ok(j) = rx.recv() {
                         let name = j.op.name();
-                        if let ReadOp::Join(req) = j.op {
+                        if let ReadOp::Node(NodeOp::Join(req)) = j.op {
                             match join::join(&*shared.eng, &j.ctx, req) {
                                 Ok(rep) => stats.reply_raw(j.r, name, Ok(encode_body(&rep))),
                                 Err(f) => {
@@ -141,6 +135,11 @@ impl MetaService {
     /// leader 内存里的会话状态（后台调度器的孤儿 GC 长期持有它；测试也看它）。
     pub fn live(&self) -> Arc<Live> {
         self.shared.live.clone()
+    }
+
+    /// leader 内存里的 target 心跳情况（cluster-mgr 的链管理器用，M9）。
+    pub fn targets(&self) -> Arc<TargetUsage> {
+        self.shared.usage.clone()
     }
 
     /// 交进 `Uninline` 用的数据面客户端（服务端装配时，只第一次有效；与后台任务共用一个）。
@@ -196,15 +195,11 @@ impl MetaService {
                 let ctx = base_ctx(&ReqHead::default(), id, f.hdr.trace_id, NOBODY, NOBODY, vec![]);
                 self.read(ctx, ReadOp::Map { since: since_epoch, full }, r);
             }
-            NodeOp::Heartbeat(hb) => {
+            op @ (NodeOp::Heartbeat(_) | NodeOp::Join(_) | NodeOp::SyncDone { .. }) => {
                 let ctx = base_ctx(&ReqHead::default(), r.identity(), f.hdr.trace_id, 0, 0, vec![]);
-                self.read(ctx, ReadOp::Heartbeat(hb), r); // 角色表已保证只有 Server 能发（3.3.3）
+                self.read(ctx, ReadOp::Node(op), r); // 角色表已保证只有 Server 能发（3.3.3）
             }
-            NodeOp::Join(req) => {
-                let ctx = base_ctx(&ReqHead::default(), r.identity(), f.hdr.trace_id, 0, 0, vec![]);
-                self.read(ctx, ReadOp::Join(req), r); // 角色表已保证只有 Server 能发（3.3.3）
-            }
-            other => self.stats.reply(r, other.name(), Err(ErrCode::FEATURE_UNSUPPORTED)), // SyncDone M9……
+            other => self.stats.reply(r, other.name(), Err(ErrCode::FEATURE_UNSUPPORTED)), // CheckEpochs、ReportCorrupt：M11
         }
     }
 }
@@ -214,10 +209,9 @@ impl ReadOp {
         match self {
             ReadOp::Meta(op) => op.name(),
             ReadOp::Map { .. } => "GetClusterMap",
-            ReadOp::Heartbeat(_) => "Heartbeat",
+            ReadOp::Node(op) => op.name(),
             ReadOp::StatFs => "StatFs",
             ReadOp::Uninline(_) => "Uninline",
-            ReadOp::Join(_) => "Join",
         }
     }
 }
@@ -289,10 +283,13 @@ impl Service for MetaService {
 fn read_job(sh: &Shared, ctx: &ReqCtx, op: ReadOp) -> Result<Vec<u8>, ErrCode> {
     let (eng, live) = (&*sh.eng, &*sh.live);
     match op {
-        ReadOp::Heartbeat(hb) => targets::heartbeat(eng, ctx, &sh.usage, hb),
+        ReadOp::Node(NodeOp::Heartbeat(hb)) => targets::heartbeat(eng, ctx, &sh.usage, hb),
+        ReadOp::Node(NodeOp::SyncDone { target, chain, chain_ver }) => {
+            chain_mgr::sync_done(eng, ctx, target, chain, chain_ver).map(|()| encode_body(&NodeReply::Ok))
+        }
+        // 走不到这里：meta-read 线程的循环先单独处理了 Join（它要带原因回复），别的 NodeOp 不会进 ReadOp::Node
+        ReadOp::Node(_) => Err(ErrCode::INTERNAL),
         ReadOp::StatFs => targets::statfs(eng, ctx, &sh.usage).map(|r| encode_body(&r)),
-        // 走不到这里：meta-read 线程的循环先单独处理了 Join（它要带原因回复）；写出这一支只为 match 穷尽
-        ReadOp::Join(_) => Err(ErrCode::INTERNAL),
         ReadOp::Uninline(ino) => {
             let data = sh.data.get().ok_or(ErrCode::NOT_READY)?;
             // 先确认自己是就绪的 leader（M8 审查）：换 leader 之后旧 leader 的 InFlight 里可能还挂着那次卡住的 uninline，不先查的话

@@ -13,7 +13,9 @@
 //! - **status**：每个键的声明、来源、实际、是否一致；实现注记（M7）：实际 = 这个目录下的新文件此刻实际得到的值（replicas 是
 //!   min(声明, 可用故障域数)、stripe 是 min(声明, 可用链数)，其余就是声明值）；逐文件扫描已有文件在 M11 的 `bg/status.rs`。
 //!   `warnings` = 集群警告 + 这棵子树里显式写着、当前满足不了的 replicas/stripe 声明（例如单节点上 init 写的 `/home replicas=3`；
-//!   最多查 1000 个这样的目录，多了明确说一句）+ 这个目录自己的。
+//!   最多查 1000 个这样的目录，多了明确说一句）+ 这个目录自己的。实现注记（M9）：replicas 另给 `short_files`——子树里已有文件中
+//!   实际副本数少于声明的个数（`wmfs status` 的"replicas 声明 3、实际 2 的文件数"，[`short_files`]；inline 文件的数据在元数据里、
+//!   与 raft 同样多份，不算；扫到上限时在 warnings 里明说）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -32,14 +34,14 @@ use crate::meta::attrs::{
     CONSISTENCY_STRONG, EffectiveAttrs, MAX_DEPTH, bump_attr_epoch, checksum_id, queue_reconcile,
 };
 use crate::meta::changelog::{self, Change};
-use crate::meta::cluster::chains::{SERVING, candidates};
+use crate::meta::cluster::chains::{SERVING, candidates, serving_count};
 use crate::meta::engine::txn::{KvRead, KvScan, KvTxn, OpCtx};
 use crate::meta::ns::common::{self, Node};
 use crate::meta::ns::read_ops;
 use crate::meta::rstat;
 use crate::meta::schema::keys::{self, ROOT_INO, T_DIRATTR};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::{AttrMapV1, ChainRecV1, ClassIdV1, decode_v1};
+use crate::meta::schema::records::{AttrMapV1, ChainRecV1, ClassIdV1, F_INLINE, InodeV1, decode_v1};
 use crate::proto::meta::MetaReply;
 use crate::proto::peer::ClusterMap;
 
@@ -338,11 +340,46 @@ pub fn status(v: &dyn KvScan, c: &OpCtx, path: &str) -> Result<StatusReply, Fail
         };
         let source = source(v, &e, &own, dir, s.key)?;
         let effect = s.effect.name().to_string();
-        let mismatched = actual != declared;
-        let actual = AttrActual { new_files: actual };
+        let short = if s.key == "replicas" { Some(short_files(v, c, dir, &mut warnings)?) } else { None };
+        let mismatched = actual != declared || short.is_some_and(|n| n > 0);
+        let actual = AttrActual { new_files: actual, short_files: short };
         attrs.push(StatusAttr { key: s.key.into(), declared, source, effect, actual, mismatched });
     }
     Ok(StatusReply { path: path.into(), warnings, attrs })
+}
+
+/// 子树里实际副本数少于声明的已有文件数（3.10 的 replicas 一行，M9 的最小部分：实际 = min(layout.replicas, 它的每条链此刻的 Serving
+/// 成员数)；inline 文件（数据在元数据里）与 nlink 为 0 的孤儿不算）。没有降级的链就不用扫；按 inode 号分页扫，最多看 `SCAN_MAX` 个
+/// inode，看不完就在 `warnings` 里说（M11 的 `bg/status.rs` 换成受限速的子树扫描）。
+fn short_files(v: &dyn KvScan, c: &OpCtx, dir: u64, warnings: &mut Vec<String>) -> Result<u64, ErrCode> {
+    const SCAN_MAX: usize = 1_000_000;
+    const PAGE: usize = 1024;
+    let serving = |id: &u32| c.map.chains.iter().find(|(i, _)| i == id).map_or(0, |(_, r)| serving_count(r));
+    if c.map.chains.iter().all(|(id, r)| serving(id) >= r.replicas as usize) {
+        return Ok(0);
+    }
+    let (mut start, end) = keys::tag_range(keys::T_INODE);
+    let (mut n, mut seen) = (0, 0);
+    loop {
+        let page = v.scan(&start, &end, PAGE)?;
+        for (k, b) in &page {
+            let ino: InodeV1 = decode_v1(b)?;
+            let Some(l) = ino.layout.as_ref().filter(|_| ino.flags & F_INLINE == 0 && ino.nlink > 0) else { continue };
+            let short = l.chains.iter().any(|ch| serving(ch) < l.replicas as usize);
+            if short && (dir == ROOT_INO || ino.parent == dir || c.attrs.ancestors(v, ino.parent)?.contains(&dir)) {
+                n += 1;
+            }
+            start = [k.as_slice(), &[0]].concat();
+        }
+        seen += page.len();
+        if page.len() < PAGE {
+            return Ok(n);
+        }
+        if seen >= SCAN_MAX {
+            warnings.push(format!("副本数不足的文件只数了前 {SCAN_MAX} 个 inode 里的（M11 起由后台扫描数全）"));
+            return Ok(n);
+        }
+    }
 }
 
 pub fn usage(v: &dyn KvRead, c: &OpCtx, path: &str) -> Result<UsageReply, Failed> {

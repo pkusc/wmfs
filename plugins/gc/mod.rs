@@ -9,6 +9,8 @@
 //!   然后对 inode 当前 layout 的每条链 `DeleteEpoch`，最后一个批次删 inode、XATTR、INLINE、LOCKS 与记录。
 //!
 //! 每一步都幂等（DeleteEpoch 删过的再删是 0 个文件；记录与 inode 的删除是带前提的批次），所以崩溃后从旧游标重放不会出错（3.10）。
+//! 实现注记（M9）：一条记录的 DeleteEpoch 失败（多链时某条链的成员暂时不可用）只跳过这一条（计入积压），下一轮再试；链此刻没有
+//! Serving 成员时不发请求、直接跳过（不然每条这样的记录都要等满数据面的总期限 30 s）。
 //! 实现注记（M5）：这是 gc 的 M5 部分；被驱逐/已关闭会话的去重记录、EVICTED 过期、changelog 修剪、数据节点上的本地孤儿扫描
 //! （`CheckEpochs`）在 M11 的完整版。指标 `wmfs_gc_epochs_deleted_total`、`wmfs_gc_orphans_deleted_total`；fail point
 //! `plugin.gc.bg_task`（本体包在每一步外层）。
@@ -18,7 +20,7 @@ use std::time::Duration;
 
 use wmfs_core::api::metrics::{self, Counter};
 use wmfs_core::base::types::ReqCtx;
-use wmfs_core::base::{ErrCode, clock};
+use wmfs_core::base::{ErrCode, clock, log};
 use wmfs_core::bg::task::{BgTask, RunOn, StepResult, TaskCtx};
 use wmfs_core::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
 use wmfs_core::meta::gc_meta::{self, GcItem};
@@ -66,9 +68,12 @@ impl Default for Gc {
     }
 }
 
-/// 对一条记录要删的每个 (epoch, 链) 发 DeleteEpoch。
+/// 对一条记录要删的每个 (epoch, 链) 发 DeleteEpoch。链此刻没有 Serving 成员（等最后的副本）→ 不发、马上算失败（不等满总期限）。
 fn delete_data(ctx: &TaskCtx, it: &GcItem) -> Result<(), ErrCode> {
     for d in &it.deletes {
+        if !ctx.data.chain_serving(d.chain) {
+            return Err(ErrCode::NOT_SERVING);
+        }
         ctx.data.delete_epoch(&d.cap, d.chain, it.ino, d.epoch)?;
     }
     Ok(())
@@ -102,15 +107,27 @@ impl BgTask for Gc {
         let (mut items, mut backlog) = (0, 0);
         for it in &page.items {
             let due = it.rec.due_ms <= ctx.now_ms;
+            let ready = match it.kind {
+                GC_EPOCH => due,
+                GC_ORPHAN => due && settled && !ctx.live.is_open(it.ino),
+                _ => false,
+            };
+            // 实现注记（M9）：某条链的成员暂时不可用、这一条的 DeleteEpoch 失败了 → 跳过它、下一轮再试，不挡住同一页里别的记录
+            if ready && let Err(e) = delete_data(ctx, it) {
+                log::warn(
+                    "gc",
+                    format_args!("inode {} epoch {} 的数据这次没删成：{e}（下一轮再试）", it.ino, it.epoch),
+                );
+                backlog += 1;
+                continue;
+            }
             match it.kind {
-                GC_EPOCH if due => {
-                    delete_data(ctx, it)?;
+                GC_EPOCH if ready => {
                     gc_meta::drop_record(ctx.meta, it)?;
                     self.epochs.inc();
                     items += 1;
                 }
-                GC_ORPHAN if due && settled && !ctx.live.is_open(it.ino) => {
-                    delete_data(ctx, it)?;
+                GC_ORPHAN if ready => {
                     gc_meta::finish_orphan(ctx.meta, it)?;
                     self.orphans.inc();
                     items += 1;

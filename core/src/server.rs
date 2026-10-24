@@ -31,7 +31,7 @@ use crate::buf::MemPool;
 use crate::client::data_client::DataClient;
 use crate::data::node_hb::{self, HbDeps, MapHolder};
 use crate::data::service::DataService;
-use crate::data::{self, DataNode};
+use crate::data::{self, DataNode, replica};
 use crate::hooks::pipeline::Pipeline;
 use crate::hooks::registry::PluginSet;
 use crate::hooks::traits::{CODEC_REPLICA, KeyLookup};
@@ -46,7 +46,7 @@ use crate::meta::service::MetaService;
 use crate::mgmt::{MgmtCtx, MgmtServer, RoleFn};
 use crate::net::client::{Endpoint, RpcClient};
 use crate::net::server::{RpcServer, ServerId};
-use crate::proto::frame::{MSG_DATA_CALL, MSG_META_CALL, MSG_NODE_CALL, MSG_RAFT, MSG_SNAPSHOT_FETCH};
+use crate::proto::frame::{MSG_DATA_CALL, MSG_META_CALL, MSG_NODE_CALL, MSG_PEER_CALL, MSG_RAFT, MSG_SNAPSHOT_FETCH};
 use crate::proto::handshake::{SERVER_KEY, cap_key, derive_secret};
 use crate::proto::peer::ClusterMap;
 
@@ -141,7 +141,7 @@ pub fn start(
             cfg.net.control_scheme
         ));
     }
-    cluster_mgr::start(&meta)?;
+    cluster_mgr::start(&meta, svc.targets())?;
     let mgmt = MgmtServer::bind(&cfg.mgmt.listen)?;
     let mgmt_addr = mgmt.addr().to_string();
     let me = NodeAddrs { node_id: node.node_id, addrs: addrs.clone(), mgmt_addr: mgmt_addr.clone() };
@@ -171,6 +171,7 @@ pub fn start(
         keys,
         failpoints_api: cfg.failpoints_api,
         meta: Some(meta.clone()), // 依赖元数据的端点（M7）
+        usage: Some(svc.targets()),
         polls: AtomicUsize::new(0),
     };
     if let Err(e) = mgmt.start(Arc::new(ctx)) {
@@ -209,7 +210,9 @@ fn open_data(
     let targets = data::open_targets(store, &cfg.targets, &cluster_id)?;
     let map = Arc::new(MapHolder::new());
     let node = DataNode::new(pipeline.clone(), targets, pool.clone(), cluster_id, cap_key(master), map);
-    rpc.add_service(MSG_DATA_CALL, DataService::start(node.clone())?);
+    let svc = DataService::start(node.clone())?;
+    rpc.add_service(MSG_DATA_CALL, svc.clone());
+    rpc.add_service(MSG_PEER_CALL, replica::start(&node, peer.clone(), svc)?); // 链式复制（M9）
     Ok(DataSide { node, peer })
 }
 
@@ -234,12 +237,13 @@ fn start_background(
     });
     let machine_id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default().trim().to_string();
     let host_id = cfg.debug.host_id.clone().unwrap_or_else(|| machine_id.clone());
-    let (boot_id, pipeline) = (rand::random_u64(), side.node.pipeline.clone());
+    let (boot_id, pipeline) = (rand::random_u64().max(1), side.node.pipeline.clone()); // 0 = 不核对 I5（data/chain.rs）
     let eng = meta.clone();
     let on_map: Arc<dyn Fn(&ClusterMap) + Send + Sync> = Arc::new(move |m| {
-        let d = plugins::diff(&eng.local_plugins().plugins, &m.plugins.plugins);
-        if let Some(d) = d.filter(|_| !eng.adopt_local_plugins()) {
-            plugins::exit_mismatch(&d); // 每一张集群图都比对（3.7.2 第 3 条）
+        match plugins::diff(&eng.local_plugins().plugins, &m.plugins.plugins) {
+            None => eng.adopt_done(), // 一致了：逃生口用过了（ADR-0039 第 6 条，与 raft 线程共用这个标志）
+            Some(d) if !eng.adopting() => plugins::exit_mismatch(&d), // 每一张集群图都比对（3.7.2 第 3 条）
+            Some(_) => {}
         }
     });
     let rpc = side.peer.clone();

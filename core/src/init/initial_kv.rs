@@ -114,9 +114,11 @@ pub fn initial_kv(i: &InitialKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         (keys::global(keys::G_SETTINGS), encode_v1(&ClusterSettingsV1::default())),
         (keys::global(keys::G_PLUGINS), encode_v1(&i.plugins)),
     ];
-    if i.profile == Profile::Default {
+    if i.profile != Profile::Minimal {
         kv.push((keys::dirattr(HOME_INO), encode_v1(&attr("replicas", "3"))));
-        kv.push((keys::dirattr(SCRATCH_INO), encode_v1(&attr("replicas", "2"))));
+    }
+    if i.profile == Profile::Default {
+        kv.push((keys::dirattr(SCRATCH_INO), encode_v1(&attr("replicas", "2")))); // nas-safe 阶段版只写 /home（9.7）
     }
     kv.extend(initial_keymeta(i.created_ms).into_iter().map(|(id, m)| (keys::keymeta(id), encode_v1(&m))));
     kv.extend(i.targets.iter().zip(1u32..).map(|(t, id)| (keys::target(id), encode_v1(t))));

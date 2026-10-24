@@ -196,8 +196,46 @@ fn warnings_cover_short_chains_and_missing_failure_domains() {
     m.chains = vec![(1, short.clone()), (2, ChainRecV1 { members: vec![(2, SERVING)], ..short })];
     let w = crate::meta::cluster::map::warnings(&m);
     assert_eq!(w.len(), 2, "{w:?}");
-    assert!(w[0].contains("c1 类声明 3 副本，只有 1 个故障域"), "{w:?}");
-    assert!(w[1].starts_with("有 2 条链少于声明副本数"), "{w:?}");
+    assert!(w[0].starts_with("有 2 条链少于声明副本数"), "链降级排在最前面（wmfs status 的第一行，M9）：{w:?}");
+    assert!(w[1].contains("c1 类声明 3 副本，只有 1 个故障域"), "{w:?}");
     let full = map((1..=3).map(|n| (n, target(n, &[], TARGET_UP))).collect(), vec![class(1, "*", false)]);
     assert!(crate::meta::cluster::map::warnings(&full).is_empty(), "3 个故障域：没有警告");
+}
+
+/// M9：降级按 Serving 成员数算（Syncing 不算副本）；没有 Serving 成员的链单独一条"等待最后的副本"；一个节点公布了别的节点没有的
+/// 数据传输 → "n→m 的数据复制不能走 X"（3.3.3）。
+#[test]
+fn warnings_cover_degraded_and_unavailable_chains_and_transport_fallback() {
+    use crate::meta::schema::records::{NODE_ACTIVE, NodeRecV1};
+    let mut m = map((1..=3).map(|n| (n, target(n, &[], TARGET_UP))).collect(), vec![class(1, "*", false)]);
+    let c = |members: Vec<(u32, u8)>, last| ChainRecV1 {
+        ver: 1,
+        incarnation: 1,
+        class_id: 1,
+        replicas: 3,
+        members,
+        last_serving: last,
+        removed: vec![],
+    };
+    m.chains = vec![(1, c(vec![(1, SERVING), (2, SERVING), (3, SYNCING)], None)), (2, c(vec![(3, SYNCING)], Some(2)))];
+    let node = |addrs: &[&str]| NodeRecV1 {
+        addrs: addrs.iter().map(|s| (s.to_string(), "a".to_string())).collect(),
+        mgmt_addr: String::new(),
+        host_id: String::new(),
+        machine_id: String::new(),
+        hostname: String::new(),
+        meta_role: 0,
+        features: vec![],
+        joined_ms: 0,
+        state: NODE_ACTIVE,
+    };
+    m.nodes = vec![(1, node(&["tcp", "fast"])), (2, node(&["tcp"]))];
+    let w = crate::meta::cluster::map::warnings(&m);
+    assert!(
+        w.iter().any(|x| x.starts_with("有 2 条链少于声明副本数") && x.contains("Serving 2 个、Syncing 1 个")),
+        "{w:?}"
+    );
+    assert!(w.iter().any(|x| x.contains("链 2 等待最后的副本 target 2") && x.contains("force-serving")), "{w:?}");
+    assert!(w.iter().any(|x| x.contains("节点 1→2 的数据复制不能走 fast")), "{w:?}");
+    assert!(!w.iter().any(|x| x.contains("节点 2→1")), "{w:?}");
 }

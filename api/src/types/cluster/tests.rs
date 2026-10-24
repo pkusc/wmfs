@@ -54,3 +54,26 @@ fn cluster_json_golden() {
         format!(r#"{{"node_id":3,"applied":34359738368,"state_version":5,"keys":12,"hash":"{}"}}"#, "ab".repeat(16));
     same(&h, &want);
 }
+
+#[test]
+fn chains_json_golden() {
+    let m = |target, node, state: &str| ChainMember { target, node, state: state.into() };
+    let c = ChainInfo {
+        id: 3,
+        ver: 1 << 33,
+        incarnation: 2,
+        class: "default".into(),
+        replicas: 3,
+        want: 3,
+        members: vec![m(1, 1, "serving"), m(3, 3, "syncing")],
+        last_serving: None,
+        removed: vec![2],
+    };
+    let one = r#"{"id":3,"ver":8589934592,"incarnation":2,"class":"default","replicas":3,"want":3,"members":[{"target":1,"node":1,"state":"serving"},{"target":3,"node":3,"state":"syncing"}],"last_serving":null,"removed":[2]}"#;
+    same(&c, one);
+    same(
+        &ChainsReply { chains: vec![c], warnings: vec!["w".into()] },
+        &format!(r#"{{"chains":[{one}],"warnings":["w"]}}"#),
+    );
+    same(&ForceServingReq { i_accept_data_loss: true }, r#"{"i_accept_data_loss":true}"#);
+}

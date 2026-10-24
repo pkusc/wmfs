@@ -7,10 +7,12 @@
 //! M6 加了 `mount`/`umount`（FUSE，`fuse/`）与 `dev mount/umount/client-pid`。M7 加了策略命令 `set/get/unset/usage/status`
 //! （`attr.rs`，挂载点路径的换算在 `pathmap.rs`）、`changelog tail`（`changelog.rs`）、`cluster set`（`cluster.rs`）与
 //! `debug rstat-check`。M8 加了 `join`、`server --adopt-local-plugins`、`node list|drain|remove|promote`（`node_admin.rs`）、
-//! `cluster plugins show|add|remove`、`dev up --nodes N`、`dev leader`、`debug meta-hash`。
+//! `cluster plugins show|add|remove`、`dev up --nodes N`、`dev leader`、`debug meta-hash`。M9 加了 `chain list|show|force-serving`
+//! （`chain.rs`）、`dev restart-all`、`dev pause|resume`、`dev wait chains-serving`、`dev up --profile nas-safe`。
 //! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod attr;
+mod chain;
 mod changelog;
 mod cluster;
 mod debug;
@@ -111,6 +113,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cluster::ClusterCmd,
     },
+    /// 数据链（list、show、force-serving）
+    Chain {
+        #[command(subcommand)]
+        cmd: chain::ChainCmd,
+    },
     /// 调试工具
     Debug {
         #[command(subcommand)]
@@ -194,6 +201,7 @@ fn main() {
         Cmd::Status(a) => attr::status(a),
         Cmd::Changelog { cmd } => changelog::run_changelog(cmd),
         Cmd::Cluster { cmd } => cluster::run_cluster(cmd),
+        Cmd::Chain { cmd } => chain::run_chain(cmd),
         Cmd::Debug { cmd: DebugCmd::RstatCheck { data_dir, json } } => debug::rstat_check(&data_dir, json),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),

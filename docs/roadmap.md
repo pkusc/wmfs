@@ -347,10 +347,10 @@ scripts/accept.sh M8
 ```bash
 wmfs dev up --nodes 3 && eval "$(wmfs dev env)" && mkdir -p ~/wmfs-mnt && wmfs dev mount ~/wmfs-mnt
 wmfs get ~/wmfs-mnt/home | grep replicas            # 预期：replicas=3（来源 /home）
-wmfs chain list                                     # 预期：每条链 3 个成员，全部 Serving
+echo hello > ~/wmfs-mnt/home/hello && wmfs chain list   # 预期：（链在第一次建文件时生成）每条链 3 个成员，全部 Serving
 head -c 2G /dev/urandom > /tmp/src2g && md5sum /tmp/src2g
 ( cp /tmp/src2g ~/wmfs-mnt/home/f && echo WRITE-OK ) &
-sleep 5; wmfs dev kill 2                            # 写到一半时 kill -9 节点 2（sleep 5 只是让写先开始）
+sleep 1; wmfs dev kill 2                            # 写到一半时 kill -9 节点 2（sleep 1 只是让写先开始：本机写完 2 GiB 不到 5 s）
 wait                                                # 预期：WRITE-OK（客户端只是等待并重试，没有报错）
 md5sum ~/wmfs-mnt/home/f                            # 预期：与 /tmp/src2g 相同
 wmfs chain list                                     # 预期：节点 2 的 target 已从各链移除（链降级为 2 个成员）

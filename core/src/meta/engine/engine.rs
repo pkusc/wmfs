@@ -145,7 +145,6 @@ pub struct EmbeddedEngine {
     raft: Mutex<Option<JoinHandle<()>>>,
     node_id: u32,
     plugins: PluginListV1,
-    adopt_local_plugins: bool,
     net: Option<Arc<RaftNet>>,
 }
 
@@ -192,17 +191,7 @@ impl EmbeddedEngine {
         let hook = HookCall::new(&MANIFEST, Hook::MetaEngine);
         let raft = Mutex::new(Some(raft));
         let (node_id, plugins) = (o.node_id, o.plugins);
-        Ok(Arc::new(EmbeddedEngine {
-            shared,
-            exec_tx,
-            hook,
-            gate_secs,
-            raft,
-            node_id,
-            plugins,
-            adopt_local_plugins,
-            net,
-        }))
+        Ok(Arc::new(EmbeddedEngine { shared, exec_tx, hook, gate_secs, raft, node_id, plugins, net }))
     }
 
     /// 元数据网络（服务端装配时把 RaftMsg 与 SnapshotFetch 登记到 RpcServer；没有 RPC 客户端的组件测试是 None）。
@@ -214,9 +203,13 @@ impl EmbeddedEngine {
     pub fn local_plugins(&self) -> &PluginListV1 {
         &self.plugins
     }
-    /// 是不是用 `wmfs server --adopt-local-plugins` 启动的（3.7.2 第 5 条的逃生口）。
-    pub fn adopt_local_plugins(&self) -> bool {
-        self.adopt_local_plugins
+    /// 还在用 `wmfs server --adopt-local-plugins` 的逃生口吗（3.7.2 第 5 条；M9：第一次一致、或集群清单变了之后就不再是）。
+    pub fn adopting(&self) -> bool {
+        self.shared.published.adopting()
+    }
+    /// 逃生口用过了（节点心跳拿到的集群图里的清单与本地一致时，M9）。
+    pub fn adopt_done(&self) {
+        self.shared.published.adopt_done()
     }
     /// 已应用的集群插件清单与本地的不一致（cluster-mgr 看它，3.7.2）。
     pub fn plugins_mismatch(&self) -> bool {

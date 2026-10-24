@@ -131,7 +131,8 @@ fn targets_on_the_command_line_and_the_initial_warnings() {
 #[test]
 fn minimal_profile_has_one_replica_and_no_replicas_attrs() {
     assert_eq!(Profile::parse("minimal"), Ok(Profile::Minimal));
-    assert!(Profile::parse("nas-safe").unwrap_err().contains("M9"), "其余的部署模板在 M9 起");
+    assert_eq!(Profile::parse("nas-safe"), Ok(Profile::NasSafe), "M9：nas-safe 的阶段版");
+    assert!(Profile::parse("bogus").unwrap_err().contains("nas-safe"), "列出现在有的部署模板");
     let d = crate::base::test_dir("init-minimal");
     let o = InitOpts { profile: Profile::Minimal, ..opts(&d) };
     assert!(initial_warnings(&o).is_empty(), "单节点 1 副本：没有降级警告");

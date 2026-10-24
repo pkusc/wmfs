@@ -16,7 +16,7 @@ use crate::base::ErrCode;
 use crate::base::units::{fmt_duration, fmt_size, parse_duration, parse_size};
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvTxn, OpCtx};
-use crate::meta::schema::keys::{self, G_SETTINGS};
+use crate::meta::schema::keys::{self, G_SETTINGS, G_SETTINGS_PREV};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::ClusterSettingsV1;
 
@@ -85,9 +85,25 @@ pub fn parse(items: &BTreeMap<String, String>) -> Result<Vec<(String, u64)>, Str
     Ok(out)
 }
 
-/// 执行器闭包：改参数、`map_epoch += 1`、每项一条 changelog `ClusterSet`。
+/// 每一项取两者中较大的（ADR-0038 第 5 条：授予方判定过期用较长的租约；settings_prev 已经有时也这样合并）。
+pub fn max_each(a: &ClusterSettingsV1, b: &ClusterSettingsV1) -> ClusterSettingsV1 {
+    ClusterSettingsV1 {
+        session_lease_ms: a.session_lease_ms.max(b.session_lease_ms),
+        target_lease_ms: a.target_lease_ms.max(b.target_lease_ms),
+        cap_ttl_ms: a.cap_ttl_ms.max(b.cap_ttl_ms),
+        repair_delay_ms: a.repair_delay_ms.max(b.repair_delay_ms),
+        rejoin_window_ms: a.rejoin_window_ms.max(b.rejoin_window_ms),
+        epoch_gc_grace_ms: a.epoch_gc_grace_ms.max(b.epoch_gc_grace_ms),
+        bg_bytes_per_sec: a.bg_bytes_per_sec.max(b.bg_bytes_per_sec),
+    }
+}
+
+/// 执行器闭包：改参数、`map_epoch += 1`、每项一条 changelog `ClusterSet`。实现注记（M9，ADR-0038 第 5 条）：调小了某个租约时，同一个
+/// 批次在 GLOBAL `settings_prev` 里记下修改之前的值（已经有就每一项取较大的）；授予方按 max(当前值, settings_prev) 判定过期，链管理器
+/// 在一个旧租约周期之后删掉它（`chain_mgr.rs`）。
 pub fn apply(v: &mut dyn KvTxn, c: &OpCtx, items: &[(String, u64)]) -> Result<ClusterSettingsReply, ErrCode> {
     let mut s: ClusterSettingsV1 = kv::get(v, &keys::global(G_SETTINGS))?.ok_or(ErrCode::INTERNAL)?;
+    let before = s.clone();
     for (name, val) in items {
         let f = field(&mut s, name).ok_or(ErrCode::EINVAL)?;
         let old = std::mem::replace(f, *val);
@@ -96,6 +112,10 @@ pub fn apply(v: &mut dyn KvTxn, c: &OpCtx, items: &[(String, u64)]) -> Result<Cl
         changelog::append(v, c, Change { op: "ClusterSet", extra, ..Default::default() })?;
     }
     kv::put(v, &keys::global(G_SETTINGS), &s);
+    if s.target_lease_ms < before.target_lease_ms || s.session_lease_ms < before.session_lease_ms {
+        let prev: Option<ClusterSettingsV1> = kv::get(v, &keys::global(G_SETTINGS_PREV))?;
+        kv::put(v, &keys::global(G_SETTINGS_PREV), &prev.map_or(before.clone(), |p| max_each(&p, &before)));
+    }
     kv::bump_map_epoch(v)?;
     Ok(ClusterSettingsReply { settings: show(&s) })
 }

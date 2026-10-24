@@ -285,6 +285,24 @@ fn version_feature_role_and_cluster_negotiation() {
     assert_eq!(raw_recv(&mut raw).err(), Some(ErrCode::ECONNRESET));
 }
 
+/// M9（M1 交接 ②）：`call_cb` 还没有连接时在后台的 `rpc-dial` 线程上建连——调用方立即返回，回调在建好连接、收到回复之后在别的
+/// 线程上执行（repl 线程用 call_cb 转发，从不等网络）。
+#[test]
+fn call_cb_dials_in_the_background() {
+    let s = mem("rpc-cb-background");
+    let (c, _) = slow_client("mem", key(2), Role::Client, Duration::from_secs(2));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (me, t0) = (std::thread::current().id(), Instant::now());
+    let cb = move |r: Result<InFrame, ErrCode>| {
+        let _ = tx.send((r.is_ok(), std::thread::current().id()));
+    };
+    c.call_cb(&s.ep, Family::Control, frame(MSG_PING, b"x"), T, Box::new(cb));
+    assert!(t0.elapsed() < Duration::from_millis(100), "call_cb 立即返回：{:?}", t0.elapsed());
+    let (ok, on) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(ok && on != me, "回调在别的线程上执行");
+    assert!(t0.elapsed() >= Duration::from_secs(2), "回调在建连（2 s）之后");
+}
+
 /// ADR-0031 第 11 条（M3 的 core 修复）：16 个线程同时对同一对端做第一次 call，只有一个线程建连、其余等它——
 /// 客户端只建 1 次连接（tcp 与 mem 各一次），16 个调用全部成功；建连失败时（握手被拒）16 个调用拿到同一个错误，
 /// 也只建了 1 次。客户端的每次建连先等 250 ms：16 个线程一定都在建连进行中到达（否则调度晚到的线程
