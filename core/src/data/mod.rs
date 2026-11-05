@@ -112,6 +112,7 @@ pub struct DataNode {
     pub touched: Mutex<HashMap<(u32, u32), HashSet<ChunkId>>>, // (链, 本节点的 target) → 本轮同步开始后本地提交过转发的 chunk
     pub fwd_fail: Mutex<HashMap<(u32, u32), u64>>,             // (链, 下游 target) → 持续转发失败的起点（墙钟 ms）
     pub sync_done: Mutex<Vec<(u32, u32, u64)>>, // (链, target, chain_ver)：同步完了，等 hb 线程报给 leader
+    pub promoted: Mutex<HashMap<u32, (u64, bool)>>, // 链 → 本节点的成员刚成为 last serving：到这个时刻（mono_ms）之前读回 BUSY、整条链吗
     pub craq: Craq,
 }
 
@@ -159,6 +160,7 @@ impl DataNode {
             touched: Mutex::default(),
             fwd_fail: Mutex::default(),
             sync_done: Mutex::default(),
+            promoted: Mutex::default(),
             craq: Craq::new(),
         })
     }

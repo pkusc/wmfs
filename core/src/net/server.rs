@@ -15,8 +15,11 @@
 //! OneWay 直接丢掉，raft 会重发）；[`Responder::error_with`] 带一句给人看的原因（`ErrorBody.msg`，例如 join 被拒时的插件差异；`NOT_LEADER` 时
 //! 照样自动填 leader_hint——join 发给 follower 也能跟到 leader）；
 //! [`StreamTx::wait_room`] 让流的发送方（snap-serve）等发送队列腾出地方，不会把整个快照一下子塞进队列。
+//! 实现注记（M10，ADR-0009"已建立的连接在集群图更新时关闭"）：hb 线程每拿到一张集群图就把其中已撤销的 key 交给
+//! [`RpcServer::set_revoked`]；读线程收到下一帧时（只在名单变过之后查一次）发现自己这条连接的 key 已撤销 → 不处理、关闭连接。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -74,6 +77,8 @@ pub struct RpcServer {
     oneway: RwLock<HashMap<u16, OneWayFn>>,
     stats: [OnceLock<Arc<FamilyStats>>; FAMILIES.len() + 1], // FAMILIES 各一个 + Unknown；第一次用到时注册，之后不加锁
     hint: OnceLock<HintFn>,
+    revoked: RwLock<Vec<u32>>, // 已撤销的 key（见文件头）
+    revoked_gen: AtomicU64,    // 名单每变一次 + 1：读线程只在它变过之后查一次名单
 }
 
 impl RpcServer {
@@ -93,7 +98,23 @@ impl RpcServer {
             oneway: RwLock::new(HashMap::new()),
             stats: Default::default(),
             hint: OnceLock::new(),
+            revoked: RwLock::default(),
+            revoked_gen: AtomicU64::new(0),
         })
+    }
+
+    /// 集群图里已撤销的 key（hb 线程每拿到一张集群图调用）：名单变了，用这些 key 建立的连接在收到下一帧时关闭。
+    pub fn set_revoked(&self, mut keys: Vec<u32>) {
+        keys.sort_unstable();
+        let mut r = self.revoked.write().unwrap_or_else(|e| e.into_inner());
+        if *r != keys {
+            *r = keys;
+            self.revoked_gen.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn is_revoked(&self, key_id: u32) -> bool {
+        self.revoked.read().unwrap_or_else(|e| e.into_inner()).binary_search(&key_id).is_ok()
     }
 
     /// 登记"leader 在哪"的函数：之后回 `NOT_LEADER` 的 ERROR 帧都带上它给的 `leader_hint`（只登记一次，再登记被忽略）。
@@ -148,9 +169,20 @@ impl RpcServer {
             }
         };
         log::debug("rpc", format_args!("{} 已认证：key {}，角色 {}", h.peer(), id.key_id, id.role.name()));
+        let mut seen = 0; // 握手时 key 有效；撤销名单变过之后再查
         loop {
             match recv_checked(&*c) {
-                Ok(f) => self.dispatch(&h, &id, f),
+                Ok(f) => {
+                    let g = self.revoked_gen.load(Ordering::Acquire);
+                    if g != seen {
+                        seen = g;
+                        if self.is_revoked(id.key_id) {
+                            log::info("rpc", format_args!("key {} 已撤销：关闭来自 {} 的连接", id.key_id, h.peer()));
+                            break;
+                        }
+                    }
+                    self.dispatch(&h, &id, f)
+                }
                 Err(e) => {
                     log::debug("rpc", format_args!("连接 {} 断开：{e}", h.peer()));
                     break;

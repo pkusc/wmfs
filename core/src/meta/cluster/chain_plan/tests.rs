@@ -1,4 +1,5 @@
-//! 3.4.2.7 与 3.4.2.10 的每一行（9.1 的"CRAQ 状态机"：3.4.2.7 的每一行），以及随机输入下 I0 一直成立。
+//! 3.4.2.7 与 3.4.2.10 的每一行（9.1 的"CRAQ 状态机"：3.4.2.7 的每一行），以及随机输入下 I0 一直成立。活着的成员分两步移出
+//! （drain、只读、10 s 转发不到，ADR-0041 第 13、16 条）的用例在 `tests/two_step.rs`。
 
 use super::*;
 use crate::base::rand::XorShift64;
@@ -58,7 +59,17 @@ fn map(n: u32, chains: Vec<ChainRecV1>) -> ClusterMap {
 /// 活着的 target：(id, boot_id)，都在最近 2 s 内来过。
 fn facts(alive: &[(u32, u64)]) -> Facts {
     let alive = alive.iter().map(|(t, b)| (*t, Seen { boot: *b, fresh: true })).collect();
-    Facts { now_ms: NOW, settings: ClusterSettingsV1::default(), alive, failures: vec![], grace: false }
+    Facts {
+        now_ms: NOW,
+        settings: ClusterSettingsV1::default(),
+        alive,
+        failures: vec![],
+        grace: false,
+        target_lease_shrinking: false,
+        syncing: HashMap::new(),
+        epoch_seen: HashMap::new(),
+        parting: BTreeSet::new(),
+    }
 }
 
 const S: u8 = SERVING;
@@ -161,84 +172,6 @@ fn fwd_fail(node: u32, down: u32, lasted_ms: u64) -> FwdFailure {
 }
 
 #[test]
-fn a_member_that_cannot_reach_its_successor_for_10s_loses_the_successor() {
-    let m = map(3, vec![chain(&[(1, S), (2, S), (3, S)])]);
-    let mut f = facts(&[(1, 101), (2, 102), (3, 103)]);
-    f.failures = vec![fwd_fail(1, 2, FWD_FAIL_MS - 1)];
-    assert!(plan(&m, &f).is_empty(), "还不到 10 s");
-    f.failures = vec![fwd_fail(1, 2, FWD_FAIL_MS)];
-    assert_eq!(plan(&m, &f).chains[0].1.members, vec![(1, S), (3, S)], "移除下游那一个");
-    f.failures = vec![fwd_fail(1, 3, FWD_FAIL_MS)];
-    assert!(plan(&m, &f).is_empty(), "报的下游不是它的后继：不动");
-}
-
-/// 审查发现：因转发失败被移除的成员一直在心跳（从没 Offline），下一轮（200 ms 后）不能被当作"离线后回来"追加回链尾——否则成员之间
-/// 持续分区时链会循环"追加 → 10 s 转发不到 → 移除"，写一直卡住。它留在 removed 里，过了 repair_delay 才可能按"修复"补回来。
-#[test]
-fn a_member_removed_for_forward_failures_is_not_readded_at_once() {
-    let m = map(3, vec![chain(&[(1, S), (2, S), (3, S)])]);
-    let mut f = facts(&[(1, 101), (2, 102), (3, 103)]);
-    f.failures = vec![fwd_fail(1, 2, FWD_FAIL_MS)];
-    let p = plan(&m, &f);
-    assert_eq!(p.chains[0].1.members, vec![(1, S), (3, S)]);
-    let mut m2 = m.clone();
-    m2.chains = p.chains.clone(); // 第一轮的结果已提交
-    f.failures = vec![]; // 链改过之后 1.5 s 内的报告不算（chain_mgr）
-    f.now_ms = NOW + 200;
-    let p2 = plan(&m2, &f);
-    assert!(p2.is_empty(), "第二轮：不追加回来：{p2:?}");
-    f.now_ms = NOW + ClusterSettingsV1::default().repair_delay_ms + 200;
-    let c = &plan(&m2, &f).chains[0].1;
-    assert_eq!(c.members, vec![(1, S), (3, S), (2, Y)], "过了 repair_delay：按修复补回（Syncing）");
-}
-
-#[test]
-fn draining_moves_targets_out_after_replacements_serve() {
-    let mut m = map(3, vec![chain(&[(1, S), (2, S), (3, S)])]);
-    m.nodes[2].1.state = NODE_DRAINING;
-    let all = facts(&[(1, 101), (2, 102), (3, 103)]);
-    let c = &plan(&m, &all).chains[0].1;
-    assert_eq!(c.members, vec![(1, S), (2, S)], "3 个节点：没有替代的，其余两个够了就移除");
-    assert_eq!(want(&m, c), 2, "管理 API 的期望长度与链管理器同一口径（drain 中的节点不算）");
-    let mut m4 = map(4, vec![chain(&[(1, S), (2, S), (3, S)])]);
-    m4.nodes[2].1.state = NODE_DRAINING;
-    let f4 = facts(&[(1, 101), (2, 102), (3, 103), (4, 104)]);
-    let c = &plan(&m4, &f4).chains[0].1;
-    assert_eq!(c.members, vec![(1, S), (2, S), (3, S), (4, Y)], "先追加替代成员（Syncing）");
-    m4.chains[0].1 = ChainRecV1 { members: vec![(1, S), (2, S), (3, S), (4, S)], ..m4.chains[0].1.clone() };
-    assert_eq!(plan(&m4, &f4).chains[0].1.members, vec![(1, S), (2, S), (4, S)], "替代成员 Serving 之后再移除");
-}
-
-/// M9 验证发现：t2 离线后回来时链已被新加入的 t4 补满（没能 rejoin，留在 removed 里）；之后 drain t4，能替代的只有 t2——drain 的替代
-/// 成员不等 repair_delay（3.4.2.10 的 drain 一行），否则 t4 要 30 min 才迁得走。不在 drain 时短链照样等（见下面"修复"的用例）。
-#[test]
-fn a_drain_replacement_does_not_wait_for_the_repair_delay() {
-    let mut c0 = chain(&[(3, S), (1, S), (4, S)]);
-    c0.removed = vec![(2, NOW - 1000)];
-    let mut m = map(4, vec![c0.clone(), ChainRecV1 { replicas: 1, ..chain(&[(2, S)]) }]);
-    m.nodes[3].1.state = NODE_DRAINING;
-    let f = facts(&[(1, 101), (2, 102), (3, 103), (4, 104)]);
-    let p = plan(&m, &f);
-    assert_eq!(p.chains.len(), 1, "{p:?}");
-    let c = &p.chains[0].1;
-    assert_eq!(c.members, vec![(3, S), (1, S), (4, S), (2, Y)], "先追加替代成员（Syncing），不等 repair_delay");
-    assert!(c.removed.is_empty(), "t2 回到链上了：不再记在 removed 里");
-    m.chains[0].1.members = vec![(3, S), (1, S), (4, S), (2, S)];
-    assert_eq!(plan(&m, &f).chains[0].1.members, vec![(3, S), (1, S), (2, S)], "替代成员 Serving 之后再移除 t4");
-}
-
-/// 已有链里的成员变成只读（3.2.3 的 ro_compat 位）：像 drain 一样迁出写路径——先补一个成员，够了再移除它。
-#[test]
-fn read_only_members_leave_the_write_path_like_drained_ones() {
-    let mut m = map(4, vec![chain(&[(1, S), (2, S), (3, S)])]);
-    m.targets[2].1.read_only = true;
-    let f = facts(&[(1, 101), (2, 102), (3, 103), (4, 104)]);
-    assert_eq!(plan(&m, &f).chains[0].1.members, vec![(1, S), (2, S), (3, S), (4, Y)]);
-    m.chains[0].1.members = vec![(1, S), (2, S), (3, S), (4, S)];
-    assert_eq!(plan(&m, &f).chains[0].1.members, vec![(1, S), (2, S), (4, S)]);
-}
-
-#[test]
 fn short_chains_are_repaired_with_spare_targets_after_the_delay() {
     let mut c0 = chain(&[(1, S), (2, S)]);
     let m = map(3, vec![c0.clone()]);
@@ -306,7 +239,9 @@ fn sync_done_promotes_only_the_first_syncing_member_of_the_same_version() {
     assert_eq!((c.members.clone(), c.ver), (vec![(1, S), (2, S), (3, Y)], 6));
 }
 
-/// 随机的心跳情况下：I0（Syncing 成员都在 Serving 之后）一直成立，改过的链 ver 只加一，链上没有重复的 target 与节点。
+/// 随机的心跳情况（另有随机的 drain、10 s 转发失败、已可做第二步的 Syncing 成员、调小租约的过渡期）下：I0（Syncing 成员都在 Serving
+/// 之后）一直成立，改过的链 ver 只加一，链上没有重复的 target 与节点；活着的、已提交的图里是 Serving 的成员不会在一轮里被移出（两步，
+/// ADR-0041 第 13 条），原来有活着的 Serving 成员的链之后也还有 Serving 成员。
 #[test]
 fn random_plans_keep_invariant_i0() {
     for seed in 1..300u64 {
@@ -317,20 +252,69 @@ fn random_plans_keep_invariant_i0() {
         for m in members.iter_mut().rev().take(syncing) {
             m.1 = Y;
         }
-        let m = map(n, vec![chain(&members)]);
+        let mut m = map(n, vec![chain(&members)]);
+        if r.below(3) == 0 {
+            m.nodes[r.below(n as u64) as usize].1.state = NODE_DRAINING;
+        }
         let mut alive = Vec::new();
         for t in 1..=n {
             if r.below(3) > 0 {
                 alive.push((t, if r.below(3) == 0 { 900 + t as u64 } else { 100 + t as u64 }));
             }
         }
-        let p = plan(&m, &facts(&alive));
+        let mut f = facts(&alive);
+        f.target_lease_shrinking = r.below(4) == 0;
+        if let Some(w) = members.windows(2).nth(r.below(members.len() as u64 + 1) as usize).filter(|_| r.below(3) == 0)
+        {
+            f.failures = vec![fwd_fail(w[0].0, w[1].0, FWD_FAIL_MS)];
+        }
+        for (t, _) in members.iter().filter(|(_, s)| *s == Y && r.below(2) == 0) {
+            f.syncing.insert((1, *t), (0, f.settings.target_lease_ms)); // 已可做第二步
+        }
+        let p = plan(&m, &f);
         for (_, c) in &p.chains {
             let first_syncing = c.members.iter().position(|(_, s)| *s == Y).unwrap_or(c.members.len());
             assert!(c.members[first_syncing..].iter().all(|(_, s)| *s == Y), "种子 {seed}：I0 不成立 {c:?}");
             assert_eq!(c.ver, 6, "种子 {seed}");
             let ids: BTreeSet<u32> = c.members.iter().map(|(t, _)| *t).collect();
             assert_eq!(ids.len(), c.members.len(), "种子 {seed}：重复的成员");
+            let live: Vec<u32> =
+                members.iter().filter(|(t, s)| *s == S && f.alive.contains_key(t)).map(|(t, _)| *t).collect();
+            for t in &live {
+                assert!(ids.contains(t), "种子 {seed}：活着的 Serving 成员 t{t} 被一步移出 {c:?}");
+            }
+            assert!(
+                live.is_empty() || c.members.iter().any(|(_, s)| *s == S),
+                "种子 {seed}：没有 Serving 成员了 {c:?}"
+            );
         }
     }
 }
+
+/// ADR-0040 第 13 条：调小 target 租约的过渡期里只做移除——离线的成员照样移出；离线回来的不 rejoin、短链不补、drain 的替代不追加；
+/// 过渡期结束（settings_prev 删掉）之后照常。
+#[test]
+fn while_the_target_lease_shrinks_the_manager_only_removes() {
+    let mut c0 = chain(&[(1, S), (3, S)]);
+    c0.removed = vec![(2, NOW - 1000)];
+    let mut m = map(4, vec![c0, chain(&[(1, S), (2, S), (3, S)])]);
+    m.targets[1].1.state = TARGET_OFFLINE;
+    let mut f = facts(&[(1, 101), (2, 102), (3, 103)]);
+    f.target_lease_shrinking = true;
+    let p = plan(&m, &f);
+    assert!(p.chains.is_empty(), "t2 回来了：不 rejoin、短链也不补 {p:?}");
+    assert!(p.targets.iter().any(|(id, t)| *id == 2 && t.state == TARGET_UP), "target 照样记为 Up");
+    let mut drain = map(4, vec![chain(&[(1, S), (2, S), (3, S)])]);
+    drain.nodes[2].1.state = NODE_DRAINING;
+    let mut f4 = facts(&[(1, 101), (2, 102), (3, 103), (4, 104)]);
+    f4.target_lease_shrinking = true;
+    assert!(plan(&drain, &f4).chains.is_empty(), "drain：替代成员（Syncing）也不追加，于是 t3 也还不能移除");
+    let gone = map(3, vec![chain(&[(1, S), (2, S), (3, S)])]);
+    let mut f = facts(&[(1, 101), (3, 103)]);
+    f.target_lease_shrinking = true;
+    assert_eq!(plan(&gone, &f).chains[0].1.members, vec![(1, S), (3, S)], "移除照常");
+    f4.target_lease_shrinking = false;
+    assert_eq!(plan(&drain, &f4).chains[0].1.members.last(), Some(&(4, Y)), "过渡期结束：照常追加");
+}
+
+mod two_step;

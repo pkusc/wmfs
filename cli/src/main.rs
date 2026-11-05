@@ -8,7 +8,8 @@
 //! （`attr.rs`，挂载点路径的换算在 `pathmap.rs`）、`changelog tail`（`changelog.rs`）、`cluster set`（`cluster.rs`）与
 //! `debug rstat-check`。M8 加了 `join`、`server --adopt-local-plugins`、`node list|drain|remove|promote`（`node_admin.rs`）、
 //! `cluster plugins show|add|remove`、`dev up --nodes N`、`dev leader`、`debug meta-hash`。M9 加了 `chain list|show|force-serving`
-//! （`chain.rs`）、`dev restart-all`、`dev pause|resume`、`dev wait chains-serving`、`dev up --profile nas-safe`。
+//! （`chain.rs`）、`dev restart-all`、`dev pause|resume`、`dev wait chains-serving`、`dev up --profile nas-safe`。M10 加了
+//! `key create|list|revoke`、`session list|evict`（`key.rs`）、`dev wait session-evicted`、`mount --allow-other`。
 //! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod attr;
@@ -21,6 +22,7 @@ mod doctor;
 mod failpoint;
 mod fs;
 mod fuse;
+mod key;
 mod leader;
 mod node;
 mod node_admin;
@@ -118,6 +120,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: chain::ChainCmd,
     },
+    /// 认证 key（create、list、revoke）
+    Key {
+        #[command(subcommand)]
+        cmd: key::KeyCmd,
+    },
+    /// 客户端会话（list、evict）
+    Session {
+        #[command(subcommand)]
+        cmd: key::SessionCmd,
+    },
     /// 调试工具
     Debug {
         #[command(subcommand)]
@@ -202,6 +214,8 @@ fn main() {
         Cmd::Changelog { cmd } => changelog::run_changelog(cmd),
         Cmd::Cluster { cmd } => cluster::run_cluster(cmd),
         Cmd::Chain { cmd } => chain::run_chain(cmd),
+        Cmd::Key { cmd } => key::run_key(cmd),
+        Cmd::Session { cmd } => key::run_session(cmd),
         Cmd::Debug { cmd: DebugCmd::RstatCheck { data_dir, json } } => debug::rstat_check(&data_dir, json),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),
@@ -300,11 +314,14 @@ mod tests {
         let s = super::registry::build_plugins(&Default::default()).unwrap();
         let want = [
             "authn:shared-key",
+            "authz:path-caps",
+            "authz:posix-acl",
             "authz:posix-mode",
             "bg_task:gc",
             "codec:replica",
             "placement:label-match",
             "qos:fifo",
+            "quota_admission:quota",
             "transform:crc32c",
         ];
         assert_eq!(s.plugin_list().plugins, want, "chunk_store（local-fs）与传输插件不进集群插件清单（3.7.2）");

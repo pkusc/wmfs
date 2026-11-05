@@ -5,24 +5,28 @@
 //! - [`data_client`]：DataClient——选副本、重定向、换副本、重试（M0 骨架，M5 实现）。
 //! - [`inode`]（M6）：一个 inode 在本挂载里的状态（属性、layout、cap、inline 副本、写回缓冲）与 C2 的"见过的 change_id"。
 //! - [`files`]（M6）：FileClient——inode 表、文件句柄表、目录句柄的快照；打开、关闭、重新 Open、取 cap。
-//! - [`writeback`]（M6）：按槽位计的写回缓冲、write、flush、fsync。
+//! - [`writeback`]（M6）：按槽位计的写回缓冲（计数器在 [`slots`]）、write、flush、fsync。
 //! - [`flusher`]（M6）：写回用到的请求（WriteChunk、SyncChunks、CommitWrite、Uninline），以及后台写回（4 个写线程、flusher 线程）。
 //! - [`read`]（M6）：读路径（读自己的写、inline、cache_store、数据节点）。
 //! - [`strong`]（M6）：同步写路径（M6 先给 cto 下的 `O_DIRECT` 用）与截断。
-//! - [`session`]（M6）：会话心跳（上报打开集合）与 relatime 批量（atime 线程）。
+//! - [`session`]（M6）：relatime 批量（atime 线程）与后台线程的小工具；会话心跳 M10 起在 [`lease`]（MetaClient 上：心跳、0.8 × lease
+//!   自停、被驱逐之后换新会话）。
 //!
 //! 实现注记（M6）：design.md 2.2 的文件表里没有 `inode.rs`、`flusher.rs`、`read.rs`、`session.rs`：为了每个文件 ≤ 400 行，从
-//! files.rs 与 writeback.rs 拆出来。锁（`locks.rs`）在 M12。
+//! files.rs 与 writeback.rs 拆出来（M10 又拆出 `dirs.rs`、`lease.rs`、`slots.rs`）。锁（`locks.rs`）在 M12。
 
 use std::time::Duration;
 
 pub mod data_client;
+pub mod dirs;
 pub mod files;
 pub mod flusher;
 pub mod inode;
+pub mod lease;
 pub mod meta_client;
 pub mod read;
 pub mod session;
+pub mod slots;
 pub mod strong;
 pub mod writeback;
 

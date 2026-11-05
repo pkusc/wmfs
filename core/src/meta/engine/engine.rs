@@ -23,7 +23,7 @@ use super::executor;
 use super::txn::{EngineStatus, KvScan, MetaEngine, OpCtx, ReadFn, RoleInfo, TxnRequest};
 use super::view::ReadView;
 use crate::base::types::ReqCtx;
-use crate::base::{ErrCode, log};
+use crate::base::{ErrCode, lock, log};
 use crate::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
 use crate::hooks::pipeline::{HookCall, Pipeline};
 use crate::hooks::traits::KeyLookup;
@@ -211,8 +211,8 @@ impl EmbeddedEngine {
     pub fn adopt_done(&self) {
         self.shared.published.adopt_done()
     }
-    /// 已应用的集群插件清单与本地的不一致（cluster-mgr 看它，3.7.2）。
-    pub fn plugins_mismatch(&self) -> bool {
+    /// 已应用的集群插件清单与本地的不一致时是差异（raft 线程比对时算好的），一致 → None（cluster-mgr 看它，3.7.2）。
+    pub fn plugins_mismatch(&self) -> Option<String> {
         self.shared.published.plugins_mismatch()
     }
 
@@ -230,7 +230,7 @@ impl EmbeddedEngine {
 
     /// 读 KV 里 KEYMETA 的 key 表（服务端握手与管理 API 签名校验用，3.3.2）。
     pub fn keys(self: &Arc<Self>, master: [u8; 32]) -> KvKeys {
-        KvKeys { master, eng: self.clone() }
+        KvKeys { master, eng: self.clone(), from_map: Mutex::default() }
     }
 
     /// 在本地（不经 ReadIndex）的已应用状态上跑 `f`：只给"读到稍旧的也无妨"的统计用（cluster-mgr 刷新 changelog 消费者的
@@ -323,9 +323,19 @@ impl MetaEngine for EmbeddedEngine {
 
 /// 认证用的 key 表：KEYMETA 来自已应用的 KV（3.3.2；M1 的临时表 `init::InitKeys` 只留给组件测试），秘密由 cluster.key 派生。
 /// key 0 固定是服务端之间用的（不在 KEYMETA 里）。被撤销的 key 照常返回元数据，由 authn 插件拒绝。
+/// 实现注记（M10）：只做数据的节点（本地一个条目也没应用过，applied = 0）的 kv 里只有 join 时预写的 key 表，之后 `wmfs key create`
+/// 建的 key 它不认识——这时改用心跳拉到的集群图里的 key 表（[`KvKeys::note_map`]，集群图对服务端带着 keys）。
 pub struct KvKeys {
     master: [u8; 32],
     eng: Arc<EmbeddedEngine>,
+    from_map: Mutex<Vec<(u32, KeyMetaV1)>>,
+}
+
+impl KvKeys {
+    /// hb 线程拉到新集群图时记下它的 key 表（见上）。
+    pub fn note_map(&self, m: &ClusterMap) {
+        *lock(&self.from_map) = m.keys.clone();
+    }
 }
 
 impl KeyLookup for KvKeys {
@@ -333,6 +343,12 @@ impl KeyLookup for KvKeys {
         (key_id == SERVER_KEY || self.meta(key_id).is_some()).then(|| derive_secret(&self.master, key_id))
     }
     fn meta(&self, key_id: u32) -> Option<KeyMetaV1> {
+        if self.eng.status().applied == 0 {
+            let m = lock(&self.from_map);
+            if let Some((_, k)) = m.iter().find(|(id, _)| *id == key_id) {
+                return Some(k.clone());
+            }
+        }
         let b = self.eng.local_get(&keys::keymeta(key_id)).ok().flatten()?;
         decode_v1(&b).ok()
     }

@@ -12,7 +12,7 @@ use fuser::{
 use wmfs_core::base::{ErrCode, log};
 use wmfs_core::client::meta_client::Caller;
 use wmfs_core::meta::schema::records::KIND_DIR;
-use wmfs_core::proto::meta::{AttrOut, MetaOp, MetaReply, SetAttrIn, TimeSet};
+use wmfs_core::proto::meta::{AttrOut, MetaOp, MetaReply, O_ACCMODE, O_RDONLY, SetAttrIn, TimeSet};
 
 use super::WmfsFs;
 use super::util::{errno, file_type, is_virtual, ts_of};
@@ -124,14 +124,18 @@ impl WmfsFs {
                 {
                     let _ = n.inval_inode(ino, 0, 0); // C2：别人改过了，回复 open 之前丢掉属性与页缓存
                 }
-                reply.opened(FileHandle(o.fh), fopen(o.keep_cache, o.direct));
+                let ro = flags.0 as u32 & O_ACCMODE == O_RDONLY;
+                reply.opened(FileHandle(o.fh), fopen(o.keep_cache, o.direct) | noflush(ro));
             }
             Err(e) => reply.error(errno(e)),
         }
     }
 
     pub(super) fn do_readdir(&self, fh: u64, offset: u64, mut reply: ReplyDirectory) {
-        let Some(d) = self.fc.dir(fh) else { return reply.error(Errno::EBADF) };
+        let d = match self.fc.dir(fh) {
+            Ok(d) => d,
+            Err(e) => return reply.error(errno(e)), // 被驱逐的会话里打开的目录句柄 → EIO（M10 审查）
+        };
         for (i, e) in d.iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(e.ino), i as u64 + 1, file_type(e.kind), OsStr::from_bytes(&e.name)) {
                 break;
@@ -141,7 +145,10 @@ impl WmfsFs {
     }
 
     pub(super) fn do_readdirplus(&self, fh: u64, offset: u64, mut reply: ReplyDirectoryPlus) {
-        let Some(d) = self.fc.dir(fh) else { return reply.error(Errno::EBADF) };
+        let d = match self.fc.dir(fh) {
+            Ok(d) => d,
+            Err(e) => return reply.error(errno(e)),
+        };
         for (i, e) in d.iter().enumerate().skip(offset as usize) {
             let Some(a) = e.attr.clone() else { continue };
             let (ttl, fa) = self.fattr(a);
@@ -189,6 +196,13 @@ impl WmfsFs {
         };
         self.xattr_reply(reply, size, v);
     }
+}
+
+/// 只读打开的句柄回 `FOPEN_NOFLUSH`（实现注记（M10）：只读句柄的 flush 本来就什么也不做；带着它，内核关闭只读 fd 时不发 FLUSH——
+/// 否则继承了这个 fd 的子进程（例如 shell 里 `exec 3< f` 之后跑的每个命令）退出时都要等挂载进程回复，挂载进程被冻住（SIGSTOP，
+/// 演示驱逐）时它们一个个卡在退出上。M12 的 POSIX 锁要在 flush 里释放时再看这一条。）
+pub(super) fn noflush(read_only: bool) -> FopenFlags {
+    if read_only { FopenFlags::FOPEN_NOFLUSH } else { FopenFlags::empty() }
 }
 
 pub(super) fn fopen(keep_cache: bool, direct: bool) -> FopenFlags {

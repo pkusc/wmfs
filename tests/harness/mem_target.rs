@@ -4,10 +4,12 @@
 //! 还在（真实磁盘上没写完的 pending 文件也可能留下一部分），启动清理（`clear_temp`）必须把它们扔掉。
 //! 另有制造损坏的工具：把已提交的文件截短（"rename 已持久、数据只落了一部分"，XFS 上掉电可能出现，3.2.5）、翻转任意比特，以及
 //! 在 `p/` 里放一个写了一半的 pending 文件。删除（R4）不落盘：掉电后被删的版本可能"复活"。另可让接下来几次 `commit_pending` 失败
-//! （EIO，pending 文件留着：像 rename 之前的 fdatasync 失败）。
+//! （EIO，pending 文件留着：像 rename 之前的 fdatasync 失败），或拦住下一次 `commit_pending`（像很慢的 fdatasync）直到测试放行：
+//! 在"正在提交"的那一刻读（ADR-0041 第 14、15 条的回归）。
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use wmfs_core::base::types::ChunkId;
 use wmfs_core::base::{ErrCode, lock};
@@ -21,9 +23,18 @@ struct State {
     fail_commits: u32, // 接下来这么多次 commit_pending 失败
 }
 
+/// 拦截点：拦住下一次 `commit_pending`（`only` 给了就只拦这个 chunk 的），直到 [`MemTargetStore::release`]。
+#[derive(Default)]
+struct Gate {
+    armed: Option<Option<ChunkId>>,
+    held: bool, // 有线程停在这里
+    open: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct MemTargetStore {
     st: Arc<Mutex<State>>,
+    gate: Arc<(Mutex<Gate>, Condvar)>,
 }
 
 /// 按 (偏移, 字节) 写进 `v`（不够长就补 0）。
@@ -45,7 +56,38 @@ impl MemTargetStore {
         let st = lock(&self.st);
         let (durable, pending) = (st.durable.clone(), st.pending.clone());
         let after = State { committed: durable.clone(), durable, pending, fail_commits: 0 };
-        MemTargetStore { st: Arc::new(Mutex::new(after)) }
+        MemTargetStore { st: Arc::new(Mutex::new(after)), gate: Arc::default() }
+    }
+
+    /// 拦住下一次 `commit_pending`（`only` 给了就只拦这个 chunk 的），直到 [`MemTargetStore::release`]。
+    pub fn hold_commit(&self, only: Option<ChunkId>) {
+        *lock(&self.gate.0) = Gate { armed: Some(only), held: false, open: false };
+    }
+
+    /// 等到有线程停在拦截点上（最多 `t`）。
+    pub fn wait_held(&self, t: Duration) -> bool {
+        let (m, cv) = &*self.gate;
+        let g = cv.wait_timeout_while(lock(m), t, |g| !g.held).unwrap_or_else(|e| e.into_inner()).0;
+        g.held
+    }
+
+    /// 放行停在拦截点上的线程。
+    pub fn release(&self) {
+        let (m, cv) = &*self.gate;
+        lock(m).open = true;
+        cv.notify_all();
+    }
+
+    fn pass(&self, id: &ChunkId) {
+        let (m, cv) = &*self.gate;
+        let mut g = lock(m);
+        if !g.armed.is_some_and(|only| only.is_none_or(|o| o == *id)) {
+            return;
+        }
+        (g.armed, g.held) = (None, true);
+        cv.notify_all();
+        g = cv.wait_while(g, |g| !g.open).unwrap_or_else(|e| e.into_inner());
+        g.held = false;
     }
 
     /// 让接下来 `n` 次 `commit_pending` 失败（EIO，pending 留着）。
@@ -140,6 +182,7 @@ impl TargetStore for MemTargetStore {
     }
 
     fn commit_pending(&self, id: &ChunkId, sync: bool) -> Result<(), ErrCode> {
+        self.pass(id);
         let mut st = lock(&self.st);
         if st.fail_commits > 0 {
             st.fail_commits -= 1;

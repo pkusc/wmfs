@@ -8,13 +8,15 @@
 //!   kind 2 记录），然后一个批次删 inode、XATTR、INLINE、LOCKS 与这条记录。"能不能删"（3.5.6 的三个条件）由 gc 任务判断——
 //!   leader 内存里的打开集合在 `sessions::Live`。实现注记（M5）：迁移中的 `pending_epoch`（M11）不在 inode 里记链，到时由迁移原语
 //!   自己的 GC 记录（kind 2）负责。
+//! - 实现注记（M10）：EVICTED 记录（0x1B）保留 24 h 之后删掉（[`expire_evicted`]，gc 每一遍扫完时；同批 `map_epoch += 1`：它在集群图里）。
 
 use crate::base::ErrCode;
 use crate::base::types::ReqCtx;
 use crate::meta::engine::txn::{KvScan, MetaEngine, OpCtx, TxnOp, txn_blocking};
-use crate::meta::schema::keys::{self, GC_EPOCH, GC_ORPHAN, T_GC, T_SESSION};
+use crate::meta::evict::EVICTED_KEEP_MS;
+use crate::meta::schema::keys::{self, GC_EPOCH, GC_ORPHAN, T_EVICTED, T_GC, T_SESSION};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::{F_ORPHAN, GcRecV1, InodeV1, SessionRecV1, decode_v1};
+use crate::meta::schema::records::{EvictedV1, F_ORPHAN, GcRecV1, InodeV1, SessionRecV1, decode_v1};
 use crate::meta::sessions::SESSION_ACTIVE;
 use crate::proto::cap::{self, CapV1, RIGHT_ADMIN};
 use crate::proto::meta::MetaReply;
@@ -134,4 +136,30 @@ pub fn finish_orphan(eng: &dyn MetaEngine, item: &GcItem) -> Result<(), ErrCode>
         Ok(MetaReply::Ok)
     });
     txn_blocking(eng, ReqCtx::internal(), op).map(|_| ())
+}
+
+/// 删掉驱逐已超过 24 h 的 EVICTED 记录（3.4.4 第 4 步）：先线性一致地读出它们，再一个批次点删（还是同一条才删），同批
+/// `map_epoch += 1`。返回删了几条。
+pub fn expire_evicted(eng: &dyn MetaEngine, now_ms: u64) -> Result<usize, ErrCode> {
+    let mut old = Vec::new();
+    eng.read(&ReqCtx::internal(), &mut |v, _c| {
+        let rows = kv::scan_tag(v, T_EVICTED)?;
+        let due = |b: &Vec<u8>| decode_v1::<EvictedV1>(b).is_ok_and(|e| e.evicted_ms + EVICTED_KEEP_MS < now_ms);
+        old = rows.into_iter().filter(|(_, b)| due(b)).collect();
+        Ok(MetaReply::Ok)
+    })?;
+    if old.is_empty() {
+        return Ok(0);
+    }
+    let n = old.len();
+    let op: TxnOp = Box::new(move |v, _c| {
+        for (k, b) in &old {
+            if v.get(k)?.as_ref() == Some(b) {
+                v.delete(k);
+            }
+        }
+        kv::bump_map_epoch(v)?;
+        Ok(MetaReply::Ok)
+    });
+    txn_blocking(eng, ReqCtx::internal(), op).map(|_| n)
 }

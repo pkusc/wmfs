@@ -188,10 +188,12 @@ fn sessions_heartbeats_and_dedup_over_rpc() {
     assert_eq!(s.svc.live().open_files(sid), vec![]);
     c.close();
     assert_eq!(raw(&s.ep, 1, head(sid, 3, 1000), mk("e")), Err(ErrCode::SESSION_EVICTED), "会话关闭之后");
-    assert!(matches!(
-        raw(&s.ep, 1, head(sid, 0, 1000), MetaOp::GetAttr { ino: ROOT_INO }),
-        Ok(MetaReply::Entry { .. })
-    ));
+    let get = MetaOp::GetAttr { ino: ROOT_INO };
+    assert_eq!(
+        raw(&s.ep, 1, head(sid, 0, 1000), get),
+        Err(ErrCode::SESSION_EVICTED),
+        "M10 起只读请求也核对会话（3.4.4）"
+    );
     let hb = MetaOp::SessionHeartbeat { opened: vec![], closed: vec![], full: None };
     assert_eq!(raw(&s.ep, 1, head(sid, 0, 1000), hb), Err(ErrCode::SESSION_EVICTED));
     let ops: Vec<&str> = (1..=4)

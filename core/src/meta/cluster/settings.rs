@@ -15,10 +15,11 @@ use crate::api::types::ClusterSettingsReply;
 use crate::base::ErrCode;
 use crate::base::units::{fmt_duration, fmt_size, parse_duration, parse_size};
 use crate::meta::changelog::{self, Change};
+use crate::meta::engine::EmbeddedEngine;
 use crate::meta::engine::txn::{KvTxn, OpCtx};
 use crate::meta::schema::keys::{self, G_SETTINGS, G_SETTINGS_PREV};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::ClusterSettingsV1;
+use crate::meta::schema::records::{ClusterSettingsV1, decode_v1};
 
 /// 全部参数名（输出顺序）。
 const NAMES: [&str; 7] =
@@ -96,6 +97,24 @@ pub fn max_each(a: &ClusterSettingsV1, b: &ClusterSettingsV1) -> ClusterSettings
         epoch_gc_grace_ms: a.epoch_gc_grace_ms.max(b.epoch_gc_grace_ms),
         bg_bytes_per_sec: a.bg_bytes_per_sec.max(b.bg_bytes_per_sec),
     }
+}
+
+/// 本节点已应用的 GLOBAL `settings_prev`（原始字节与解开的值；没有 → None）：链管理器与驱逐判定过期用 max(当前值, 它)
+/// （[`max_each`]），读不出来时调用方这一轮不做决定——绝不退回到调小之后的较短租约（ADR-0038 第 5 条）。
+pub fn prev_local(eng: &EmbeddedEngine) -> Result<Option<(Vec<u8>, ClusterSettingsV1)>, ErrCode> {
+    match eng.local_get(&keys::global(G_SETTINGS_PREV))? {
+        Some(b) => {
+            let p = decode_v1(&b)?;
+            Ok(Some((b, p)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// target 租约正在调小的过渡期（`prev` = settings_prev，其中的 target_lease 比现在的大；ADR-0040 第 13 条）：链管理器只移除、
+/// 不追加、不提升 Syncing 成员。
+pub fn target_lease_shrinking(prev: &ClusterSettingsV1, cur: &ClusterSettingsV1) -> bool {
+    prev.target_lease_ms > cur.target_lease_ms
 }
 
 /// 执行器闭包：改参数、`map_epoch += 1`、每项一条 changelog `ClusterSet`。实现注记（M9，ADR-0038 第 5 条）：调小了某个租约时，同一个

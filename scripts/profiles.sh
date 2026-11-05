@@ -7,8 +7,9 @@
 #     ② 再起一个同样的部署，在 wmfs-tools 容器里跑 fio verify、pjdfstest 子集、fsx（没有镜像 → SKIP，不算通过也不算失败）。
 #     M7 起冒烟里有目录属性的 set/get 与递归用量。
 #   nas-safe（M9 起的阶段版：3 节点、replicas=3）：① tests/profiles/nas_safe.rs（写入中依次 kill -9 每个节点、fsync 过的文件全部完好）；
-#     ② 再起一个 nas-safe 部署跑 Jepsen-lite（tests/it/jepsen_register.rs：寄存器在随机 kill / SIGSTOP 下线性一致），之后等链全部 Serving、
-#     跑不变式检查器（tests/it/replica_check.rs）。
+#     ② 再起一个 nas-safe 部署跑 Jepsen-lite（tests/it/jepsen_register.rs：寄存器在随机 kill / SIGSTOP 下线性一致；只跑这一个用例——
+#     那里另有一个 drain 用例，drain 撤销不了，只由 scripts/accept.d/m10.sh 最后跑），之后等链全部 Serving、跑不变式检查器
+#     （tests/it/replica_check.rs）。
 #   hpc-rdma：本机没有 RDMA 设备，显示 SKIP（不算通过，也不算失败）。
 # 输出：每项一行 ✓ / ✗ / SKIP，最后一行 "minimal PASS" 或 "minimal FAIL"。用开发集群的端口 19100/19180（要空闲），开发目录是临时的，
 # 结束时 wmfs dev down --purge（先卸载挂载、再停节点），不留挂载与进程。
@@ -66,12 +67,14 @@ nas-safe)
     WMFS_DEV_DIR="$pdir" wmfs dev down --purge >/dev/null 2>&1
     dev="$(mktemp -d "${TMPDIR:-/tmp}/wmfs-profile-dev-XXXX")"
     export WMFS_DEV_DIR="$dev"
+    JEPSEN=a_register_on_one_chunk_stays_linearizable_while_nodes_die_and_freeze
     if wmfs dev up --nodes 3 --profile nas-safe >/dev/null &&
-        timeout 600 cargo test --release -p wmfs-testkit --test jepsen_register -- --ignored --nocapture >"$LOG" 2>&1; then
+        timeout 600 cargo test --release -p wmfs-testkit --test jepsen_register "$JEPSEN" -- --exact --ignored --nocapture \
+            >"$LOG" 2>&1; then
         ok "Jepsen-lite：寄存器（单个 chunk）在随机 kill -9 / SIGSTOP 下线性一致"
     else
         tail -30 "$LOG"
-        bad "Jepsen-lite（cargo test -p wmfs-testkit --test jepsen_register -- --ignored）"
+        bad "Jepsen-lite（cargo test -p wmfs-testkit --test jepsen_register $JEPSEN -- --exact --ignored）"
     fi
     # 捣乱过后（节点回来、重同步期间寄存器一直在写）：链全部 Serving 之后所有副本一致
     if wmfs dev wait chains-serving --timeout 120 >"$LOG" 2>&1 &&

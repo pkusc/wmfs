@@ -19,7 +19,7 @@
 source "$ROOT/scripts/accept.d/m6.sh"
 
 accept_m8() {
-    check "开发集群的端口 19100/19180、19200/19280、19300/19380 都空闲（演示用的开发集群要先 wmfs dev down）" m8_ports_free
+    check "开发集群的端口 19100/19180、19200/19280、19300/19380 都空闲（演示用的开发集群要先 wmfs dev down）" dev_ports_free M8 3
     check "没有残留的 wmfs FUSE 挂载（有的话先 wmfs dev down --purge，或 fusermount3 -uz <挂载点>）" m6_no_mounts
     check "cargo build --release 成功且零警告" build_no_warnings
     check "第一步（ADR-0038 第 7 条）：读句柄碰上 layout 变化用 ReopenHandle{write:false}——属主 chmod 0200 之后照常读到新内容（chunk 与 inline）；非属主 chmod o-r 之后 EACCES" \
@@ -75,17 +75,6 @@ accept_m8() {
 m8_cleanup() {
     [ -n "${LOOP_PID:-}" ] && kill "$LOOP_PID" 2>/dev/null
     wmfs dev down >/dev/null 2>&1
-}
-
-m8_ports_free() {
-    local p
-    for p in 19100 19180 19200 19280 19300 19380; do
-        if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
-            echo "127.0.0.1:$p 已被占用：演示用的开发集群还在运行？请先 wmfs dev down，再跑 scripts/accept.sh M8"
-            return 1
-        fi
-    done
-    echo "19100/19180、19200/19280、19300/19380 都空闲"
 }
 
 m8_unit() {

@@ -50,8 +50,6 @@ fn values_are_validated_and_normalized() {
 fn keys_that_cannot_be_set_yet_are_rejected_explicitly() {
     assert_eq!(err("consistency=strong").0, ErrCode::EOPNOTSUPP, "strong 在 M12");
     for (text, code) in [
-        ("quota=10G,soft=8G", ErrCode::EOPNOTSUPP),
-        ("quota.ssd=1G", ErrCode::EOPNOTSUPP),
         ("chunk=1M,compress=zstd:3", ErrCode::EOPNOTSUPP),
         ("qos=r=100,w=10", ErrCode::EOPNOTSUPP),
         ("ec=4+2", ErrCode::EOPNOTSUPP),
@@ -60,11 +58,12 @@ fn keys_that_cannot_be_set_yet_are_rejected_explicitly() {
         assert_eq!(err(text).0, code, "{text}");
     }
     assert!(err("snapshot=on").1.contains("二期"));
-    assert!(err("quota=1G").1.contains("M10"));
+    assert!(err("trash=7d").1.contains("M12"));
     // 单独给出的键（wmfs unset）与 set 的说法相同
     assert_eq!(spec_of("chunk").map(|s| s.key).ok(), Some("chunk"));
-    let f = spec_of("quota.ssd").unwrap_err();
-    assert!(f.code == ErrCode::EOPNOTSUPP && f.msg.contains("M10"), "{f:?}");
+    let f = spec_of("compress").unwrap_err();
+    assert!(f.code == ErrCode::EOPNOTSUPP && f.msg.contains("M11"), "{f:?}");
+    assert_eq!(spec_of("quota.ssd").map(|s| s.key).ok(), Some("quota.*"), "M10：quota.<类> 按前缀匹配");
     assert_eq!(spec_of("ec").unwrap_err().code, ErrCode::EOPNOTSUPP);
     let f = spec_of("chunck").unwrap_err();
     assert_eq!((f.code, f.msg.as_str()), (ErrCode::EINVAL, "未知属性 chunck"));
@@ -93,4 +92,37 @@ fn plugin_manifests_must_name_known_attributes() {
     assert!(check_manifest_attrs("crc32c", &["checksum"]).is_ok());
     let e = check_manifest_attrs("x", &["chunck"]).unwrap_err();
     assert!(e.contains("chunck"), "{e}");
+}
+
+/// M10：配额与 acl.default（3.8、第 5 章）。
+#[test]
+fn quota_and_acl_default_are_split_parsed_and_shown() {
+    let p = split("quota=100M,soft=80M,grace=1m,files=1000,quantum=1M,replicas=2").unwrap();
+    assert_eq!(
+        (p[0].key.as_str(), p[0].norm.as_str()),
+        ("quota", "104857600,soft=83886080,grace=60000,files=1000,quantum=1048576")
+    );
+    assert_eq!((p[1].key.as_str(), p[1].spec.kind), ("replicas", AttrKind::Inherit), "子键之后照样能开始新属性");
+    assert_eq!((find("quota").unwrap().show)(&p[0].norm), "100M,soft=80M,grace=1m,files=1000,quantum=1M");
+    let c = split("quota.ssd=1G").unwrap();
+    assert_eq!((c[0].key.as_str(), c[0].spec.key, c[0].spec.kind), ("quota.ssd", "quota.*", AttrKind::Stacked));
+    assert_eq!(ok("quota=off")[0].1, "off");
+    for bad in [
+        "quota=0",
+        "quota=1G,soft=2G",
+        "quota=1G,grace=1d",
+        "quota=1G,quantum=512K",
+        "quota=1G,quantum=2G",
+        "quota=off,soft=1M",
+    ] {
+        assert_eq!(err(bad).0, ErrCode::EINVAL, "{bad}");
+    }
+    assert!(err("quota=1G,soft=1M,soft=2M").1.contains("两次"));
+    let a = split("acl.default=u::rwx,g::r-x,o::---,u:1001:rwx,m::rwx").unwrap();
+    assert_eq!(a[0].norm, "u::rwx,u:1001:rwx,g::r-x,m::rwx,o::---", "takes_rest：值里的逗号并进来，存规范的写法");
+    assert_eq!(err("acl.default=u::rwx").0, ErrCode::EINVAL);
+    assert!(
+        check_manifest_attrs("quota", &["quota", "quota.*"]).is_ok()
+            && check_manifest_attrs("posix-acl", &["acl.default"]).is_ok()
+    );
 }

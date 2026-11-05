@@ -33,8 +33,7 @@ accept_m6() {
         tests_at_least 6 --release -p wmfs-testkit --test client_files
     check "客户端 InodeState 的纯逻辑与读路径的块划分（chunk 小于 1 MiB 时块不跨 chunk）、inline 内容之后读 0" \
         tests_at_least 6 --release -p wmfs-core --lib client::
-    check "写回缓冲：区间合并、本地末尾与读自己的写（在途与脏区）、槽位上限按池算" \
-        tests_at_least 3 --release -p wmfs-core --lib client::writeback
+    check "写回缓冲：区间合并、本地末尾与读自己的写（在途与脏区）、槽位上限按池算" m6_writeback_unit
     check "cache-memory：manifest、键里带 change_id、LRU 淘汰、超大的块不放、invalidate_ino" \
         tests_at_least 4 --release -p wmfs-plugins --lib cache_memory::
     check "FUSE 适配层：错误码映射、作业 id、时间换算、虚拟 xattr 的判定" \
@@ -280,4 +279,10 @@ m6_after_down() {
     wmfs fs get /unclosed "$F/unclosed" || return 1
     python3 -c "import sys; d = open(sys.argv[1], 'rb').read(); print(len(d)); sys.exit(0 if d == b'u' * 1500000 else 1)" "$F/unclosed" || return 1
     wmfs dev down
+}
+
+# 写回缓冲的单元测试；槽位计数 M10 起在 client/slots.rs（为了 writeback.rs ≤ 400 行挪出去的）。
+m6_writeback_unit() {
+    tests_at_least 2 --release -p wmfs-core --lib client::writeback || return 1
+    one_test --release -p wmfs-core --lib client::slots::tests::slots_are_sixty_percent_of_the_m_and_l_slots
 }

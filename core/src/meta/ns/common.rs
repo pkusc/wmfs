@@ -4,22 +4,25 @@
 //!
 //! 现状：`AttrOut` 的 `consistency`、`ttl_ms` 按管辖目录（目录自己、文件的主父目录）的生效属性给出（[`governing`]）；新文件的
 //! layout 在 `ns/layout.rs`（`new_layout`/`set_new_layout`，这里原样转出）；递归计数 RSTAT 由各操作调 `meta/rstat.rs` 更新；
-//! `quota_end = u64::MAX`（配额在 M10）。`OpenOut.cap` 在闭包里签（[`sign_cap`]，有效期 `cap_ttl`）：权限位按这次打开的方式给
-//! （Open 按 O_ACCMODE；Create 新建的文件读写都给，打开已有的文件给写、能读才再给读；改了长度的 SetAttr 同后者）；`qos_id` 先填 0
-//! （qos 属性在 M13）。`OpenOut.inline`（文件的完整内容）只给能读这个文件的人：Open 按这次是否读打开，Create 打开已有的文件、
-//! 改了 size 的 SetAttr 按调用者有没有读权限（[`may_read`]）；不带时为 None，要内容就 GetInline。
+//! 写打开的 `quota_end` 由 `meta/quota.rs` 按配额算（M10；没有配额、只读打开 → `u64::MAX`）。`OpenOut.cap` 在闭包里签
+//! （[`sign_cap`]，有效期 `cap_ttl`）：权限位按这次打开的方式给（Open 按 O_ACCMODE；Create 新建的文件读写都给，打开已有的文件给写、
+//! 能读才再给读；改了长度的 SetAttr 同后者）；`qos_id` 先填 0（qos 属性在 M13）。`OpenOut.inline`（文件的完整内容）只给能读这个
+//! 文件的人：Open 按这次是否读打开，Create 打开已有的文件、改了 size 的 SetAttr 按调用者有没有读权限（[`may_read`]）；不带时为 None，
+//! 要内容就 GetInline。
 //!
 //! 历史注记：M4 时 `consistency`、`ttl_ms` 取内置默认值（cto、attr_ttl 1 s），RSTAT 与配额都还不碰（M7 已实现前两者：见
 //! `attrs.rs`、`rstat.rs`）；cap 与 inline 的规则是 M5 加的。
 
 use std::sync::Arc;
 
+use super::path_view::path_view;
 use crate::base::ErrCode;
 use crate::base::types::Principal;
 use crate::hooks::traits::{AuthzInput, AuthzOp, InodeView};
 use crate::meta::attrs::{CONSISTENCY_STRONG, EffectiveAttrs};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
 use crate::meta::ns::xattr::{ACL_ACCESS, get_xattr};
+use crate::meta::quota;
 use crate::meta::schema::keys::{self, G_NEXT_INO, GC_ORPHAN, ROOT_INO};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{
@@ -234,12 +237,13 @@ pub fn open_out(v: &dyn KvRead, c: &OpCtx, n: &Node, with_inline: bool, rights: 
     } else {
         None
     };
+    let quota_end = if rights & RIGHT_WRITE != 0 { quota::end(v, c, n)? } else { u64::MAX }; // 3.9 第 2 条（M10）
     Ok(OpenOut {
         attr: attr_out(v, c, n)?,
         layout: n.rec.layout.clone(),
         cap: sign_cap(c, n, rights, c.req.session),
         inline,
-        quota_end: u64::MAX,
+        quota_end,
         atime_due: false,
     })
 }
@@ -296,7 +300,8 @@ pub fn may_read(v: &dyn KvRead, c: &OpCtx, n: &Node) -> bool {
 }
 
 /// 调 authz 钩子（posix-mode → posix-acl → path-caps，3.7.2）。inode 带扩展 ACL 时把它的 `system.posix_acl_access`
-/// 一并交给插件。实现注记（M4）：`ancestors` 先给空（path-caps 在 M10，到时按 attr_epoch 缓存祖先链）。
+/// 一并交给插件。实现注记（M10）：调用者的 key 有路径限制时才算 `ancestors`（要看的对象——有父目录时是父目录，否则是目标——的祖先，
+/// 根 → 父，按 attr_epoch 缓存；只有 path-caps 用它，别的 key 给空）；路径遍历的放宽见 `ns/path_view.rs`。
 pub fn authz(
     v: &dyn KvRead,
     c: &OpCtx,
@@ -311,8 +316,10 @@ pub fn authz(
     };
     let (ta, pa, va) = (acl(target)?, acl(parent)?, acl(victim)?);
     let (t, p, w) = (view(target, &ta), view(parent, &pa), view(victim, &va));
+    let (ancestors, relaxed) = path_view(v, c, op, parent.or(target))?;
+    let who = relaxed.as_ref().unwrap_or(&c.req.who);
     let input =
-        AuthzInput { who: &c.req.who, op, target: t.as_ref(), parent: p.as_ref(), victim: w.as_ref(), ancestors: &[] };
+        AuthzInput { who, op, target: t.as_ref(), parent: p.as_ref(), victim: w.as_ref(), ancestors: &ancestors };
     c.pipeline.authz(&input)
 }
 

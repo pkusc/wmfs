@@ -52,6 +52,25 @@ pub fn why(mine: &PluginListV1, committed: Option<&PluginListV1>) -> String {
     }
 }
 
+/// 节点心跳拿到一张集群图之后，对它的插件清单做什么（[`on_map`]）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum MapCheck {
+    Keep,         // 什么也不做
+    AdoptDone,    // 一致了：逃生口用过了
+    Exit(String), // 不一致、又不在逃生口里：退出（差异）
+}
+
+/// 节点心跳拿到的集群图里的清单 `cluster` 与本地清单比对（3.7.2 第 3 条，`server.rs` 的 `on_map`）。一致时只有只做数据的节点
+/// （`data_only`：不在 raft 里）结束逃生口；元数据节点的逃生口只由 raft 线程按已应用的清单结束（ADR-0041 第 11 条：心跳可能先拿到
+/// 改好的清单，本节点的 raft 线程却还没应用那个批次——这时结束豁免，cluster-mgr 看到"还不一致、又不豁免"就以退出码 3 退出）。
+pub fn on_map(mine: &[String], cluster: &[String], data_only: bool, adopting: bool) -> MapCheck {
+    match diff(mine, cluster) {
+        None if data_only => MapCheck::AdoptDone,
+        Some(d) if !adopting => MapCheck::Exit(d),
+        _ => MapCheck::Keep,
+    }
+}
+
 /// 不一致：写一条错误日志（差异与修法），1 s 后以退出码 3 结束进程（3.7.2 第 3 条）。
 pub fn exit_mismatch(why: &str) -> ! {
     log::error(
@@ -136,5 +155,16 @@ mod tests {
         for bad in ["authz", "transport:tcp", "authz:", "authz:Deny", "meta_engine:embedded-kv"] {
             assert!(check_item(bad).is_err(), "{bad}");
         }
+    }
+
+    /// ADR-0041 第 11 条 ②：心跳拿到的清单与本地一致时，只有只做数据的节点结束逃生口（元数据节点等 raft 线程应用改清单的批次）。
+    #[test]
+    fn only_data_only_nodes_end_the_escape_hatch_from_a_map() {
+        let (a, b) = (vec!["authz:posix-mode".to_string()], vec!["qos:fifo".to_string()]);
+        assert_eq!(on_map(&a, &a, true, true), MapCheck::AdoptDone, "只做数据的节点");
+        assert_eq!(on_map(&a, &a, false, true), MapCheck::Keep, "元数据节点：由 raft 线程决定");
+        assert_eq!(on_map(&a, &b, false, true), MapCheck::Keep, "还在逃生口里：不退出");
+        assert!(matches!(on_map(&a, &b, true, false), MapCheck::Exit(d) if d.contains("缺少 qos:fifo")));
+        assert!(matches!(on_map(&a, &b, false, false), MapCheck::Exit(_)), "元数据节点不一致、不豁免：照样退出");
     }
 }

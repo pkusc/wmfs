@@ -1,0 +1,13 @@
+# path-caps 授权插件的 manifest（design.md 3.7.1、4.3）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "path-caps"
+version = "0.1.0"
+hooks = ["authz"]
+altitude = 250
+hot_path = true
+abi_version = 1
+attrs = []
+budget_ns = 2000
+fail_points = ["plugin.path-caps.authz"]
+
+[config_schema]
+# 没有部署参数：限制写在 key 的元数据里（复制状态 KEYMETA.path_caps，wmfs key create --path/--path-ro）

@@ -18,6 +18,8 @@
 use crate::base::units::{fmt_duration, fmt_size, parse_duration, parse_size};
 use crate::base::{ErrCode, Failed};
 use crate::data::format::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
+use crate::meta::ns::acl;
+use crate::meta::quota;
 
 /// Inherit：取最近的祖先值；Stacked：所有祖先同时生效（配额，M10）；Local：只作用于设置它的目录（inherit）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,8 +53,8 @@ impl Effect {
 
 /// 解析 + 规范化：(值, 子键) → 存进 DIRATTR 的形式；错误是给人看的原因。
 pub type ParseFn = fn(&str, &[(String, String)]) -> Result<String, String>;
-/// 切分时攒着的一个属性：(注册表项, 值, 子键)。
-type Item = (&'static AttrSpec, String, Vec<(String, String)>);
+/// 切分时攒着的一个属性：(注册表项, 键, 值, 子键)。
+type Item = (&'static AttrSpec, String, String, Vec<(String, String)>);
 
 /// 一个可设置的属性（Debug 只为测试里打印）。`parse(值, 子键)` → 规范化的存储形式（错误是给人看的中文原因，调用方映射成 `EINVAL`，0.2 第 5 条）。
 #[derive(Debug)]
@@ -77,8 +79,11 @@ const fn spec(
     AttrSpec { key, kind: AttrKind::Inherit, subkeys: &[], takes_rest: false, parse, show, effect, consumers }
 }
 
-/// 全部 M7 的键（顺序就是 `wmfs get` 的显示顺序）。
-pub static REGISTRY: [AttrSpec; 8] = [
+/// 配额的子键（3.8 的切分：跟在 `quota=…` 后面）。
+const QUOTA_SUBKEYS: &[&str] = &["soft", "grace", "files", "quantum"];
+
+/// 全部键（顺序就是 `wmfs get` 的显示顺序）：M7 的 8 个，M10 的 quota、`quota.<类>`（注册表里写成 `quota.*`，按前缀匹配）、acl.default。
+pub static REGISTRY: [AttrSpec; 11] = [
     spec(
         "class",
         parse_class,
@@ -96,12 +101,24 @@ pub static REGISTRY: [AttrSpec; 8] = [
         ..spec("consistency", parse_consistency, show_consistency, Effect::NewOpens, &["core"])
     },
     AttrSpec { kind: AttrKind::Local, ..spec("inherit", parse_inherit, show_as_is, Effect::Immediate, &["core"]) },
+    AttrSpec {
+        kind: AttrKind::Stacked,
+        subkeys: QUOTA_SUBKEYS,
+        ..spec("quota", quota::parse, quota::show, Effect::Immediate, &["quota"])
+    },
+    AttrSpec {
+        kind: AttrKind::Stacked,
+        subkeys: QUOTA_SUBKEYS,
+        ..spec("quota.*", quota::parse, quota::show, Effect::Immediate, &["quota"])
+    },
+    AttrSpec {
+        takes_rest: true,
+        ..spec("acl.default", parse_acl, show_as_is, Effect::NewFiles, &["core", "posix-acl"])
+    },
 ];
 
 /// 后面的里程碑才实现的键：设置 → `EOPNOTSUPP`（`quota.<类>` 按前缀 `quota.` 匹配）。
 pub const LATER: &[(&str, &str)] = &[
-    ("quota", "M10"),
-    ("acl.default", "M10"),
     ("compress", "M11"),
     ("encrypt", "M11"),
     ("trash", "M12"),
@@ -114,8 +131,10 @@ pub const LATER: &[(&str, &str)] = &[
 /// 二期功能的键（第 5 章）：设置 → `EOPNOTSUPP`"二期功能"。
 const PHASE2: &[&str] = &["ec", "snapshot"];
 
+/// 注册表里的键；`quota.<类>` 按前缀匹配 `quota.*`（实现注记（M10））。
 pub fn find(key: &str) -> Option<&'static AttrSpec> {
-    REGISTRY.iter().find(|s| s.key == key)
+    let prefixed = |s: &AttrSpec| s.key.strip_suffix('*').is_some_and(|p| key.len() > p.len() && key.starts_with(p));
+    REGISTRY.iter().find(|s| s.key == key || prefixed(s))
 }
 
 /// 还不能设置的已知键（后面的里程碑、二期功能）→ `EOPNOTSUPP` 与原因（写明在哪个里程碑）；别的键 → None。
@@ -138,10 +157,11 @@ pub fn spec_of(key: &str) -> Result<&'static AttrSpec, Failed> {
     }
 }
 
-/// 切分、解析好的一个属性：存进 DIRATTR 的规范化值。
+/// 切分、解析好的一个属性：存进 DIRATTR 的键（`quota.<类>` 是完整的键，不是注册表里的 `quota.*`）与规范化值。
 #[derive(Debug)]
 pub struct Parsed {
     pub spec: &'static AttrSpec,
+    pub key: String,
     pub norm: String,
 }
 
@@ -166,27 +186,27 @@ pub fn split(text: &str) -> Result<Vec<Parsed>, Failed> {
         // 顶层属性名：开始一个新属性
         if let Some(s) = find(k) {
             let Some(v) = v else { return Err(einval(format!("属性 {k} 没有给值（写成 {k}=…）"))) };
-            if items.iter().any(|(t, ..)| t.key == s.key) {
+            if items.iter().any(|(_, t, ..)| t == k) {
                 return Err(einval(format!("属性 {k} 写了两次（{k}={v}）")));
             }
-            items.push((s, v.to_string(), vec![]));
+            items.push((s, k.to_string(), v.to_string(), vec![]));
             continue;
         }
-        // 剩下的只可能是：当前属性的子键（consistency 后面的 attr_ttl），或者值里本身带逗号的属性的续接（takes_rest，
-        // M10 的 acl.default 才用）；都不是 → 未知属性
+        // 剩下的只可能是：当前属性的子键（consistency 后面的 attr_ttl、quota 后面的 soft 等），或者值里本身带逗号的属性的续接
+        // （takes_rest：acl.default）；都不是 → 未知属性
         match (items.last_mut(), v) {
-            (Some((cur, _, subs)), Some(v)) if cur.subkeys.contains(&k) => subs.push((k.into(), v.into())),
-            (Some((cur, val, _)), None) if cur.takes_rest => {
+            (Some((cur, _, _, subs)), Some(v)) if cur.subkeys.contains(&k) => subs.push((k.into(), v.into())),
+            (Some((cur, _, val, _)), None) if cur.takes_rest => {
                 val.push(',');
                 val.push_str(frag);
             }
             _ => return Err(einval(format!("未知属性 {k}"))),
         }
     }
-    items.into_iter().map(|(s, v, subs)| parse_one(s, &v, &subs)).collect()
+    items.into_iter().map(|(s, k, v, subs)| parse_one(s, k, &v, &subs)).collect()
 }
 
-fn parse_one(s: &'static AttrSpec, v: &str, subs: &[(String, String)]) -> Result<Parsed, Failed> {
+fn parse_one(s: &'static AttrSpec, key: String, v: &str, subs: &[(String, String)]) -> Result<Parsed, Failed> {
     if v.starts_with("wasm:") {
         return Err(Failed::new(ErrCode::FEATURE_UNSUPPORTED, format!("{}={v}：wasm: 策略是二期功能", s.key)));
     }
@@ -198,10 +218,10 @@ fn parse_one(s: &'static AttrSpec, v: &str, subs: &[(String, String)]) -> Result
     }
     let shown = || {
         let rest: Vec<String> = subs.iter().map(|(k, x)| format!(",{k}={x}")).collect();
-        format!("{}={v}{}", s.key, rest.concat())
+        format!("{key}={v}{}", rest.concat())
     };
     let norm = (s.parse)(v, subs).map_err(|m| einval(format!("{}：{m}", shown())))?;
-    Ok(Parsed { spec: s, norm })
+    Ok(Parsed { spec: s, key, norm })
 }
 
 /// 启动时的对账（3.8）：插件 manifest 的 `attrs` 里每个名字都得是认识的键（M7 的、后面里程碑的），否则多半是写错了。
@@ -282,6 +302,12 @@ fn parse_consistency(v: &str, subs: &[(String, String)]) -> Result<String, Strin
         }
         _ => Err("attr_ttl 写了两次".into()),
     }
+}
+
+/// `acl.default`：setfacl 的短文本（`u::rwx,g::r-x,o::---,u:1001:rwx,m::rwx`）→ 规范的写法（按 ACL 的顺序，`ns/acl.rs`）。
+fn parse_acl(v: &str, subs: &[(String, String)]) -> Result<String, String> {
+    no_subkeys(subs)?;
+    acl::parse_text(v).map(|a| acl::to_text(&a))
 }
 
 fn parse_inherit(v: &str, subs: &[(String, String)]) -> Result<String, String> {

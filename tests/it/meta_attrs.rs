@@ -97,8 +97,8 @@ fn validation_consumers_and_warnings() {
     assert_eq!(e.code, ErrCode::ENOENT, "没设置过的键");
     let e = ns.txn(&ROOT, |v, c| attr_ops::unset(v, c, "/proj", "chunck")).unwrap_err();
     assert_eq!((e.code, e.msg.as_str()), (ErrCode::EINVAL, "未知属性 chunck"));
-    let e = ns.txn(&ROOT, |v, c| attr_ops::unset(v, c, "/proj", "quota")).unwrap_err();
-    assert!(e.code == ErrCode::EOPNOTSUPP && e.msg.contains("M10"), "与 set 的说法相同：{e:?}");
+    let e = ns.txn(&ROOT, |v, c| attr_ops::unset(v, c, "/proj", "compress")).unwrap_err();
+    assert!(e.code == ErrCode::EOPNOTSUPP && e.msg.contains("M11"), "与 set 的说法相同：{e:?}");
     // 没有 label-match（placement）的管线：stripe 没有消费者，chunk（core）照常
     let mut set_ = PluginSet::new(&[]);
     set_.authz(Arc::new(PosixMode::new()));
@@ -203,15 +203,15 @@ fn status_reports_declared_and_actual_and_usage_reads_rstat() {
     let r = s.attrs.iter().find(|a| a.key == "replicas").unwrap();
     assert_eq!((r.declared.as_str(), r.actual.new_files.as_str(), r.mismatched), ("3", "1", true));
     assert!(s.attrs.iter().filter(|a| a.key != "replicas").all(|a| !a.mismatched), "{:?}", s.attrs);
-    assert_eq!(s.attrs.len(), 8, "每个已实现的属性都有声明与实际");
+    assert_eq!(s.attrs.len(), 11, "每个已实现的属性都有声明与实际（M10 加了 quota、quota.*、acl.default）");
     let f = ns.create(&OWNER, p, "f").unwrap();
     ns.op(&OWNER, MetaOp::Symlink { parent: p, name: b"l".to_vec(), target: b"f".to_vec() }).unwrap();
     ns.set_size(&OWNER, f, 5000).unwrap();
     ns.mkdir(&OWNER, p, "d").unwrap();
-    let u = ns.view(&ROOT, |v, c| attr_ops::usage(v, c, "/p")).unwrap();
+    let u = ns.view(&ROOT, |v, c| wmfs_core::meta::quota::usage(v, c, "/p")).unwrap();
     assert_eq!((u.bytes, u.files, u.dirs), (5000, 2, 1), "符号链接算文件、0 字节");
     assert_eq!(u.per_class.len(), 1);
     assert_eq!((u.per_class[0].class.as_str(), u.per_class[0].files), ("default", 1));
-    let e = ns.view(&ROOT, |v, c| attr_ops::usage(v, c, "/p/f")).unwrap_err();
+    let e = ns.view(&ROOT, |v, c| wmfs_core::meta::quota::usage(v, c, "/p/f")).unwrap_err();
     assert_eq!(e.code, ErrCode::ENOTDIR);
 }

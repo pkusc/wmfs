@@ -219,8 +219,10 @@ impl DataClient {
                         },
                         Err(e) => e,
                     };
-                    // 实现注记（M9）：读遇到连不上、超时、FENCED 的副本 → 马上换下一个 Serving 副本（8.3）；都试过了才退避重试
-                    let transient = matches!(code, ErrCode::ECONNRESET | ErrCode::ETIMEDOUT | ErrCode::FENCED);
+                    // 实现注记（M9）：读遇到连不上、超时、FENCED 的副本 → 马上换下一个 Serving 副本（8.3）；都试过了才退避重试。
+                    // 实现注记（M10）：BUSY 也换（刚被提升为 last serving 的成员一个租约内对读回 BUSY，ADR-0040 第 11 条；别的副本照常）
+                    let transient =
+                        matches!(code, ErrCode::ECONNRESET | ErrCode::ETIMEDOUT | ErrCode::FENCED | ErrCode::BUSY);
                     if transient && matches!(to, To::Read { .. }) && !down.contains(&target) {
                         down.push(target);
                         continue;

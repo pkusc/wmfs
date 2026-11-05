@@ -11,9 +11,9 @@
 //! 每一步都幂等（DeleteEpoch 删过的再删是 0 个文件；记录与 inode 的删除是带前提的批次），所以崩溃后从旧游标重放不会出错（3.10）。
 //! 实现注记（M9）：一条记录的 DeleteEpoch 失败（多链时某条链的成员暂时不可用）只跳过这一条（计入积压），下一轮再试；链此刻没有
 //! Serving 成员时不发请求、直接跳过（不然每条这样的记录都要等满数据面的总期限 30 s）。
-//! 实现注记（M5）：这是 gc 的 M5 部分；被驱逐/已关闭会话的去重记录、EVICTED 过期、changelog 修剪、数据节点上的本地孤儿扫描
-//! （`CheckEpochs`）在 M11 的完整版。指标 `wmfs_gc_epochs_deleted_total`、`wmfs_gc_orphans_deleted_total`；fail point
-//! `plugin.gc.bg_task`（本体包在每一步外层）。
+//! 实现注记（M5）：这是 gc 的 M5 部分；被驱逐/已关闭会话的去重记录、changelog 修剪、数据节点上的本地孤儿扫描（`CheckEpochs`）
+//! 在 M11 的完整版。实现注记（M10）：每一遍扫完时删掉超过 24 h 的 EVICTED 记录（`gc_meta::expire_evicted`）。
+//! 指标 `wmfs_gc_epochs_deleted_total`、`wmfs_gc_orphans_deleted_total`；fail point `plugin.gc.bg_task`（本体包在每一步外层）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,6 +135,9 @@ impl BgTask for Gc {
                 GC_EPOCH | GC_ORPHAN => backlog += 1, // 还没到期 / 可能还有人打开着：下一轮再看
                 _ => {}
             }
+        }
+        if !page.more {
+            items += gc_meta::expire_evicted(ctx.meta, ctx.now_ms)? as u64; // 一遍扫完：顺带删过期的 EVICTED 记录（M10）
         }
         let cursor = if page.more { page.items.last().map(|i| i.key.clone()).unwrap_or_default() } else { vec![] };
         Ok(StepResult { cursor, items, bytes: 0, backlog, pass_done: !page.more })

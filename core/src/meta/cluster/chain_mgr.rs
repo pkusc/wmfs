@@ -12,15 +12,17 @@
 //!   `wmfs_chain_members{chain,state}`（7.3）。只有就绪的 leader 报；不是（或不再是）就绪的 leader → 全部归零（换了 leader 旧值不留着）。
 //! - 转发失败的报告（3.4.2.10）只认报告者最近 FRESH_MS 内的心跳里的（它停了心跳，最后一次报告不能一直当作"持续"的证据），时长按
 //!   同一台机器的钟算（`chain_plan::FwdFailure`）。
+//! - 两步移出活着的成员（ADR-0041 第 13 条，`chain_plan::part`）：本 leader 第一次看到每个 Syncing 成员时的 (map_epoch, 时刻) 记在
+//!   这里，成员不再是 Syncing 就删；因转发失败已降级、等第二步的成员记在 `TargetUsage::parting`（[`sync_done`] 也要看）。换任期都清空。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use wmfs_api::metrics::{self, Gauge};
 
 use super::chain_plan::{self, FRESH_MS, Facts, Plan, sole};
 use super::chains::{SERVING, SYNCING, serving_count};
-use super::settings::max_each;
+use super::settings::{self, max_each, target_lease_shrinking};
 use super::targets::TargetUsage;
 use crate::base::types::ReqCtx;
 use crate::base::{ErrCode, Failed, clock, log};
@@ -29,7 +31,7 @@ use crate::meta::engine::EmbeddedEngine;
 use crate::meta::engine::txn::{KvTxn, MetaEngine, OpCtx, TxnOp, txn_blocking_exclusive};
 use crate::meta::schema::keys::{self, G_NEXT_CHAIN, G_SETTINGS_PREV};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::{ChainRecV1, ClusterSettingsV1, TargetRecV1, decode_v1};
+use crate::meta::schema::records::{ChainRecV1, ClusterSettingsV1, TargetRecV1};
 use crate::proto::meta::MetaReply;
 use crate::proto::peer::ClusterMap;
 
@@ -41,6 +43,7 @@ pub struct ChainMgr {
     prev_since: Option<((u64, u64), u64)>, // 第一次看到 settings_prev 时的 (当前的 target、会话租约) 与那一刻
     gauges: HashMap<(u32, u8), Arc<Gauge>>,
     changed: HashMap<u32, u64>, // 链 → 本 leader 最近一次改它的时刻：这之前（再加一个心跳周期）报上来的转发失败已经过时
+    syncing: HashMap<(u32, u32), (u64, u64)>, // (链, target) → 本 leader 第一次看到它是 Syncing 时的 (map_epoch, mono_ms)
 }
 
 /// 链改过之后多久之内收到的"转发不到后继"不算（数据节点拿到新集群图、清掉旧记录之后，下一次心跳才不再报它）。
@@ -60,15 +63,13 @@ impl ChainMgr {
         if role.term != self.term {
             (self.term, self.ready_since, self.prev_since) = (role.term, now, None);
             self.changed.clear();
+            self.syncing.clear();
+            usage.parting(|_| false, &[]);
         }
         let Ok(map) = eng.cluster_map() else { return };
         self.gauges(&map);
         // settings_prev 读不出来、解不开：这一轮什么也不做——绝不退回到调小之后的较短租约（ADR-0038 第 5 条）
-        let prev = match eng.local_get(&keys::global(G_SETTINGS_PREV)) {
-            Ok(b) => b.map(|b| decode_v1::<ClusterSettingsV1>(&b).map(|p| (b, p))).transpose(),
-            Err(e) => Err(e),
-        };
-        let prev = match prev {
+        let prev = match settings::prev_local(eng) {
             Ok(p) => p,
             Err(e) => return log::error("chain", format_args!("读 settings_prev 失败：{e}（这一轮链管理器不做决定）")),
         };
@@ -98,7 +99,26 @@ impl ChainMgr {
         for x in &mut failures {
             x.lasted_ms += now.saturating_sub(x.heard_ms); // 加上 leader 收到之后过去的时间（同一台机器的 mono_ms）
         }
-        let f = Facts { now_ms: clock::wall_ms(), settings, alive, failures, grace };
+        let shrinking = prev.as_ref().is_some_and(|(_, p)| target_lease_shrinking(p, &map.settings));
+        // 两步移出的第二步（见文件头）：第一次看到它是 Syncing 的 (map_epoch, 时刻)；记着要移出的只留还是 Syncing 的
+        let syncing: BTreeSet<(u32, u32)> = (map.chains.iter())
+            .flat_map(|(id, c)| c.members.iter().filter(|(_, s)| *s == SYNCING).map(move |(t, _)| (*id, *t)))
+            .collect();
+        self.syncing.retain(|k, _| syncing.contains(k));
+        for k in &syncing {
+            self.syncing.entry(*k).or_insert((map.map_epoch, now));
+        }
+        let f = Facts {
+            now_ms: clock::wall_ms(),
+            settings,
+            alive,
+            failures,
+            grace,
+            target_lease_shrinking: shrinking,
+            syncing: self.syncing.iter().map(|(k, (e, at))| (*k, (*e, now - at))).collect(),
+            epoch_seen: usage.epochs_seen(role.term),
+            parting: usage.parting(|k| syncing.contains(k), &[]),
+        };
         let plan = chain_plan::plan(&map, &f);
         if plan.is_empty() {
             return;
@@ -113,8 +133,12 @@ impl ChainMgr {
             ),
         );
         let ids: Vec<u32> = plan.chains.iter().map(|(id, _)| *id).collect();
+        let parting = plan.parting.clone();
         match apply(eng, &map, plan) {
-            Ok(()) => self.changed.extend(ids.into_iter().map(|id| (id, now))),
+            Ok(()) => {
+                self.changed.extend(ids.into_iter().map(|id| (id, now)));
+                usage.parting(|_| true, &parting); // 降级之后前驱多半换了、失败报告就没了：记住它，下一轮照样做第二步
+            }
             Err(ErrCode::RETRY) => {}
             Err(e) => log::warn("chain", format_args!("链管理器的批次没有提交：{e}（下一轮重新算）")),
         }
@@ -202,9 +226,24 @@ fn drop_prev(eng: &EmbeddedEngine, bytes: Vec<u8>) {
 }
 
 /// `NodeOp::SyncDone`（3.4.2.8 第 4 步）：链版本没变、`target` 紧跟最后一个 Serving 成员 → 变 Serving（`ver += 1`）；否则 `RETRY`
-/// （Syncing 成员重跑同步）。
-pub fn sync_done(eng: &dyn MetaEngine, ctx: &ReqCtx, target: u32, chain: u32, chain_ver: u64) -> Result<(), ErrCode> {
-    let op: TxnOp = Box::new(move |v, _c| {
+/// （Syncing 成员重跑同步）。调小 target 租约的过渡期里（ADR-0040 第 13 条，见 `chain_plan::Facts`）不提升，也回 `RETRY`；正在移出的
+/// 成员（drain、只读、`usage` 里记着要移出的）也回 `RETRY`：降级期间不再被提升回 Serving（ADR-0041 第 13 条）。
+pub fn sync_done(
+    eng: &dyn MetaEngine,
+    ctx: &ReqCtx,
+    usage: &TargetUsage,
+    target: u32,
+    chain: u32,
+    chain_ver: u64,
+) -> Result<(), ErrCode> {
+    if usage.parting(|_| true, &[]).contains(&(chain, target)) {
+        return Err(ErrCode::RETRY);
+    }
+    let op: TxnOp = Box::new(move |v, oc| {
+        let prev: Option<ClusterSettingsV1> = kv::get(v, &keys::global(G_SETTINGS_PREV))?;
+        if prev.is_some_and(|p| target_lease_shrinking(&p, oc.settings)) || chain_plan::target_leaving(oc.map, target) {
+            return Err(ErrCode::RETRY);
+        }
         let mut c: ChainRecV1 = kv::get(v, &keys::chain(chain))?.ok_or(ErrCode::RETRY)?;
         if !chain_plan::promote(&mut c, target, chain_ver) {
             return Err(ErrCode::RETRY);

@@ -2,7 +2,8 @@
 //! mem 传输互连，集群图由测试直接下发（不需要元数据服务；链的变化由测试按链管理器的规则——`chain_plan` 的函数——算出来）。target
 //! 是内存版的 [`MemTargetStore`]（可以模拟掉电）。没有 hb 线程，所以不核对 I5 的租约与 boot_id（3.4.2.2；要测 I5 的用例自己打开
 //! `lease.enforce`，集群图里 target 的 boot_id 用 [`Craq::set_boot`] 给）；转发的期限、chain-timer 的 3 s 与生产代码相同。集群图里的
-//! `target_lease` 是 1 s：新的 Syncing 成员第一轮同步之前等 0.8 × target_lease（sync.rs），组件测试里不必等 6.4 s。
+//! `target_lease` 是 1 s：新的 Syncing 成员第一轮同步之前等一个 target_lease（sync.rs，M10 起：ADR-0040 第 12 条），组件测试里不必等 8 s；
+//! 刚从 Syncing 被提升为 last serving 的成员也只在 1 s 内对读回 BUSY（ADR-0040 第 11 条）。
 //!
 //! "重启"一个节点 = 让旧的数据服务看到一张没有任何链的集群图（它放弃全部 pending、之后什么也不服务），在掉电之后的存储上起一个新的
 //! 数据服务（新的 mem 地址），集群图里这个节点的地址换成新的。

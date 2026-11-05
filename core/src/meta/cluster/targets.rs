@@ -11,8 +11,10 @@
 //! 来自各 Up target 最近一次心跳的容量与已用之和，inode 数不设上限（`files = ffree = 2^32 − 1`），`namelen` 255。
 //! 实现注记（M9）：`boot_id` 的变化不在这里写——它要与链管理器的降级（或唯一幸存者的 incarnation + 1）在同一个批次里生效，否则集群图里
 //! 先出现新 boot_id、重启过的成员却还是 Serving，它就会带着丢掉的 pending 服务读（R6）。
+//! 实现注记（M10 审查）：链管理器"因转发失败已降级、等第二步移出"的成员（ADR-0041 第 13 条）也记在这里（[`TargetUsage::parting`]）：
+//! 链管理器在 cluster-mgr 线程上写，`SyncDone` 在 meta-read 线程上看（不再提升它们）；这个结构本来就是两边共用的 leader 内存。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use crate::base::types::ReqCtx;
@@ -32,12 +34,13 @@ const BSIZE: u64 = 4096;
 const FILES: u64 = u32::MAX as u64;
 const NAMELEN: u32 = 255;
 
-/// 一个 target 最近一次心跳（mono_ms、boot_id、记下时的 term）与它报的容量、已用。
+/// 一个 target 最近一次心跳（mono_ms、boot_id、记下时的 term）、它报的容量与已用、节点报的 `map_epoch_seen`（M10 的驱逐看它）。
 struct Beat {
     at_ms: u64,
     boot: u64,
     term: u64,
     stat: StoreStat,
+    map_epoch_seen: u64,
 }
 
 /// leader 内存里的心跳情况（见文件头）。
@@ -45,6 +48,7 @@ struct Beat {
 pub struct TargetUsage {
     m: Mutex<HashMap<u32, Beat>>,
     fails: Mutex<HashMap<u32, Vec<FwdFailure>>>, // 节点 → 它最近一次心跳里报的持续转发失败
+    parting: Mutex<BTreeSet<(u32, u32)>>,        // 链管理器记着要移出的 (链, target)（见文件头）
 }
 
 impl TargetUsage {
@@ -53,7 +57,7 @@ impl TargetUsage {
         let (mut m, at_ms) = (lock(&self.m), clock::mono_ms());
         for r in hb.targets.iter().filter(|r| mine.contains(&r.target)) {
             let stat = StoreStat { capacity: r.capacity, used: r.used };
-            m.insert(r.target, Beat { at_ms, boot: hb.boot_id, term, stat });
+            m.insert(r.target, Beat { at_ms, boot: hb.boot_id, term, stat, map_epoch_seen: hb.map_epoch_seen });
         }
         let f = |&(chain, down, since): &(u32, u32, u64)| FwdFailure {
             node: hb.node,
@@ -87,9 +91,31 @@ impl TargetUsage {
         m.get(&t).filter(|b| b.term == term && now_ms.saturating_sub(b.at_ms) <= FRESH_MS).map(|b| b.boot)
     }
 
+    /// 驱逐第二阶段的等待条件（3.4.4 第 2 步，`meta/evict.rs`）：target `t` 在本任期的心跳里报过 `map_epoch_seen ≥ epoch`，或已超过
+    /// `lease_ms` 没有心跳——计时从本任期最近一次心跳与就绪时刻 `since_ms` 中较晚的那个算起（换了 leader：当作就绪那一刻刚听到过）。
+    pub fn caught_up(&self, t: u32, term: u64, epoch: u64, now_ms: u64, since_ms: u64, lease_ms: u64) -> bool {
+        let m = lock(&self.m);
+        let b = m.get(&t).filter(|b| b.term == term);
+        let quiet_since = b.map_or(0, |b| b.at_ms).max(since_ms); // 本任期最近一次心跳与就绪时刻中较晚的那个
+        b.is_some_and(|b| b.map_epoch_seen >= epoch) || now_ms.saturating_sub(quiet_since) > lease_ms
+    }
+
     /// 各节点最近一次心跳里报的持续转发失败。
     pub fn failures(&self) -> Vec<FwdFailure> {
         lock(&self.fails).values().flatten().copied().collect()
+    }
+
+    /// 本任期心跳里各 target 报的 `map_epoch_seen`（链管理器两步移出的第二步，ADR-0041 第 13 条）。
+    pub fn epochs_seen(&self, term: u64) -> HashMap<u32, u64> {
+        lock(&self.m).iter().filter(|(_, b)| b.term == term).map(|(t, b)| (*t, b.map_epoch_seen)).collect()
+    }
+
+    /// 链管理器记着要移出的 (链, target)（见文件头）：先只留 `keep` 的、再加上 `add`，返回现在的集合。
+    pub fn parting(&self, keep: impl Fn(&(u32, u32)) -> bool, add: &[(u32, u32)]) -> BTreeSet<(u32, u32)> {
+        let mut p = lock(&self.parting);
+        p.retain(|k| keep(k));
+        p.extend(add.iter().copied());
+        p.clone()
     }
 }
 

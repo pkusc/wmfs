@@ -120,6 +120,7 @@ pub fn run(a: FsArgs) -> i32 {
         Err((code, e)) => return setup_failed(a.json, code, e),
     };
     let client = Arc::new(client);
+    client.start_heartbeat(); // 命令跑得比会话租约久（例如大文件的 put/get）也不被驱逐（M10）
     let dc = DataClient::for_meta(rpc, client.clone(), OPTS.rpc_timeout, OPTS.op_timeout);
     let res = exec(&client, &dc, &who, umask, &a.cmd);
     client.close();

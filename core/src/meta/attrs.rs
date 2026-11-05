@@ -21,6 +21,8 @@ use crate::base::{ErrCode, lock};
 use crate::data::format::{CK_BLAKE3, CK_CRC32C, CK_XXH3, CMP_NONE};
 use crate::meta::attr_registry::{self, AttrKind, attr_ttl_ms};
 use crate::meta::engine::txn::{KvRead, KvTxn};
+use crate::meta::ns::acl;
+use crate::meta::quota;
 use crate::meta::schema::keys::{self, G_ATTR_EPOCH, G_NEXT_RECONCILE, ROOT_INO};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{AttrMapV1, ClassIdV1, InodeV1, ReconcileItemV1, StorageClassV1};
@@ -34,7 +36,7 @@ pub const DEFAULT_ATTR_TTL_MS: u32 = 1000;
 pub const CONSISTENCY_CTO: u8 = 1;
 pub const CONSISTENCY_STRONG: u8 = 2;
 /// 沿 parent 指针走的步数上限：只防损坏的 parent 指针让遍历不停（实现注记（M7）：规格没有目录深度的限制，所以取得远比真实的
-/// 目录树深；祖先链、`attr_ops::path_of`、`rstat::check` 共用它）。
+/// 目录树深；祖先链、`ns::read_ops::path_of`、`rstat::check` 共用它）。
 pub const MAX_DEPTH: usize = 1 << 16;
 /// 缓存的大小上限（单位：生效属性每项算 1、祖先链按它的长度算）；超过就整个清空（只是缓存）。
 const CACHE_MAX: usize = 1 << 17;
@@ -202,25 +204,49 @@ pub fn queue_reconcile(v: &mut dyn KvTxn, dir: u64, reason: u8) -> Result<(), Er
     Ok(())
 }
 
-/// 不经缓存算一遍 `chain`（dir → … → 根）的生效属性（见文件头）。
+/// 不经缓存算一遍 `chain`（dir → … → 根）的生效属性（见文件头）。实现注记（M10）：Stacked 的配额键收齐整条链（`inherit=false` 挡不住，
+/// 近的在前；`quota.<类>` 的类已经不在了 → 它管不着任何文件，跳过）。
 fn compute(v: &dyn KvRead, chain: &[u64]) -> Result<EffectiveAttrs, ErrCode> {
-    let mut got: Vec<(&'static str, String, u64)> = Vec::new();
+    let mut got: Vec<(&'static str, String, u64)> = Vec::new(); // (键, 值, 来自哪个目录)
+    let mut stacked: Vec<(u64, QuotaDecl)> = Vec::new();
+    let mut inherit = true;
     for &d in chain {
         let Some(m) = kv::get::<AttrMapV1>(v, &keys::dirattr(d))? else { continue };
         for (k, val) in &m.entries {
-            let Some(s) = attr_registry::find(k).filter(|s| s.kind == AttrKind::Inherit) else { continue };
-            if !got.iter().any(|(g, ..)| *g == s.key) {
-                got.push((s.key, val.clone(), d));
+            match attr_registry::find(k).map(|s| (s.kind, s.key)) {
+                Some((AttrKind::Inherit, key)) if inherit && !got.iter().any(|(g, ..)| *g == key) => {
+                    got.push((key, val.clone(), d));
+                }
+                Some((AttrKind::Stacked, _)) => {
+                    let class = match k.strip_prefix("quota.") {
+                        Some(name) => match kv::get::<ClassIdV1>(v, &keys::class_name(name))? {
+                            Some(c) => Some(c.id),
+                            None => continue,
+                        },
+                        None => None,
+                    };
+                    stacked.extend(quota::decl(val, class).map(|q| (d, q)));
+                }
+                _ => {}
             }
         }
         if m.entries.get("inherit").is_some_and(|x| x == "false") {
-            break; // 它自己的值已经收了，不再向上取 Inherit 键
+            inherit = false; // 它自己的值已经收了，不再向上取 Inherit 键（配额照样往上收）
         }
     }
     let class = got.iter().find(|(k, ..)| *k == "class").map_or(DEFAULT_CLASS, |(_, v, _)| v.as_str());
     let id = kv::get::<ClassIdV1>(v, &keys::class_name(class))?.ok_or(ErrCode::INTERNAL)?.id;
     let rec = kv::get::<StorageClassV1>(v, &keys::class(id))?.ok_or(ErrCode::INTERNAL)?;
     let mut eff = EffectiveAttrs::defaults(id, rec.replica);
+    for (k, d) in [
+        ("quota", stacked.iter().find(|(_, q)| q.class.is_none())),
+        ("quota.*", stacked.iter().find(|(_, q)| q.class.is_some())),
+    ] {
+        if let Some((d, _)) = d {
+            eff.sources.push((k, *d)); // 最近的那个（wmfs get 的来源）
+        }
+    }
+    eff.quotas = stacked;
     for (k, val, d) in got {
         set_typed_field(&mut eff, k, &val).ok_or(ErrCode::INTERNAL)?; // DIRATTR 里存的是规范化过的值：解不开 = 状态损坏
         eff.sources.push((k, d));
@@ -237,6 +263,7 @@ fn set_typed_field(eff: &mut EffectiveAttrs, key: &str, v: &str) -> Option<()> {
         "stripe" => eff.stripe = v.parse().ok()?,
         "inline" => eff.inline_max = v.parse().ok()?,
         "checksum" => eff.checksum = checksum_id(v)?,
+        "acl.default" => eff.acl_default = Some(acl::encode(&acl::parse_text(v).ok()?)),
         "consistency" => {
             eff.consistency = CONSISTENCY_CTO; // strong 在 M12
             eff.attr_ttl_ms = attr_ttl_ms(v).map_or(Some(DEFAULT_ATTR_TTL_MS), |ms| u32::try_from(ms).ok())?;

@@ -10,7 +10,8 @@
 //!
 //! 实现注记（M4）：`SessionClose` 也用 seq 0（与 SessionOpen 一样不进去重表）：它本身就幂等（会话已经不在 → 照常回 Ok），
 //! 而带 seq 的重试会因为"会话已经关闭"拿到 `SESSION_EVICTED`。正在被驱逐的会话（Evicting）收到 SessionClose 只回 Ok、
-//! 不删记录——驱逐的两个阶段（M10）自己走完。会话租约到期的驱逐（cluster-mgr）在 M10。
+//! 不删记录——驱逐的两个阶段自己走完（M10，`meta/evict.rs`：租约到期、两阶段）。实现注记（M10）：已撤销的 key 不能再打开会话
+//! （`EACCES`；撤销时它的会话一并驱逐，`mgmt/keys.rs`）。
 //! 会话绑定打开它的 key（`SessionRecV1.key_id`）：session id 在线上是明文，别的 key 拿着它发修改、心跳、关闭或重新打开
 //! 一律 `EACCES`（[`usable`]），否则别人能抢先用它的 seq 污染去重表，或者替它关掉会话。
 //! 实现注记（M5）：签给客户端的 cap 带着会话号（被驱逐会话的 cap 由数据节点拒绝，ADR-0023 第 4 条），所以只读路径上签 cap 之前
@@ -25,11 +26,12 @@ use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
 use crate::meta::schema::keys;
 use crate::meta::schema::kv;
-use crate::meta::schema::records::SessionRecV1;
+use crate::meta::schema::records::{KeyMetaV1, SessionRecV1};
 use crate::proto::meta::MetaReply;
 
-/// 会话状态（`SessionRecV1.state`）：1 Active，2 Evicting（驱逐第一阶段已完成）。
+/// 会话状态（`SessionRecV1.state`）：1 Active，2 Evicting（驱逐第一阶段已完成，`meta/evict.rs`）。
 pub const SESSION_ACTIVE: u8 = 1;
+pub const SESSION_EVICTING: u8 = 2;
 
 /// 会话存在且是 Active。驱逐是单调的事实：Evicting 或已删除的会话的任何请求都回 `SESSION_EVICTED`。执行器的 run_one 与
 /// 心跳用同时核对 key 的 [`usable`]（3.4.1.4 的注记）。
@@ -76,6 +78,9 @@ pub fn open(v: &mut dyn KvTxn, c: &OpCtx, info: OpenInfo) -> Result<MetaReply, E
         return Err(ErrCode::SESSION_EVICTED);
     }
     let id = &c.req.who.conn;
+    if kv::get::<KeyMetaV1>(v, &keys::keymeta(id.key_id))?.is_some_and(|k| k.revoked) {
+        return Err(ErrCode::EACCES); // 已撤销的 key（M10）：已建立的连接也不能再开会话
+    }
     match kv::get::<SessionRecV1>(v, &keys::session(sid))? {
         Some(s) if s.key_id != id.key_id => return Err(ErrCode::EACCES), // 别的 key 打开的会话
         Some(s) if s.state == SESSION_ACTIVE => {}                       // 重试：已经打开过
@@ -173,7 +178,12 @@ impl Live {
         }
     }
 
-    /// SessionClose 之后：删掉它的内存状态。
+    /// 本任期里最近一次收到它的心跳（或它新开）的时刻（mono_ms）；本任期还没有 → None（驱逐按就绪时刻计时，`meta/evict.rs`）。
+    pub fn last_seen(&self, session: u64, term: u64) -> Option<u64> {
+        lock(&self.m).get(&session).filter(|s| s.term == term).map(|s| s.last_seen_ms)
+    }
+
+    /// SessionClose 或驱逐之后：删掉它的内存状态。
     pub fn forget(&self, session: u64) {
         lock(&self.m).remove(&session);
     }

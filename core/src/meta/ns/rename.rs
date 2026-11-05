@@ -8,9 +8,12 @@
 //! 类型要匹配（目录 ← 非目录 `ENOTDIR`、非目录 ← 目录 `EISDIR`），目标目录必须为空（`ENOTEMPTY`）→ 改目录项、被移动 inode 的
 //! 链接（主链接或 extra_links）、两个父目录的 size/nlink/mtime/ctime/change_id → 被覆盖的目标：目录直接删掉，文件 nlink − 1、
 //! 归零即孤儿 → changelog。
-//! 实现注记（M4）：跨配额域的检查（M10）、回收站（M12）随各自的里程碑加入。实现注记（M7）：递归计数的搬移——换了目录的主链接
-//! （目录、或文件的主链接）把它的那一份计数从旧祖先链搬到新祖先链，到最近公共祖先为止；被覆盖的目标按 unlink / rmdir 扣；
-//! 涉及目录的 rename 令 `attr_epoch += 1` 并写 `RECONCILE_Q(dir, 2)`（同一个目录里改名也算：3.8"任何目录 rename"；协调器在 M11）。
+//! 实现注记（M4）：回收站（M12）随它的里程碑加入。实现注记（M7）：递归计数的搬移——换了目录的主链接（目录、或文件的主链接）把它的
+//! 那一份计数从旧祖先链搬到新祖先链，到最近公共祖先为止；被覆盖的目标按 unlink / rmdir 扣；涉及目录的 rename 令 `attr_epoch += 1`
+//! 并写 `RECONCILE_Q(dir, 2)`（同一个目录里改名也算：3.8"任何目录 rename"；协调器在 M11）。实现注记（M10）：跨配额域的检查——换了
+//! 目录的那一份计数先在新祖先链一侧过配额（`quota::admit_move`）；M10 审查：被覆盖的目标先扣掉再查（否则装得下的覆盖也被误拒），
+//! RENAME_EXCHANGE 按两份计数对调之后的净增量查；有多个链接的非目录把一个链接搬进配额范围不同的目录 → `EXDEV`（对调的两边各看
+//! 各的，[`links_stay`]，ADR-0041 第 1 条）。
 
 use super::common::{
     Node, authz, bump_ctime, check_name, child, link_dentry, relink, save, searchable_dir, update_dir,
@@ -21,6 +24,7 @@ use crate::hooks::traits::AuthzOp;
 use crate::meta::attrs::{bump_attr_epoch, queue_reconcile};
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
+use crate::meta::quota;
 use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys;
 use crate::proto::meta::{MetaReply, RENAME_EXCHANGE, RENAME_NOREPLACE};
@@ -33,6 +37,12 @@ fn inside(v: &dyn KvRead, c: &OpCtx, dir: u64, anc: u64) -> Result<bool, ErrCode
 /// 这个目录项 (parent, name) 是不是 `n` 的主链接（递归计数归属于它，3.9）：目录只有一个链接；文件看记录里的 parent/name。
 fn primary(n: &Node, parent: u64, name: &[u8]) -> bool {
     n.is_dir() || (n.rec.parent == parent && n.rec.name == name)
+}
+
+/// 有多个链接的非目录不能把一个链接搬进配额范围不同的目录 `to`（`quota::same_range` → `EXDEV`，ADR-0041 第 1 条；mv 会改成复制
+/// 再删除）。只有一个链接的照旧可以跨范围 rename（新祖先链一侧精确检查）。
+fn links_stay(v: &dyn KvRead, c: &OpCtx, n: &Node, to: u64) -> Result<(), ErrCode> {
+    if n.is_dir() || n.rec.nlink <= 1 { Ok(()) } else { quota::same_range(v, c, n, to) }
 }
 
 /// 换了父目录的目录：要能写它自己（更新它的 ..），在 RenameTo 里作为 target 交给 authz 插件。
@@ -97,7 +107,7 @@ pub fn rename(
     let to = if across { Some(searchable_dir(v, c, new_parent)?) } else { None };
     let ps = Parents { from, to };
     let mut src = child(v, parent, name)?.ok_or(ErrCode::ENOENT)?;
-    let victim = child(v, new_parent, new_name)?; // 目标名字现在指向的 inode（要被覆盖或对调的）
+    let mut victim = child(v, new_parent, new_name)?; // 目标名字现在指向的 inode（要被覆盖或对调的）
     authz(v, c, AuthzOp::RenameFrom, None, Some(&ps.from), Some(&src))?;
     authz(v, c, AuthzOp::RenameTo, dir_changing_parent(across, &src), Some(ps.to()), victim.as_ref())?;
     if src.is_dir() && across && inside(v, c, new_parent, src.ino)? {
@@ -125,27 +135,36 @@ pub fn rename(
             _ => {}
         }
     }
+    if across {
+        links_stay(v, c, &src, new_parent)?;
+    }
     let moving = if across && primary(&src, parent, name) { Some(Delta::of(v, &src)?) } else { None };
     v.delete(&keys::dentry(parent, name));
     link_dentry(v, new_parent, new_name, &src);
     relink(&mut src, (parent, name), (new_parent, new_name));
     bump_ctime(&mut src, c);
     save(v, &src);
+    // 被覆盖的目标先从计数里扣掉（目录：空的，dirs − 1；文件：按 unlink），跨 scope 的检查才看得到覆盖之后的用量（M10 审查）
+    match victim.as_mut() {
+        Some(d) if d.is_dir() => {
+            let gone = Delta::of(v, d)?.neg();
+            rstat::apply(v, c, new_parent, &gone)?;
+        }
+        Some(d) => unlink_file(v, c, d, new_parent, new_name)?,
+        None => {}
+    }
     if let Some(d) = &moving {
+        quota::admit_move(v, c, parent, new_parent, d)?; // 跨 scope：新祖先链一侧先过配额（3.9，M10）
         rstat::transfer(v, c, parent, new_parent, d)?; // 计数从旧祖先链搬到新祖先链（到最近公共祖先为止，3.9）
     }
     // 父目录的增量 (size, nlink)：源父少一项；目标父多一项（覆盖了目标就抵掉）；目录换了父目录，它的 .. 跟着走
     let dir_moves = (across && src.is_dir()) as i64;
     let (mut dsize, mut dnlink) = (1, dir_moves);
-    if let Some(mut d) = victim {
+    if let Some(d) = &victim {
         dsize -= 1;
         if d.is_dir() {
             dnlink -= 1;
-            let gone = Delta::of(v, &d)?.neg();
-            rstat::apply(v, c, new_parent, &gone)?;
-            delete_dir_records(v, d.ino)?;
-        } else {
-            unlink_file(v, c, &mut d, new_parent, new_name)?;
+            delete_dir_records(v, d.ino)?; // 有 DIRATTR 时 attr_epoch += 1：之后不再解析属性（attrs.rs）
         }
     }
     ps.apply(v, c, (-1, -dir_moves), (dsize, dnlink));
@@ -175,6 +194,10 @@ fn exchange(v: &mut dyn KvTxn, c: &OpCtx, ps: Parents, mut a: Side, mut b: Side)
     if across && b.node.is_dir() && inside(v, c, a.parent, b.node.ino)? {
         return Err(ErrCode::EINVAL); // b 会被移进它自己的子树
     }
+    if across {
+        links_stay(v, c, &a.node, b.parent)?;
+        links_stay(v, c, &b.node, a.parent)?;
+    }
     let share = |n: &Node, p: u64, nm: &[u8]| -> Result<Option<Delta>, ErrCode> {
         if across && primary(n, p, nm) { Delta::of(v, n).map(Some) } else { Ok(None) }
     };
@@ -189,6 +212,12 @@ fn exchange(v: &mut dyn KvTxn, c: &OpCtx, ps: Parents, mut a: Side, mut b: Side)
     }
     let (ad, bd) = ((across && a.node.is_dir()) as i64, (across && b.node.is_dir()) as i64);
     ps.apply(v, c, (0, bd - ad), (0, ad - bd));
+    if across {
+        // 跨 scope：两份计数一进一出，按对调之后的净增量查（只查变多的那边，M10 审查）
+        let (ina, inb) = (da.clone().unwrap_or_default(), db.clone().unwrap_or_default());
+        quota::admit_move(v, c, a.parent, b.parent, &ina.minus(&inb))?;
+        quota::admit_move(v, c, b.parent, a.parent, &inb.minus(&ina))?;
+    }
     if let Some(d) = &da {
         rstat::transfer(v, c, a.parent, b.parent, d)?;
     }

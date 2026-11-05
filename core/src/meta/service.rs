@@ -285,7 +285,7 @@ fn read_job(sh: &Shared, ctx: &ReqCtx, op: ReadOp) -> Result<Vec<u8>, ErrCode> {
     match op {
         ReadOp::Node(NodeOp::Heartbeat(hb)) => targets::heartbeat(eng, ctx, &sh.usage, hb),
         ReadOp::Node(NodeOp::SyncDone { target, chain, chain_ver }) => {
-            chain_mgr::sync_done(eng, ctx, target, chain, chain_ver).map(|()| encode_body(&NodeReply::Ok))
+            chain_mgr::sync_done(eng, ctx, &sh.usage, target, chain, chain_ver).map(|()| encode_body(&NodeReply::Ok))
         }
         // 走不到这里：meta-read 线程的循环先单独处理了 Join（它要带原因回复），别的 NodeOp 不会进 ReadOp::Node
         ReadOp::Node(_) => Err(ErrCode::INTERNAL),
@@ -318,7 +318,14 @@ fn read_job(sh: &Shared, ctx: &ReqCtx, op: ReadOp) -> Result<Vec<u8>, ErrCode> {
             let need = live.heartbeat(ctx.session, eng.role().term, clock::mono_ms(), opened, closed, full);
             Ok(encode_body(&MetaReply::Heartbeat { lease_ms, map_epoch, need_full_open_set: need }))
         }
-        ReadOp::Meta(op) => eng.read(ctx, &mut |v, c| ns::read(v, c, &op)).map(|r| encode_body(&r)),
+        ReadOp::Meta(op) => eng
+            .read(ctx, &mut |v, c| {
+                if ctx.session != 0 {
+                    sessions::usable(v, ctx.session, ctx.who.conn.key_id)?; // 被驱逐的会话的任何请求（M10，3.4.4）
+                }
+                ns::read(v, c, &op)
+            })
+            .map(|r| encode_body(&r)),
         ReadOp::Map { since, full } => {
             let mut out = None;
             // 这个闭包只用来在 ReadIndex 之后的视图上取集群图快照，它的返回值丢弃

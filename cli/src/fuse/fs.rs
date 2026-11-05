@@ -206,12 +206,19 @@ impl Filesystem for WmfsFs {
         fh: FileHandle,
         offset: u64,
         data: &[u8],
-        _write_flags: WriteFlags,
+        write_flags: WriteFlags,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.fc.handle(fh.0).and_then(|h| self.fc.write(&self.who(req), &h, offset, data)) {
+        let (who, kill) = (self.who(req), write_flags.contains(WriteFlags::FUSE_WRITE_KILL_SUIDGID));
+        let r = self.fc.handle(fh.0).and_then(|h| {
+            if kill {
+                self.fc.commit_to_drop_suid(&who, &h)?; // 去掉 setuid/setgid 要马上看得到（M10，`commit_to_drop_suid`）
+            }
+            self.fc.write(&who, &h, offset, data)
+        });
+        match r {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(errno(e)),
         }
@@ -259,8 +266,9 @@ impl Filesystem for WmfsFs {
         reply.ok();
     }
 
-    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        reply.ok(); // 目录的修改在回复之前已经在元数据多数派落盘
+    fn fsyncdir(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        // 目录的修改在回复之前已经在元数据多数派落盘；被驱逐的会话里打开的目录句柄 → EIO（与 readdir 相同，ADR-0041 第 9 条）
+        self.empty(reply, self.fc.dir(fh.0).map(|_| ()));
     }
 
     fn statfs(&self, req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
@@ -314,14 +322,15 @@ impl Filesystem for WmfsFs {
     fn fallocate(
         &self,
         req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
+        _ino: INodeNo,
+        fh: FileHandle,
         offset: u64,
         length: u64,
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        let r = self.fc.fallocate(&self.who(req), ino.0, offset, length, mode as u32);
+        let who = self.who(req);
+        let r = self.fc.handle(fh.0).and_then(|h| self.fc.fallocate(&who, &h, offset, length, mode as u32));
         self.empty(reply, r.map(|_| ()));
     }
 

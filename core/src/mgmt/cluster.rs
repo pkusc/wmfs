@@ -195,12 +195,11 @@ fn chain_info(m: &ClusterMap, id: u32, c: &ChainRecV1, heard: Heard) -> ChainInf
         Some(_) if s == SERVING => "serving",
         Some(_) => "syncing",
     };
-    let class = m.classes.iter().find(|k| k.id == c.class_id);
     ChainInfo {
         id,
         ver: c.ver,
         incarnation: c.incarnation,
-        class: class.map_or(format!("#{}", c.class_id), |k| k.name.clone()),
+        class: m.class_name(c.class_id),
         replicas: c.replicas,
         want: chains::want(m, c) as u8,
         members: c

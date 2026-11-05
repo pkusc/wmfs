@@ -1,4 +1,5 @@
-//! `wmfs dev` 的单元测试：端口规则、`up --rdma` 的声明式改写、`up --profile` 不改已有集群的 profile、`dev mount` 的就绪条件。
+//! `wmfs dev` 的单元测试：端口规则、`up --rdma` 的声明式改写、`up --profile` 不改已有集群的 profile、`dev mount` 的就绪条件、
+//! 挂载日志里现在的会话号（M10 的 `dev wait session-evicted`）。
 
 use super::*;
 use wmfs_core::base::clock;
@@ -57,4 +58,12 @@ fn dev_mount_is_ready_only_after_the_whole_mounted_line() {
     assert!(!announced("2026-10-23T03:27:31.000Z INFO fuse: 已挂载\n"), "日志行中间的字样不算");
     assert!(announced("已挂载 /m（会话 1f）\n"), "没有警告时第一行就是它");
     assert!(announced("警告：……新文件实际为 1 副本\n已挂载 /m（会话 1f）\n"));
+}
+
+#[test]
+fn the_current_session_is_the_last_one_in_the_mount_log() {
+    let log = "警告：x\n已挂载 /m（会话 1a2b）\n2026-10-25T00:00:00Z WARN  meta-client: 会话 1a2b 已被驱逐（……）；新会话 ff00\n";
+    assert_eq!(mount::last_session(log), Some(0xff00), "被驱逐之后：新会话");
+    assert_eq!(mount::last_session("已挂载 /m（会话 1a2b）\n"), Some(0x1a2b));
+    assert_eq!(mount::last_session("别的日志：会话 99 什么的\n"), None, "只认这两种行");
 }

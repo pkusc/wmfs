@@ -157,5 +157,71 @@ pub fn on_create(parent_default: Option<&[u8]>, mode: u32, umask: u32, is_dir: b
     Ok(NewPerms { mode, access_acl: extended.then(|| encode(&a)), default_acl })
 }
 
+/// 目录属性 `acl.default` 的值（实现注记（M10），第 5 章）：setfacl 的短文本 `u::rwx,g::r-x,o::---,u:1001:rwx,m::rwx` → 条目（按 ACL 的
+/// 顺序排好）。用户与组只能写数字 id（服务端没有用户数据库）；`m`、`o` 可以省掉中间的空字段；有命名条目而没写 mask 时补上 mask =
+/// 属组类条目的并集（与 setfacl 相同）。错误是给人看的原因。
+pub fn parse_text(t: &str) -> Result<Vec<Ace>, String> {
+    let mut a = Vec::new();
+    for e in t.split(',').map(str::trim) {
+        let parts: Vec<&str> = e.split(':').collect();
+        let (tag, qual, perm) = match parts.as_slice() {
+            [t, q, p] => (*t, *q, *p),
+            [t @ ("m" | "mask" | "o" | "other"), p] => (*t, "", *p),
+            _ => return Err(format!("ACL 条目 {e:?} 应写成 u::rwx、u:1001:r-x、g::r-x、g:100:rwx、m::rwx 或 o::---")),
+        };
+        let id = match qual {
+            "" => None,
+            q => Some(q.parse::<u32>().map_err(|_| format!("ACL 条目 {e:?}：用户与组只能写数字 id"))?),
+        };
+        let tag = match (tag, id) {
+            ("u" | "user", None) => USER_OBJ,
+            ("u" | "user", Some(_)) => USER,
+            ("g" | "group", None) => GROUP_OBJ,
+            ("g" | "group", Some(_)) => GROUP,
+            ("m" | "mask", None) => MASK,
+            ("o" | "other", None) => OTHER,
+            _ => return Err(format!("ACL 条目 {e:?}：不认识的种类（u、g、m、o）")),
+        };
+        let mut bits = 0;
+        for ch in perm.chars() {
+            bits |= match ch {
+                'r' => 4,
+                'w' => 2,
+                'x' => 1,
+                '-' => 0,
+                _ => return Err(format!("ACL 条目 {e:?}：权限只能由 r、w、x、- 组成")),
+            };
+        }
+        a.push(Ace { tag, perm: bits, id: id.unwrap_or(u32::MAX) });
+    }
+    let named = a.iter().any(|e| e.tag == USER || e.tag == GROUP);
+    if named && !a.iter().any(|e| e.tag == MASK) {
+        let union = a.iter().filter(|e| matches!(e.tag, USER | GROUP_OBJ | GROUP)).fold(0, |m, e| m | e.perm);
+        a.push(Ace { tag: MASK, perm: union, id: u32::MAX });
+    }
+    a.sort_by_key(|e| (e.tag, e.id));
+    if a.windows(2).any(|w| (w[0].tag, w[0].id) == (w[1].tag, w[1].id)) || !valid(&a) {
+        return Err("不是合法的 ACL：u::、g::、o:: 各要一条，同一个用户或组只能写一次".into());
+    }
+    Ok(a)
+}
+
+/// 条目 → 规范的短文本（`u::rwx,u:1001:rwx,g::r-x,m::rwx,o::---`；`acl.default` 的存储与显示形式）。
+pub fn to_text(a: &[Ace]) -> String {
+    let one = |e: &Ace| {
+        let t = match e.tag {
+            USER_OBJ | USER => "u",
+            GROUP_OBJ | GROUP => "g",
+            MASK => "m",
+            _ => "o",
+        };
+        let q = if e.tag == USER || e.tag == GROUP { e.id.to_string() } else { String::new() };
+        let p: String =
+            [(4, 'r'), (2, 'w'), (1, 'x')].iter().map(|(b, c)| if e.perm & b != 0 { *c } else { '-' }).collect();
+        format!("{t}:{q}:{p}")
+    };
+    a.iter().map(one).collect::<Vec<_>>().join(",")
+}
+
 #[cfg(test)]
 mod tests;

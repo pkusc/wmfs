@@ -1,10 +1,12 @@
 //! 创建（design.md 3.5.1 的示例代码与 KV 影响表）：create、mkdir、mknod、symlink、link。
 //!
 //! 顺序与 3.5.1 的示例相同：名字检查 → 父目录（`ENOENT`/`ENOTDIR`）→ authz（对父目录要写 + 执行）→ 已存在 → `EEXIST` →
-//! 分配 ino → 权限位（父目录有默认 ACL → 按 ACL 规则、不用 umask；否则 `mode & !umask`）→ 普通文件按当前生效属性选好链
-//! （`new_layout`，必要时 `gen_chains`；inline_max > 0 时置 F_INLINE）→ 写 inode、目录项、继承的 ACL、父目录 → 祖先的 RSTAT（M7：
-//! 文件、符号链接、设备节点 files + 1，目录 dirs + 1 并建它自己的空 RSTAT，3.9）→ changelog。link 不改 RSTAT（硬链接只在主链接
-//! 所在目录计一次）。
+//! 分配 ino → 权限位（父目录有默认 ACL、或生效的 `acl.default` 属性（M10）→ 按 ACL 规则、不用 umask；否则 `mode & !umask`）→
+//! 普通文件按当前生效属性选好链（`new_layout`，必要时 `gen_chains`；inline_max > 0 时置 F_INLINE）→ 写 inode、目录项、继承的 ACL、
+//! 父目录 → 祖先的 RSTAT（M7：文件、符号链接、设备节点 files + 1，目录 dirs + 1 并建它自己的空 RSTAT，3.9）→ changelog。link 不改
+//! RSTAT（硬链接只在主链接所在目录计一次）。实现注记（M10 审查）：调用者的 key 有路径限制时，link 另按"取属性"对源 inode 过一次
+//! authz——path-caps 按源 inode 自己的祖先判，子树外的文件不能按 inode 号链接进来（4.3 只写了"目录项操作看父目录"）；新父目录与
+//! 源文件主父目录的配额范围不同 → `EXDEV`（`quota::same_range`，ADR-0041 第 1 条，在 `EEXIST`/`ENOENT`/`EMLINK` 之后）。
 //! 字符设备与块设备节点只有 root 能建（`EPERM`，与 Linux 的 CAP_MKNOD 相同）。
 //! `Create` 不带 O_EXCL 时名字可能已存在（要按名字打开它），所以先查"能不能在父目录里查名字"（执行权限，与 lookup 相同；
 //! 没有 → `EACCES`，不泄露名字在不在），再看名字：已存在 → O_EXCL 回 `EEXIST`、目录回 `EISDIR`、否则要对它有写权限。
@@ -19,10 +21,10 @@ use crate::base::ErrCode;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvTxn, OpCtx};
-use crate::meta::rstat;
 use crate::meta::schema::records::{
     F_ORPHAN, KIND_BLK, KIND_CHR, KIND_DIR, KIND_FIFO, KIND_FILE, KIND_SOCK, KIND_SYMLINK,
 };
+use crate::meta::{quota, rstat};
 use crate::proto::cap::{RIGHT_READ, RIGHT_WRITE};
 use crate::proto::meta::MetaReply;
 
@@ -43,7 +45,11 @@ fn make(v: &mut dyn KvTxn, c: &OpCtx, p: &mut Node, o: NewInode) -> Result<Node,
     let perms = if o.kind == KIND_SYMLINK {
         acl::NewPerms { mode: 0o777, access_acl: None, default_acl: None } // 符号链接的权限位恒为 0777，也不带 ACL
     } else {
-        let pacl = get_xattr(v, p.ino, ACL_DEFAULT)?;
+        // 父目录没有默认 ACL 时用生效的 acl.default 属性（第 5 章，M10）
+        let pacl = match get_xattr(v, p.ino, ACL_DEFAULT)? {
+            Some(d) => Some(d),
+            None => c.attrs.resolve(v, p.ino)?.acl_default.clone(),
+        };
         acl::on_create(pacl.as_deref(), o.mode, o.umask, o.kind == KIND_DIR)?
     };
     let mut n = new_node(c, ino, o.kind, perms.mode, p, o.name);
@@ -61,6 +67,7 @@ fn make(v: &mut dyn KvTxn, c: &OpCtx, p: &mut Node, o: NewInode) -> Result<Node,
     if o.kind == KIND_DIR {
         rstat::init_dir(v, ino); // 新目录自己的 RSTAT 从 0 开始（3.9）
     }
+    quota::admit(v, c, &n, 0, 1)?; // 文件数配额：精确（3.9 第 5 条，M10）
     let d = rstat::Delta::of(v, &n)?; // 文件 + 1（计入存储类）或目录 + 1
     rstat::apply(v, c, p.ino, &d)?;
     changelog::append(v, c, Change { op: o.op, ino, parent: p.ino, name: o.name, ..Default::default() })?;
@@ -173,6 +180,9 @@ pub fn link(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, new_parent: u64, new_name: &
     }
     let mut p = dir(v, new_parent)?;
     authz(v, c, AuthzOp::Link, Some(&n), Some(&p), None)?;
+    if !c.req.who.conn.path_caps.is_empty() {
+        authz(v, c, AuthzOp::GetAttr, Some(&n), None, None)?; // 源 inode 也要在允许的子树里（见文件头）
+    }
     if child(v, new_parent, new_name)?.is_some() {
         return Err(ErrCode::EEXIST);
     }
@@ -182,6 +192,7 @@ pub fn link(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, new_parent: u64, new_name: &
     if n.rec.nlink >= MAX_LINKS {
         return Err(ErrCode::EMLINK);
     }
+    quota::same_range(v, c, &n, new_parent)?; // 硬链接不跨配额范围 → EXDEV（ADR-0041 第 1 条）
     n.rec.nlink += 1;
     n.rec.extra_links.push((new_parent, new_name.to_vec()));
     bump_ctime(&mut n, c);

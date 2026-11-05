@@ -1,11 +1,7 @@
 //! 金样：M8 管理端点的 JSON 逐字固定（服务端与 ApiClient 都用这些结构，字段名不靠猜）。
 
 use super::*;
-
-fn same<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(v: &T, want: &str) {
-    assert_eq!(serde_json::to_string(v).unwrap(), want);
-    assert_eq!(&serde_json::from_str::<T>(want).unwrap(), v);
-}
+use crate::types::same;
 
 fn node() -> NodeInfo {
     NodeInfo {

@@ -4,9 +4,13 @@
 //! `tcp://host:port`），用 client key 握手 → GetClusterMap + SessionOpen（`MetaClient::connect`，跟随 leader）→ 检查 `--transport`
 //! 的 data_scheme 每个数据节点都公布了（没有就报错并列出缺的节点）→ 打印集群警告（`ClusterMap.warnings`，例如"……新文件实际为
 //! 1 副本"）→ 挂载（16 个工作线程、clone_fd，`FSName = wmfs:<cluster_id 前 8 位 hex>`、`Subtype = wmfs`、`DefaultPermissions`；
-//! 不开 allow_other）→ 打印"已挂载"。会话开了之后挂载失败也先 SessionClose 再退出（M10 之前会话不会被驱逐，不关就一直留在
-//! leader 上）。之后前台运行：SIGTERM / SIGINT → 把全部脏数据写出去 → 卸载 → 关会话、退出；挂载点被别人卸载（`wmfs umount`、
-//! `fusermount3 -u`）→ 会话结束 → 同样写出脏数据、关会话、退出。
+//! 默认不开 allow_other）→ 打印"已挂载"。会话开了之后挂载失败也先 SessionClose 再退出（不关的话它要等租约到期被驱逐）。之后前台
+//! 运行：SIGTERM / SIGINT → 把全部脏数据写出去 → 卸载 → 关会话、退出；挂载点被别人卸载（`wmfs umount`、`fusermount3 -u`）→ 会话
+//! 结束 → 同样写出脏数据、关会话、退出。
+//!
+//! 实现注记（M10）：`--allow-other`（7.2 的参数表里没有）只给容器里以 root 挂载、跑切换用户的 pjdfstest 权限子集用（宿主机上普通
+//! 用户经 fusermount3 挂载时它要求 /etc/fuse.conf 的 user_allow_other，本仓库不改那个文件）。会话被驱逐之后（MetaClient 换新会话，
+//! `client/lease.rs`）在另一个线程上对已知 inode `inval_inode`（不在 FUSE 工作线程上调：内核可能正等着它回复）。
 //! 信号（0.2 第 4 条）：main 在创建任何线程之前屏蔽 SIGTERM/SIGINT，这里最后 `sys::wait_signals`；会话线程结束时给自己发一个
 //! SIGTERM 叫醒 main。
 //! `wmfs umount <挂载点>` = `fusermount3 -u <挂载点>`（挂载进程看到会话结束后自己退出）。
@@ -26,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use fuser::{Config, FileAttr, INodeNo, MountOption, Notifier, Session};
+use fuser::{Config, FileAttr, INodeNo, MountOption, Notifier, Session, SessionACL};
 use wmfs_core::api::hex::hex;
 use wmfs_core::api::types::KeyFile;
 use wmfs_core::base::config::NetConfig;
@@ -72,6 +76,9 @@ pub struct MountArgs {
     /// 日志写到这个文件（默认写 stderr）
     #[arg(long)]
     log: Option<PathBuf>,
+    /// 允许别的用户访问这个挂载（只在容器里以 root 挂载时用；见文件头）
+    #[arg(long)]
+    allow_other: bool,
 }
 
 pub fn run(a: MountArgs) -> i32 {
@@ -113,7 +120,7 @@ fn mount(a: MountArgs) -> Result<(), String> {
         Err(e) => return Err(format!("连接集群失败：{e}")),
     };
     let r = serve(&a, &mp, rpc, meta.clone(), max_ttl, op_timeout);
-    meta.close(); // 不论成败：会话开了就要关（M10 之前不会被驱逐）
+    meta.close(); // 不论成败：会话开了就要关（不关要等租约到期被驱逐）
     r
 }
 
@@ -133,16 +140,30 @@ fn serve(
     let fc = FileClient::start(meta.clone(), data, registry::cache_store(&a.cache)?);
     let fs = WmfsFs::new(fc.clone(), max_ttl, a.job_id_var.clone());
     let slot = fs.notifier.clone();
+    let n = slot.clone();
+    fc.on_evict(Box::new(move |inos| {
+        let n = n.clone();
+        let _ = std::thread::Builder::new().name("evict-inval".into()).spawn(move || {
+            if let Some(n) = n.get() {
+                for ino in inos {
+                    let _ = n.inval_inode(INodeNo(ino), 0, 0); // 被驱逐之后：内核缓存里旧会话的属性与页一律作废
+                }
+            }
+        });
+    }));
     let mut cfg = Config::default();
     cfg.n_threads = Some(16);
     cfg.clone_fd = true;
     let fsname = format!("wmfs:{}", &hex(&map.cluster_id)[..8]); // FSName 里不能有逗号（fusermount 用逗号分隔选项）
     cfg.mount_options =
         vec![MountOption::FSName(fsname), MountOption::Subtype("wmfs".into()), MountOption::DefaultPermissions];
+    if a.allow_other {
+        cfg.acl = SessionACL::All; // = allow_other
+    }
     let mut session = Session::new(fs, mp, &cfg).map_err(|e| format!("挂载 {} 失败：{e}", mp.display()))?;
     let _ = slot.set(session.notifier());
     let mut unmounter = session.unmount_callable();
-    lines.push(format!("已挂载 {}（会话 {:x}）", mp.display(), meta.session()));
+    lines.push(format!("{MOUNTED}{}{MOUNTED_SESSION}{:x}）", mp.display(), meta.session()));
     let _ = out(lines.join("\n"));
     let t = std::thread::Builder::new()
         .name("fuse-session".into())
@@ -206,6 +227,10 @@ pub fn umount(mp: &Path) -> i32 {
     }
 }
 
+/// 挂载成功时打印的那一行 `已挂载 <挂载点>（会话 <十六进制>）` 的开头与会话号前面的字样：`wmfs dev mount` 等这一行写完再返回，
+/// `dev wait session-evicted` 从它取会话号（`dev/mount.rs`）——两边共用这两个字样（同 `client::lease::NEW_SESSION`）。
+pub const MOUNTED: &str = "已挂载 ";
+pub const MOUNTED_SESSION: &str = "（会话 ";
 /// 默认依次尝试的作业 id 环境变量（8.7）。
 const JOB_VARS: [&str; 3] = ["SLURM_JOB_ID", "PBS_JOBID", "WMFS_JOB_ID"];
 /// 附加组、作业 id 的缓存最多记多少个 pid（超过就整个清掉：只是缓存）。

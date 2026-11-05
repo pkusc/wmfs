@@ -78,3 +78,20 @@ fn chmod_updates_user_mask_and_other() {
     chmod(&mut m, 0o751);
     assert_eq!(m.iter().map(|e| e.perm).collect::<Vec<_>>(), vec![7, 5, 1]);
 }
+
+#[test]
+fn acl_default_text_is_parsed_and_normalized() {
+    let a = parse_text("u::rwx,g::r-x,o::---,u:1001:rwx,m::rwx").unwrap();
+    assert_eq!(to_text(&a), "u::rwx,u:1001:rwx,g::r-x,m::rwx,o::---", "按 ACL 的顺序");
+    assert!(parse(&encode(&a)).is_ok(), "编码之后是合法的 xattr");
+    assert_eq!(
+        to_text(&parse_text("user::rw,group::r,other:r,g:100:rwx").unwrap()),
+        "u::rw-,g::r--,g:100:rwx,m::rwx,o::r--",
+        "补上 mask"
+    );
+    for bad in
+        ["u::rwx,g::r-x", "u::rwz,g::r,o::", "u:alice:rwx,u::rwx,g::r,o::", "u::r,u::r,g::r,o::", "x::r,u::r,g::r,o::"]
+    {
+        assert!(parse_text(bad).is_err(), "{bad}");
+    }
+}

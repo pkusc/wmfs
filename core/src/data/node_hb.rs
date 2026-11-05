@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
+use wmfs_api::failpoint::fail_point;
 
 use super::{DataNode, redrive};
 use crate::base::{ErrCode, clock, lock, log};
@@ -156,8 +157,10 @@ fn beat(hb: &HbDeps, f: &mut Finder, poked: bool) -> Result<(), ErrCode> {
     r
 }
 
-/// 向 `ep` 发一次心跳；leader 的 map_epoch 更新（或被 poke 了）就拉新集群图。
+/// 向 `ep` 发一次心跳；leader 的 map_epoch 更新（或被 poke 了）就拉新集群图。fail point `chain.map.delay`（实现注记（M10），sleep）：
+/// 发心跳之前睡一会儿——拖住本节点换图（租约还有效时它照旧按旧图服务），测 ADR-0040 第 11 条的"提升"窗口。
 fn beat_to(hb: &HbDeps, ep: &Endpoint, poked: bool, hint: &mut Option<String>) -> Result<(), ErrCode> {
+    let _ = fail_point("chain.map.delay");
     let mut targets = Vec::new();
     for t in hb.data.targets.values() {
         let st = hb.data.store(|| t.stat())?;

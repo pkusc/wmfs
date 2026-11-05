@@ -20,7 +20,7 @@ accept_m4() {
         tests_at_least 12 --release -p wmfs-testkit --test meta_ns
     check "rename 的全部规则：覆盖、类型不匹配、非空目标、NOREPLACE/EXCHANGE/WHITEOUT、不得移进自己的子树、硬链接、粘滞位、没有执行权限看不出名字" \
         tests_at_least 8 --release -p wmfs-testkit --test meta_ns_rename
-    check "setattr 与 xattr：chmod/chown/时间的属主规则、截断到 s>0、截断到 0 按当前属性重建 layout（新 epoch、重新选链、GC 记录）、xattr 名字空间与限制、ACL 与默认 ACL（umask 规则）、M10 之前带扩展 ACL 的只有 root 能访问、inline 内容只给有读权限的人" \
+    check "setattr 与 xattr：chmod/chown/时间的属主规则、截断到 s>0、截断到 0 按当前属性重建 layout（新 epoch、重新选链、GC 记录）、xattr 名字空间与限制、ACL 与默认 ACL（umask 规则）、带扩展 ACL 的由 posix-acl 判（M10 之前只有 root 能访问）、inline 内容只给有读权限的人" \
         tests_at_least 8 --release -p wmfs-testkit --test meta_ns_attr
     check "带种子的随机命名空间操作（1000 个种子）：每一步之后目录项、链接、nlink、size、孤儿标记、目录树的不变式都成立" \
         env WMFS_NS_SEEDS=1000 cargo test --release -p wmfs-testkit --test meta_ns_random

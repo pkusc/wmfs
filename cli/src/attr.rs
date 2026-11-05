@@ -5,13 +5,15 @@
 //! - `wmfs set <path> k=v[,k=v…]`：属性字符串原样发给服务端（服务端切分、解析、规范化，3.8），打印规范化后的结果与警告。
 //! - `wmfs get <path> [key] [-r]`：每个属性一行"键=值  来源  生效方式"，之后是警告，最后一行 `semantics:`；给了 key 只打印那一行
 //!   （`--json` 仍是完整的回复）。key 不在回复里（回复列着全部能查的键）→ 报错、退出码 1，不静默输出空行（原则 7）。
-//! - `wmfs unset <path> <key>`；`wmfs usage <path>`（递归用量，常量时间）；`wmfs status [path]`（第一行起是集群警告，之后声明 vs 实际）。
+//! - `wmfs unset <path> <key>`；`wmfs usage <path>`（递归用量，常量时间；M10 起另列出管着它的每个配额：用量、硬限、软限与宽限剩余）；
+//!   `wmfs status [path]`（第一行起是集群警告，之后声明 vs 实际）。
 
 use std::path::PathBuf;
 
 use serde::Serialize;
 use wmfs_core::api::types::{
-    AttrGetReply, AttrSetReply, AttrSetReq, AttrUnsetReply, DEFAULT_SOURCE, KeyFile, StatusReply, UsageReply,
+    AttrGetReply, AttrSetReply, AttrSetReq, AttrUnsetReply, DEFAULT_SOURCE, KeyFile, QuotaUsage, StatusReply,
+    UsageReply,
 };
 use wmfs_core::api::url::encode;
 use wmfs_mgr::api::{ApiClient, ApiError};
@@ -208,9 +210,30 @@ pub fn usage(a: PathArgs) -> i32 {
         for k in &r.per_class {
             s += &format!("\n  存储类 {}：{} 字节，{} 个文件", k.class, k.bytes, k.files);
         }
+        for q in &r.quotas {
+            s += &quota_line(q);
+        }
         s
     };
     run(&a.api, Some(&a.path), call, show)
+}
+
+/// 一个配额作用域一行（M10）：用量 / 硬限，软限与宽限期（超过软限后还剩多久、或已经按软限拒绝），文件数上限。
+fn quota_line(q: &QuotaUsage) -> String {
+    let class = q.class.as_ref().map_or(String::new(), |c| format!("（存储类 {c}）"));
+    let mut s = format!("\n  配额{class}（{}）：已用 {} / 硬限 {}", q.dir, human(q.used_bytes), human(q.hard));
+    if q.soft > 0 {
+        s += &format!("，软限 {}", human(q.soft));
+        s += &match q.grace_left_ms {
+            Some(0) => "（已超过软限，宽限期已过：按软限拒绝）".to_string(),
+            Some(ms) => format!("（已超过软限，宽限剩余约 {} s）", ms.div_ceil(1000)),
+            None => String::new(),
+        };
+    }
+    if q.files > 0 {
+        s += &format!("；文件 {} / {}", q.used_files, q.files);
+    }
+    s + &format!("；quantum {}", human(q.quantum))
 }
 
 pub fn status(a: StatusArgs) -> i32 {

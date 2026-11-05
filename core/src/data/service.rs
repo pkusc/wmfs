@@ -12,8 +12,11 @@
 //! 实现注记（M5）：QosSpec 先只带存储类的低优先级标记（mclock 的份额在 M13）；后台请求 = cap 带管理权限位（`proto/cap.rs` 的注记）；
 //! 只读的 target（3.2.3）上写、截断与 DeleteEpoch 一律 `EROFS`。
 //! 实现注记（M9）：校验多了 I5（租约、boot_id、集群图不旧，不满足 → `FENCED`，`chain.rs`）；读到有未提交版本的 chunk、本成员又不是
-//! last serving → `CHUNK_DIRTY{extra = L}`（3.4.2.5）；SyncChunks 与 DeleteEpoch 在 head 上做完本地的部分，再沿链传播（ForwardSync /
-//! ForwardDeleteEpoch，`call_cb`，尾确认之后逆向回复，3.4.2.9）；同步源的 ListChunks / FetchChunk（PeerCall）也进这个队列，标为后台。
+//! last serving → `CHUNK_DIRTY{extra = L}`（3.4.2.5；实现注记（M10）：本成员刚从 Syncing 被提升为 last serving、还在一个 target 租约之内
+//! → `BUSY`，ADR-0040 第 11 条，`chain::note_promotions`；M10 审查：刚从排在 L 前面的 Serving 成为 last serving 时只对被占着的 chunk 回
+//! `BUSY`，ADR-0041 第 14 条；chunk 正忙也算脏、重定向给 L，第 15 条）；SyncChunks 与 DeleteEpoch 在 head 上做完本地的部分，再沿链传播
+//! （ForwardSync / ForwardDeleteEpoch，`call_cb`，尾确认之后逆向回复，3.4.2.9）；同步源的 ListChunks / FetchChunk（PeerCall）也进这个
+//! 队列，标为后台。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -218,8 +221,11 @@ fn exec(node: &Arc<DataNode>, call: DataCall, bulk: Option<Buf>) -> Result<Done,
         DataOp::ReadChunk { chunk, chain_ver, off, len } => {
             let (t, l) = member(node, &map, chunk.chain, chain_ver, false)?;
             cap.allows(&chunk, RIGHT_READ, now)?;
+            if chain::read_busy(node, &chunk) {
+                return Err(ErrCode::BUSY.into()); // 刚成为 last serving：一个租约内（ADR-0040 第 11 条、ADR-0041 第 14 条）
+            }
             if node.chunks.has_dirty(&chunk) && l != Some(t.id) {
-                node.craq.dirty_reads.inc(); // 有未提交版本、本成员不是 last serving：改问 L（3.4.2.5）
+                node.craq.dirty_reads.inc(); // 正忙或有未提交版本、本成员不是 last serving：改问 L（3.4.2.5、ADR-0041 第 15 条）
                 return Err(Fail(ErrCode::CHUNK_DIRTY, l.unwrap_or(0) as u64));
             }
             let (buf, n, version) = read::read(node, t, &chunk, off, len)?;

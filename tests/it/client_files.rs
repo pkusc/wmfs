@@ -5,18 +5,21 @@
 //! - 截断到 0 之后的 fsync 不再提交（不改 mtime 与 change_id）；
 //! - `STALE_LAYOUT` 之后的重新 Open 不把别人的修改记成"见过"（下一次 open 照样失效，C2）；
 //! - 并发提交时本挂载的属性只前进；读已提交的数据不会读成 0；
-//! - inline 副本带着版本：只写打开回来的属性比副本新时，读重新取内容。
+//! - inline 副本带着版本：只写打开回来的属性比副本新时，读重新取内容；
+//! - 稀疏写要额度时直接提交到这次写的末尾：配额不够 → `EDQUOT`、长度不变（ADR-0041 第 8 条 ⑤）。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use wmfs_core::api::types::{AttrSetReply, AttrSetReq, KeyFile};
 use wmfs_core::base::ErrCode;
 use wmfs_core::client::files::FileClient;
 use wmfs_core::meta::schema::keys::ROOT_INO;
 use wmfs_core::proto::meta::{AttrOut, MetaOp, MetaReply, O_RDONLY, O_RDWR, O_WRONLY, SetAttrIn};
 use wmfs_core::server::Running;
-use wmfs_testkit::harness::node::{TempDir, client, file_client, get, init, start, who};
+use wmfs_mgr::api::ApiClient;
+use wmfs_testkit::harness::node::{TempDir, client, file_client, get, init, node_dir, start, who};
 
 fn node(name: &str) -> (TempDir, Running) {
     let d = TempDir::new(&format!("files-{name}"));
@@ -230,5 +233,42 @@ fn the_inline_copy_is_refetched_when_it_is_older_than_the_attrs() {
     let r2 = a.open(&me, ino, O_RDONLY).unwrap();
     assert_eq!(a.read(&me, &a.handle(r2.fh).unwrap(), 0, 100).unwrap(), b"abcdddX");
     a.release(r2.fh);
+    run.stop();
+}
+
+/// 稀疏写要额度（ADR-0041 第 8 条 ⑤）：起点越过文件末尾的写要额度时直接提交到这次写的末尾——配额不够 → 这次 write `EDQUOT`、
+/// 长度不变（以前先把长度提到起点、才发现不够：失败的 write 改了 st_size）；够 → 写成功，洞读为 0。
+#[test]
+fn a_sparse_write_past_the_quota_fails_without_changing_the_size() {
+    let (d, run) = node("sparse-quota");
+    let c = file_client(&d.0, &run);
+    let (me, mib) = (who(1000, 1000), 1usize << 20);
+    let key = KeyFile::parse(&std::fs::read_to_string(node_dir(&d.0).join("keys/admin.key")).unwrap()).unwrap();
+    let api = ApiClient::new(vec![run.mgmt_addr.clone()], key);
+    // quantum=4M：要的 2.5 MiB 不超过一个 quantum，专门来要额度的提交也不能借护栏的宽容（ADR-0041 第 8 条 ⑤）
+    for quantum in ["1M", "4M"] {
+        let name = format!("q{quantum}");
+        let mkdir = MetaOp::Mkdir { parent: ROOT_INO, name: name.clone().into_bytes(), mode: 0o777, umask: 0 };
+        let MetaReply::Entry { attr: q } = c.meta.write(&who(0, 0), mkdir).unwrap() else { panic!() };
+        let spec = format!("inline=0,quota=8M,quantum={quantum}");
+        let _: AttrSetReply = api.post("/api/v1/attr", &AttrSetReq { path: format!("/{name}"), spec }).unwrap();
+        let fill = c.create(&me, q.ino, b"fill", 0o644, 0, O_RDWR).unwrap();
+        for i in 0..6 {
+            c.write(&me, &c.handle(fill.fh).unwrap(), (i * mib) as u64, &vec![b'f'; mib]).unwrap(); // 每次 ≤ quantum（同 FUSE）
+        }
+        c.flush(fill.fh).unwrap();
+        c.release(fill.fh);
+        let o = c.create(&me, q.ino, b"sparse", 0o644, 0, O_RDWR).unwrap();
+        let h = c.handle(o.fh).unwrap();
+        let r = c.write(&me, &h, (3 * mib / 2) as u64, &vec![b's'; mib]);
+        assert_eq!(r, Err(ErrCode::EDQUOT), "quantum={quantum}：从 1.5 MiB 写 1 MiB，要 2.5 MiB，只剩 2 MiB");
+        assert_eq!(attr(&c, o.attr.ino).size, 0, "quantum={quantum}：失败的 write 不改长度");
+        c.write(&me, &h, mib as u64, &vec![b's'; mib / 2]).unwrap(); // 要 1.5 MiB：够
+        c.flush(o.fh).unwrap();
+        assert_eq!(attr(&c, o.attr.ino).size, (3 * mib / 2) as u64);
+        let got = c.read(&me, &h, 0, (3 * mib / 2) as u32).unwrap();
+        assert!(got[..mib].iter().all(|b| *b == 0) && got[mib..].iter().all(|b| *b == b's'), "洞读为 0");
+        c.release(o.fh);
+    }
     run.stop();
 }

@@ -10,7 +10,8 @@
 //!     文件已经不是 inline（别人先把它转成了 chunk）→ `STALE_LAYOUT`，客户端重新 Open、按 chunk 重写。
 //!   - `uninline_expect_change_id = Some(c)`：文件仍是 inline 且 change_id 仍是 c 才清除 F_INLINE 与 INLINE（CAS），否则
 //!     `STALE_LAYOUT`（服务端的 uninline 从头重做）。内容与大小都没变、只换了存放位置，所以不写 changelog（ADR-0034）。
-//!   - `want_quota` 在 M10 才有用（回复的 `quota_end` 先一律是 `u64::MAX`）；`close`（M6 起客户端在写句柄 close 时带上）服务端
+//!   - 配额（M10，`meta/quota.rs`）：长度变长先过护栏（孤儿不计）；回复的 `quota_end` 每次都按当前的配额重新算；`want_quota`
+//!     （客户端专门来要额度）的增长不走护栏的宽容，插件拒绝就 `EDQUOT`（ADR-0041 第 8 条 ⑤）；`close`（M6 起客户端在写句柄 close 时带上）服务端
 //!     还不用（拿它做什么规格没写，实现注记（M6）：等主管决定，3.3.4 的 M6 注记 ③）。
 //! - 实现注记（M7）：CommitWrite 与 Fallocate 改了长度 → 祖先 RSTAT 按差值更新（3.9；孤儿不计）。
 //! - **Fallocate**：经句柄（`AuthzOp::Handle`）；只支持 mode 0（别的 → `EOPNOTSUPP`）；`size = max(size, offset + len)`（超过最大长度 → `EFBIG`）；inline 文件的
@@ -36,6 +37,7 @@ use crate::base::types::Ts;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
+use crate::meta::quota;
 use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys::{self, GC_EPOCH};
 use crate::meta::schema::kv;
@@ -51,6 +53,7 @@ pub struct CommitIn {
     pub new_size: u64,
     pub patches: Vec<(u64, Vec<u8>)>,
     pub expect_change_id: Option<u64>, // uninline_expect_change_id：Some = 清除 INLINE 的 CAS
+    pub want_quota: bool,              // 客户端专门来要额度：增长按插件的判定精确检查（ADR-0041 第 8 条 ⑤）
 }
 
 /// 只有普通文件能被写：目录 → `EISDIR`，别的种类 → `EINVAL`；调用者要能**经已打开的写句柄**写它（`AuthzOp::Handle`，
@@ -97,7 +100,7 @@ pub fn commit_write(v: &mut dyn KvTxn, c: &OpCtx, w: &CommitIn) -> Result<MetaRe
         v.delete(&keys::inline(w.ino));
         bump_ctime(&mut n, c);
         save(v, &n);
-        return Ok(MetaReply::Committed { attr: attr_out(v, c, &n)?, quota_end: u64::MAX });
+        return Ok(MetaReply::Committed { attr: attr_out(v, c, &n)?, quota_end: quota::end(v, c, &n)? });
     }
     let before = Delta::of(v, &n)?; // 递归计数按长度的差值更新（3.9）
     let mut size = n.rec.size.max(w.new_size);
@@ -119,13 +122,14 @@ pub fn commit_write(v: &mut dyn KvTxn, c: &OpCtx, w: &CommitIn) -> Result<MetaRe
     } else if inline && w.new_size > n.rec.size.max(l.inline_max as u64) {
         return Err(ErrCode::EINVAL); // inline 文件没有 chunk：越过阈值的长度只能来自 Uninline 之后的写
     }
+    quota::commit_growth(v, c, &n, size - n.rec.size, w.want_quota)?; // 护栏（3.9 第 4 条；孤儿不计）
     n.rec.size = size;
     touch_data(&mut n, c);
     save(v, &n);
     rstat::changed(v, c, &before, &n)?;
     let extra = vec![("via".to_string(), "CommitWrite".to_string())];
     changelog::append(v, c, Change { op: "SetSize", ino: w.ino, size, extra, ..Default::default() })?;
-    Ok(MetaReply::Committed { attr: attr_out(v, c, &n)?, quota_end: u64::MAX })
+    Ok(MetaReply::Committed { attr: attr_out(v, c, &n)?, quota_end: quota::end(v, c, &n)? })
 }
 
 pub fn fallocate(
@@ -147,6 +151,7 @@ pub fn fallocate(
     let max = n.rec.layout.as_ref().map_or(i64::MAX as u64, max_file_size);
     let end = offset.checked_add(len).filter(|e| *e <= max).ok_or(ErrCode::EFBIG)?;
     if end > n.rec.size {
+        quota::admit_size(v, c, &n, end)?; // 精确（3.9 第 5 条；孤儿不计）
         let before = Delta::of(v, &n)?;
         n.rec.size = end;
         touch_data(&mut n, c);

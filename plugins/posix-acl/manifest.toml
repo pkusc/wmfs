@@ -1,0 +1,13 @@
+# posix-acl 授权插件的 manifest（design.md 3.7.1、4.3）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "posix-acl"
+version = "0.1.0"
+hooks = ["authz"]
+altitude = 220
+hot_path = true
+abi_version = 1
+attrs = ["acl.default"]
+budget_ns = 5000
+fail_points = ["plugin.posix-acl.authz"]
+
+[config_schema]
+# 没有部署参数：ACL 是文件自己的属性（system.posix_acl_access），新文件继承的默认 ACL 与 acl.default 属性在 core 里

@@ -18,7 +18,8 @@
 //!   同步 `system.posix_acl_access` 的 USER_OBJ / MASK / OTHER。chown：只有 root 能改 uid；属主只能把 gid 改成自己所在的组；
 //!   非目录 chown 之后去掉 setuid、以及带组执行位时的 setgid。非属主改长度也去掉它们（"非属主写入时清除 suid/sgid"）。
 //! - 时间：设成"现在"只要有写权限（或是属主）；设成指定值要是属主或 root。任何改动都更新 ctime、change_id + 1。
-//! - 实现注记（M7）：改了长度（截断到 0 时还可能换了存储类）→ 祖先 RSTAT 按差值更新（3.9；孤儿不计）。
+//! - 实现注记（M7）：改了长度（截断到 0 时还可能换了存储类）→ 祖先 RSTAT 按差值更新（3.9；孤儿不计）。实现注记（M10）：变长先过配额
+//!   的精确检查（`meta/quota.rs`，3.9 第 5 条）。
 
 use super::common::{
     MODE_MASK, Node, S_ISGID, attr_out, authz, bump_ctime, get, in_group, is_file, kill_suid, max_file_size, may_read,
@@ -30,6 +31,7 @@ use crate::base::ErrCode;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvTxn, OpCtx};
+use crate::meta::quota;
 use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys;
 use crate::meta::schema::records::{F_HAS_ACL, F_INLINE};
@@ -142,6 +144,7 @@ fn truncate(v: &mut dyn KvTxn, c: &OpCtx, n: &mut Node, size: u64, epoch_seen: u
     if c.req.who.uid != n.rec.uid && c.req.who.uid != 0 {
         kill_suid(n);
     }
+    quota::admit_size(v, c, n, size)?; // 扩展长度：精确（3.9 第 5 条；孤儿不计）
     n.rec.size = size;
     n.rec.mtime = c.req.now;
     rstat::changed(v, c, &before, n)

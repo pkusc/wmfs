@@ -18,7 +18,7 @@
 source "$ROOT/scripts/accept.d/m6.sh"
 
 accept_m9() {
-    check "开发集群的端口 19100–19480 都空闲（演示用的开发集群要先 wmfs dev down）" m9_ports_free
+    check "开发集群的端口 19100–19480 都空闲（演示用的开发集群要先 wmfs dev down）" dev_ports_free M9 4
     check "没有残留的 wmfs FUSE 挂载（有的话先 wmfs dev down --purge）" m6_no_mounts
     check "cargo build --release 成功且零警告" build_no_warnings
     check "第一步 ①（ADR-0039 第 6 条，真进程）：3 个节点带 --adopt-local-plugins、配置相同 → 收敛后都照常运行、清单等于本地清单；配置不同的那个在清单改好之后以退出码 3 退出、不会来回改清单" \
@@ -26,7 +26,7 @@ accept_m9() {
     check "单元：chunk 状态表（pending 占着 chunk）、链管理器的每一行（离线、重启降级、唯一幸存者、整链重启、last_serving、rejoin、10 s 转发失败、drain、修复、新 target、SyncDone、计时重置——听全了才处理重启、随机输入下 I0）、集群警告、I5 的 target 租约（持有方 0.8 倍先自停）、复制 lane（C-5）" m9_unit
     check "CRAQ 组件测试（3 个数据服务、mem 传输）：写到每个成员、NeedFull 与重同步、唯一幸存者 incarnation（C-8）、整链重启、3.4.2.6 的四条前滚规则、3.4.2.4 的后继处理表、同步源列出 pending 的版本、退回 control_scheme 时警告" \
         tests_at_least 8 --release -p wmfs-testkit --test craq
-    check "CRAQ 组件测试（续，审查发现的边界情况）：同步期间写到中间的 Syncing 成员不丢 chunk、新成员等 0.8 × 租约才第一轮同步、规则 2 之后的重新驱动等后面的成员（C-9）、head 本地提交失败不让出版本号（I6）、I5 自我隔离（读与转发）、DeleteEpoch 沿链、多块 chunk 的部分覆盖与截断" \
+    check "CRAQ 组件测试（续，审查发现的边界情况）：同步期间写到中间的 Syncing 成员不丢 chunk、新成员等一个租约才第一轮同步、规则 2 之后的重新驱动等后面的成员（C-9）、head 本地提交失败不让出版本号（I6）、I5 自我隔离（读与转发）、DeleteEpoch 沿链、多块 chunk 的部分覆盖与截断" \
         tests_at_least 7 --release -p wmfs-testkit --test craq_edges
     check "M1 交接 ②：call_cb 在后台建连（调用方立即返回，回调在别的线程上）" \
         one_test --release -p wmfs-testkit --test net_rpc call_cb_dials_in_the_background
@@ -68,16 +68,16 @@ accept_m9() {
         wmfs status "$M/home" --json
     check "leader 的 /metrics：wmfs_chains_degraded = 0" m9_leader_metric wmfs_chains_degraded 0
     check "不变式检查器：静止后每条链所有 Serving 副本的已提交版本与内容（packed 形式的 crc32c）一致" \
-        m9_ignored --release -p wmfs-testkit --test replica_check every_serving_replica_has_the_same_committed_versions_and_bytes
+        ignored_test --release -p wmfs-testkit --test replica_check every_serving_replica_has_the_same_committed_versions_and_bytes
     check "md5 再核对一次（wmfs fs get 绕过页缓存，直接从数据节点读）" m9_md5_direct
-    check "写 2 GiB 的途中 kill -9 元数据 leader 所在的节点 → WRITE-OK、md5 一致；最长停顿 ≤ 15 s（选举 1–3 s + 新 leader 就绪后一个 target 租约的计时重置 + 集群图传播；超出 semantics.md 的约 8–10 s，已上报）" \
+    check "写 2 GiB 的途中 kill -9 元数据 leader 所在的节点 → WRITE-OK、md5 一致；最长停顿 ≤ 15 s（选举 1–3 s + 新 leader 就绪后一个 target 租约的计时重置 + 集群图传播；对照 semantics.md 第 7 节：宕的节点恰好也是元数据 leader 时约 10–13 s，ADR-0040 第 14 条）" \
         m9_kill_leader
     check "写 2 GiB 的途中冻住（SIGSTOP）元数据 leader 所在的节点 20 s → WRITE-OK、md5 一致；最长停顿 ≤ 16 s（客户端的元数据请求超时之后换节点，不干等冻住的 leader）" \
         m9_pause_leader
     check "ADR-0038 第 5 条：调小 target_lease 之后立刻冻结一个数据节点（SIGSTOP），它在旧租约（8 s）期满之前不被移出链" m9_settings_prev
     check "fail point chain.head.crash_after_pending（abort）：head 写完 pending 之后崩溃 → 写照样成功（存活成员前滚）；它重启之后以 Syncing 回链、再 Serving；副本一致" m9_head_crash
     check "Jepsen-lite：寄存器（单个 chunk，DataClient 直接读写）在随机 kill -9 / SIGSTOP 下线性一致（Wing-Gong；失败时打印种子）" \
-        m9_ignored --release -p wmfs-testkit --test jepsen_register a_register_on_one_chunk_stays_linearizable_while_nodes_die_and_freeze
+        ignored_test --release -p wmfs-testkit --test jepsen_register a_register_on_one_chunk_stays_linearizable_while_nodes_die_and_freeze
     check "join 的新节点补进链：dev up --nodes 4 → 生成以 t4 为 head 的链；1 副本的链最后的副本离线 → 链不可用、告警「等待最后的副本」、不拿别的顶替；回来之后可用；wmfs node drain 4 → 先追加替代成员、Serving 之后再移除 t4" \
         m9_join_drain
     check "wmfs chain force-serving：不加 --i-accept-data-loss 拒绝；加了 → 指定的 target 成为唯一 Serving、incarnation + 1、写 changelog ChainForceServing；其余重新同步" \
@@ -114,17 +114,6 @@ m9_rm_big() {
     fi
 }
 
-m9_ports_free() {
-    local p
-    for p in 19100 19180 19200 19280 19300 19380 19400 19480; do
-        if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
-            echo "127.0.0.1:$p 已被占用：演示用的开发集群还在运行？请先 wmfs dev down，再跑 scripts/accept.sh M9"
-            return 1
-        fi
-    done
-    echo "19100–19480 都空闲"
-}
-
 m9_unit() {
     tests_at_least 5 --release -p wmfs-core --lib data::state || return 1
     tests_at_least 14 --release -p wmfs-core --lib meta::cluster::chain_plan || return 1
@@ -142,14 +131,6 @@ m9_golden() {
 m9_regress() {
     tests_at_least 7 --release -p wmfs-testkit --test data_e2e || return 1
     tests_at_least 8 --release -p wmfs-testkit --test meta_cluster
-}
-
-# 跑一个 #[ignore] 的用例（对着本次验收的开发集群），并确认它真的跑了。
-m9_ignored() {
-    local out
-    out="$(cargo test "$@" -- --exact --ignored --nocapture 2>&1)"
-    printf '%s\n' "$out"
-    printf '%s' "$out" | grep -q 'test result: ok. 1 passed'
 }
 
 m9_chains_full() {
@@ -309,7 +290,7 @@ m9_head_crash() {
     wmfs dev wait chains-serving --timeout 120 || return 1
     wmfs fs get /home/crash "$LOGDIR/crash.back" && cmp "$LOGDIR/crash.src" "$LOGDIR/crash.back" || return 1
     rm -f "$LOGDIR/crash.src" "$LOGDIR/crash.back"
-    m9_ignored --release -p wmfs-testkit --test replica_check every_serving_replica_has_the_same_committed_versions_and_bytes
+    ignored_test --release -p wmfs-testkit --test replica_check every_serving_replica_has_the_same_committed_versions_and_bytes
 }
 
 m9_join_drain() {
@@ -401,7 +382,7 @@ m9_whole_restart() {
     inc_after="$(wmfs chain list --json | jq '[.chains[].incarnation] | add')"
     echo "incarnation 之和：$inc_before → $inc_after"
     [ "$inc_after" -gt "$inc_before" ] || return 1
-    m9_ignored --release -p wmfs-testkit --test replica_check every_serving_replica_has_the_same_committed_versions_and_bytes || return 1
+    ignored_test --release -p wmfs-testkit --test replica_check every_serving_replica_has_the_same_committed_versions_and_bytes || return 1
     n="$(stat -c %s "$M/home/w")"
     wmfs fs get /home/w "$LOGDIR/w.back" || return 1
     echo "重同步期间写了 $((n >> 20)) MiB；读回比对"

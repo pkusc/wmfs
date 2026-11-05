@@ -11,7 +11,7 @@ path = "lib.rs"
 
 [dependencies]
 wmfs-core.workspace = true
-wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc"] }
+wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc"] }
 plugin-mem-transport.workspace = true
 crc32c.workspace = true
 redb.workspace = true
@@ -69,6 +69,10 @@ path = "it/failpoint_raft_abort.rs"
 [[test]]
 name = "failpoint_raft_order"
 path = "it/failpoint_raft_order.rs"
+
+[[test]]
+name = "failpoint_raft_plugins"
+path = "it/failpoint_raft_plugins.rs"
 
 [[test]]
 name = "failpoint_meta"
@@ -175,6 +179,11 @@ path = "it/client_reopen.rs"
 name = "meta_attrs"
 path = "it/meta_attrs.rs"
 
+# M10：配额、acl.default 与路径限制的语义（内存 KV 视图上）。
+[[test]]
+name = "meta_quota"
+path = "it/meta_quota.rs"
+
 [[test]]
 name = "meta_rstat"
 path = "it/meta_rstat.rs"
@@ -215,6 +224,12 @@ path = "it/craq.rs"
 name = "craq_edges"
 path = "it/craq_edges.rs"
 
+# M10 审查（ADR-0041 第 13–15 条）：链成员变更时的读窗口——活着的成员两步移出、新 L 的读窗口与登记顺序、非 L 成员提交那一下的重定向、
+# 租约边界（不用 fail point）。
+[[test]]
+name = "craq_members"
+path = "it/craq_members.rs"
+
 [[test]]
 name = "failpoint_chain"
 path = "it/failpoint_chain.rs"
@@ -222,6 +237,27 @@ path = "it/failpoint_chain.rs"
 [[test]]
 name = "failpoint_sync"
 path = "it/failpoint_sync.rs"
+
+# M10 第一步（ADR-0040 第 11 条）：提升 Syncing 尾的那一刻，S 一个租约内对读回 BUSY（chain.ack.drop 是进程级的：单独一个测试程序）。
+[[test]]
+name = "failpoint_promote"
+path = "it/failpoint_promote.rs"
+
+[[test]]
+name = "failpoint_evict"
+path = "it/failpoint_evict.rs"
+
+[[test]]
+name = "evict_inflight"
+path = "it/evict_inflight.rs"
+
+[[test]]
+name = "evict_lease"
+path = "it/evict_lease.rs"
+
+[[test]]
+name = "mgmt_keys"
+path = "it/mgmt_keys.rs"
 
 # M9：Jepsen-lite（寄存器负载直接用 DataClient 读写单个 chunk）与不变式检查器，都对着一个跑着的开发集群（固定端口：#[ignore]，
 # 由 scripts/accept.d/m9.sh 跑）；检查器本身的单元测试照常跑。

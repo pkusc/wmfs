@@ -21,7 +21,8 @@
 #   build_no_warnings                                cargo build --release --workspace 成功且零警告
 #   one_test <cargo test 参数…> <完整测试名>          只跑这一个测试（-- --exact），并确认它真的跑了
 #   tests_at_least <N> <cargo test 参数…>            通过，且至少跑了 N 个测试
-#   dev_ports_free <里程碑>                          开发集群的端口 19100、19180 空闲（演示用的开发集群要先 wmfs dev down）
+#   dev_ports_free <里程碑> [节点数]                 开发集群的端口 19n00、19n80（n = 1..节点数，默认 1）空闲（演示用的开发集群要先 wmfs dev down）
+#   ignored_test <cargo test 参数…> <完整测试名>     跑一个 #[ignore] 的用例（对着本次验收的开发集群），并确认它真的跑了
 #   expect_error <错误码> 命令…                      命令失败（退出码非 0），且 --json 输出里 .error 是这个错误码
 # 以及给检查函数用的：
 #   dev_metric <指标名>                              node1（127.0.0.1:19180）/metrics 里一个不带标签的指标的值（没有就是空）
@@ -125,16 +126,26 @@ tests_at_least() {
     [ "$n" -ge "$want" ]
 }
 
-# dev_ports_free <里程碑>：开发集群的 rpc 与管理端口上已经有人在听（多半是演示用的开发集群还在运行）→ 失败并提示 wmfs dev down。
+# dev_ports_free <里程碑> [节点数]：开发集群节点 n（1..节点数，默认 1）的 rpc 端口 19n00 与管理端口 19n80 上已经有人在听（多半是
+# 演示用的开发集群还在运行）→ 失败并提示 wmfs dev down。
 dev_ports_free() {
-    local p
-    for p in 19100 19180; do
+    local n p ports=""
+    for n in $(seq 1 "${2:-1}"); do ports="$ports 19${n}00 19${n}80"; done
+    for p in $ports; do
         if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
             echo "127.0.0.1:$p 已被占用：演示用的开发集群还在运行？请先 wmfs dev down，再跑 scripts/accept.sh $1"
             return 1
         fi
     done
-    echo "19100、19180 都空闲"
+    echo "端口$ports 都空闲"
+}
+
+# ignored_test <cargo test 参数…> <完整测试名>：跑一个 #[ignore] 的用例（对着本次验收的开发集群），并确认它真的跑了。
+ignored_test() {
+    local out
+    out="$(cargo test "$@" -- --exact --ignored --nocapture 2>&1)"
+    printf '%s\n' "$out"
+    printf '%s' "$out" | grep -q 'test result: ok. 1 passed'
 }
 
 # expect_error <错误码> 命令…：命令必须失败（退出码非 0），且 --json 输出里 .error 是期望的错误码。

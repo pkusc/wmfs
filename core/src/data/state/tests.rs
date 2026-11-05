@@ -1,5 +1,5 @@
-//! chunk 状态表的单元测试：同一 chunk 的写排队与上限、pending 占着 chunk、claim / take_held / put_held、脏（没在本地提交）与
-//! Corrupt 标记。
+//! chunk 状态表的单元测试：同一 chunk 的写排队与上限、pending 占着 chunk、claim / take_held / put_held、脏（正忙或没在本地提交）、
+//! 被占着与 Corrupt 标记。
 
 use super::*;
 use crate::data::write::JobKind;
@@ -100,6 +100,22 @@ fn committed_pendings_are_not_dirty_and_pendings_can_be_listed() {
     ids.sort();
     assert_eq!(ids, vec![chunk(0), chunk(1)]);
     assert_eq!(t.pendings(|_, p| p.version > 6), vec![chunk(1)]);
+}
+
+/// ADR-0041 第 14、15 条：正忙也算脏（取走 pending 到提交的 rename 完成之间，读重定向给 L）；"被占着" = 正忙或有 pending（含规则 2
+/// 已在本地提交、还在等确认的）。
+#[test]
+fn busy_chunks_are_dirty_and_pending_ones_are_held() {
+    let t = ChunkTable::new();
+    assert!(!t.has_dirty(&chunk(0)) && !t.held(&chunk(0)));
+    assert!(t.claim(&chunk(0)));
+    assert!(t.has_dirty(&chunk(0)) && t.held(&chunk(0)), "正忙（还没有 pending）");
+    t.set_pending(&chunk(0), PendingWrite { committed: true, ..pending(5) });
+    assert!(!t.has_dirty(&chunk(0)) && t.held(&chunk(0)), "规则 2 已在本地提交：不脏，但被占着");
+    assert!(t.take_pending(&chunk(0), None).is_some());
+    assert!(t.has_dirty(&chunk(0)) && t.held(&chunk(0)), "取走了 pending、正在提交：脏");
+    assert!(t.finish(&chunk(0)).is_none());
+    assert!(!t.has_dirty(&chunk(0)) && !t.held(&chunk(0)));
 }
 
 #[test]

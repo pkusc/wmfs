@@ -56,6 +56,7 @@ pub struct InodeState {
     pub readers: u32,
     pub writers: u32,
     pub unsynced: BTreeSet<u32>, // 写过或截断过、还没 SyncChunks 的 chunk（fsync 用）
+    pub quota_end: u64,          // 配额授予的写入上限（3.9；u64::MAX = 没有配额）：写打开与提交的回复带来（M10）
     io_busy: bool,               // 有线程拿着 io 权（[`Inode::io`]）
 }
 
@@ -75,6 +76,7 @@ impl InodeState {
             readers: 0,
             writers: 0,
             unsynced: BTreeSet::new(),
+            quota_end: u64::MAX,
             io_busy: false,
         }
     }
@@ -100,6 +102,7 @@ impl InodeState {
             }
             if c.rights & RIGHT_WRITE != 0 {
                 self.wcap = Cap::new(o.cap.clone());
+                self.quota_end = o.quota_end; // 只有带写权限的回复才算了额度（只读打开回的是 u64::MAX）
             }
         }
         if let Some(d) = &o.inline {

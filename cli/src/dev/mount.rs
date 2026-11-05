@@ -8,7 +8,7 @@
 //!   记录目录的名字 = 挂载点的最后一段（重名时加 `-2`、`-3`……）；按挂载点找记录时扫一遍 `mounts/`，比对各自的 `mountpoint`
 //!   文件。实现注记（M6）：7.2 的 `--node n`（客户端冒充那个节点所在的"主机"）随 M13 的 locality。
 //! - `dev umount <挂载点>`：`fusermount3 -u`，等挂载进程退出（它写出全部脏数据后自己退出），删掉记录。
-//! - `dev client-pid <挂载点>`：打印挂载进程的 pid（M10 用 `kill -STOP` 冻住它演示驱逐）。
+//! - `dev client-pid <挂载点>`：打印挂载进程的 pid（M10 用 `kill -STOP` 冻住它演示驱逐）；[`session_of`]：挂载日志里它现在的会话号。
 //! - `dev down` 先清理挂载、再停节点（否则节点停了以后挂载点上的命令会卡到 `--op-timeout`）：对每个开发挂载进程依次 SIGCONT
 //!   （被冻住的也能处理 SIGTERM）→ SIGTERM（它写出脏数据、自己卸载）→ 3 s 后仍在就 SIGKILL → 还挂着的（被 SIGKILL 的、卡住的）
 //!   `fusermount3 -uz`（lazy 卸载：冻住或崩溃的挂载点上普通卸载会 EBUSY 或卡住）→ 删掉记录（7.2 的"安全清理顺序"）。
@@ -19,10 +19,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use wmfs_core::base::{clock, sys};
+use wmfs_core::client::lease::NEW_SESSION;
 
 use super::proc::{live_pid, spawn_logged, wait_exit, wait_ready};
 use super::{health, node_dir, nodes};
 use crate::doctor::parse::parse_mountinfo;
+use crate::fuse::{MOUNTED, MOUNTED_SESSION};
 
 const MOUNT_TIMEOUT_MS: u64 = 30_000;
 
@@ -112,13 +114,13 @@ pub fn mount(d: &Path, mp: &Path, key_file: &Option<PathBuf>, cache: &Option<Str
         return Err(e);
     }
     let text = read_log();
-    Ok(text.lines().filter(|l| l.starts_with("警告") || l.starts_with("已挂载")).map(String::from).collect())
+    Ok(text.lines().filter(|l| l.starts_with("警告") || l.starts_with(MOUNTED)).map(String::from).collect())
 }
 
 /// 挂载进程已经把"已挂载 …"这一行完整写进了日志。只看 mountinfo 不够：挂载在 `Session::new` 里就出现在 mountinfo 里，
 /// 集群警告与"已挂载"是紧接着才一次写出来的——只等 mountinfo，偶尔会读到还空着的日志，什么也转不出来。
 pub fn announced(log: &str) -> bool {
-    log.split_inclusive('\n').any(|l| l.starts_with("已挂载") && l.ends_with('\n'))
+    log.split_inclusive('\n').any(|l| l.starts_with(MOUNTED) && l.ends_with('\n'))
 }
 
 /// 还挂着就 lazy 卸载（`fusermount3 -uz`：冻住或崩溃的挂载点上普通卸载会 EBUSY 或卡住）；卸不掉也不报错。
@@ -128,9 +130,41 @@ fn lazy_umount(mp: &Path) {
     }
 }
 
-/// 找到挂载点的记录（没有 → 错误）。
+/// 挂载点 `mp` 现在的会话号（`dev wait session-evicted`，M10）：挂载日志里最后一个——"已挂载 …（会话 X）"，或被驱逐之后的
+/// "……新会话 Y"（`client/lease.rs`）。
+pub fn session_of(d: &Path, mp: &Path) -> Result<u64, String> {
+    let (rec, mp) = find(d, mp)?;
+    let log = std::fs::read_to_string(rec.join("mount.log")).unwrap_or_default();
+    last_session(&log).ok_or_else(|| format!("{} 的挂载日志里没有会话号", mp.display()))
+}
+
+/// 挂载日志 `log` 里最后一个会话号：被驱逐之后的"……新会话 Y"（字样是 `client::lease::NEW_SESSION`），或挂载时的
+/// "已挂载 …（会话 X）"（字样是 `fuse::MOUNTED`、`MOUNTED_SESSION`）；都没有 → None。
+pub fn last_session(log: &str) -> Option<u64> {
+    for l in log.lines().rev() {
+        let rest = if let Some(i) = l.rfind(NEW_SESSION) {
+            &l[i + NEW_SESSION.len()..]
+        } else if let Some(i) = l.rfind(MOUNTED_SESSION).filter(|_| l.starts_with(MOUNTED)) {
+            &l[i + MOUNTED_SESSION.len()..]
+        } else {
+            continue;
+        };
+        let hex: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+        if let Ok(sid) = u64::from_str_radix(&hex, 16) {
+            return Some(sid);
+        }
+    }
+    None
+}
+
+/// 找到挂载点的记录（没有 → 错误）。实现注记（M10）：不 stat 挂载点本身（只规范化它的父目录）——挂载进程被冻住（SIGSTOP）时
+/// stat 它会卡住，而 `dev client-pid`、`dev wait session-evicted` 正是在那时候用的。
 fn find(d: &Path, mp: &Path) -> Result<(PathBuf, PathBuf), String> {
-    let mp = canon(mp)?;
+    let mp = match (mp.parent().filter(|p| !p.as_os_str().is_empty()), mp.file_name()) {
+        (Some(parent), Some(name)) => canon(parent)?.join(name),
+        (None, Some(name)) => canon(Path::new("."))?.join(name),
+        _ => canon(mp)?,
+    };
     match records(d).into_iter().find(|(_, m)| *m == mp) {
         Some((rec, _)) => Ok((rec, mp)),
         None => Err(format!("{} 不是 wmfs dev mount 挂上的（{} 里没有记录）", mp.display(), d.display())),

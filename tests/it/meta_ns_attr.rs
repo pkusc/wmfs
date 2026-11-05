@@ -1,7 +1,7 @@
 //! setattr 与 xattr（design.md 3.5.1、3.4.2.9、3.1.1）：chmod/chown/时间的属主规则、setuid/setgid 的清除、截断到 s > 0
 //! （inline 文件截 INLINE、epoch 不符 → STALE_LAYOUT）与**截断到 0 按当前属性重建 layout**（新 epoch、按当前的存储类重新选链、
 //! 旧 epoch 写 GC 记录）、xattr 的名字空间与大小限制、POSIX ACL（权限位同步、F_HAS_ACL、默认 ACL 的继承与 umask 规则、
-//! M10 之前带扩展 ACL 的 inode 只有 root 能访问）、inline 文件的内容只给有读权限的人。
+//! M10 起带扩展 ACL 的 inode 由 posix-acl 判）、inline 文件的内容只给有读权限的人。
 
 use wmfs_core::base::ErrCode;
 use wmfs_core::base::types::Ts;
@@ -209,8 +209,9 @@ fn access_acls_sync_the_mode_bits() {
     assert_eq!(ns.attr(f).flags & F_HAS_ACL, 0);
 }
 
+/// M10：带扩展 ACL 的 inode 由 posix-acl 按 ACL 判（M10 之前只有 root 过得去）；root 照样放行（posix-mode 先放行 root）。
 #[test]
-fn only_root_gets_past_an_extended_acl_before_m10() {
+fn extended_acls_are_judged_by_posix_acl() {
     let mut ns = Ns::new();
     let d = ns.mkdir(&OWNER, ROOT_INO, "d").unwrap();
     ns.create(&OWNER, d, "f").unwrap();
@@ -229,11 +230,14 @@ fn only_root_gets_past_an_extended_acl_before_m10() {
     assert!(ns.read(&ROOT, readdir.clone()).is_ok());
     assert!(ns.create(&ROOT, d, "byroot").is_ok());
     assert!(ns.read(&ROOT, MetaOp::ResolvePath { path: b"/d/f".to_vec() }).is_ok());
-    for who in [OWNER, user(2000, 2000)] {
-        assert_eq!(ns.read(&who, lookup.clone()), Err(ErrCode::EACCES), "posix-acl 在 M10：{who:?} 还过不去");
-        assert_eq!(ns.read(&who, readdir.clone()), Err(ErrCode::EACCES));
-        assert_eq!(ns.create(&who, d, "x"), Err(ErrCode::EACCES));
+    for (who, name) in [(OWNER, "x"), (user(2000, 2000), "y")] {
+        assert!(ns.read(&who, lookup.clone()).is_ok(), "{who:?}：属主 / 命名用户 rwx");
+        assert!(ns.read(&who, readdir.clone()).is_ok());
+        assert!(ns.create(&who, d, name).is_ok());
     }
+    let other = user(3000, 3000);
+    assert!(ns.read(&other, readdir.clone()).is_ok(), "其他人 r-x");
+    assert_eq!(ns.create(&other, d, "z"), Err(ErrCode::EACCES), "其他人没有 w");
 }
 
 #[test]

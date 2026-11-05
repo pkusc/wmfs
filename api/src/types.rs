@@ -7,8 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
+mod access;
 mod cluster;
 mod mgmt;
+pub use access::*; // M10 的管理端点：认证 key 与会话（types/access.rs）
 pub use cluster::*; // M8 的管理端点：集群概览与节点、集群插件清单、元数据哈希（types/cluster.rs）
 pub use mgmt::*; // M7 的管理端点：目录属性、用量、声明 vs 实际、语义、changelog 与游标、集群运行参数（types/mgmt.rs）
 
@@ -120,6 +122,13 @@ pub struct ChangeEvent {
     pub size: u64,
     pub extra: Vec<(String, String)>,
     pub audited: bool,
+}
+
+/// 金样测试共用（`types/*/tests.rs`）：`v` 编码出来逐字是 `want`，`want` 解码回来等于 `v`。
+#[cfg(test)]
+pub(crate) fn same<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(v: &T, want: &str) {
+    assert_eq!(serde_json::to_string(v).unwrap(), want);
+    assert_eq!(&serde_json::from_str::<T>(want).unwrap(), v);
 }
 
 #[cfg(test)]

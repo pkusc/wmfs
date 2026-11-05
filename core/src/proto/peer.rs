@@ -151,6 +151,13 @@ pub struct ClusterMap {
     pub warnings: Vec<String>, // leader 由已提交状态算出的集群警告（中文）：短链、故障域不足、故障域重叠、2 voter 无高可用……
 }
 
+impl ClusterMap {
+    /// 存储类 `id` 的名字（集群图里没有 → `#id`；`wmfs get`、`wmfs usage` 显示用）。
+    pub fn class_name(&self, id: u16) -> String {
+        self.classes.iter().find(|k| k.id == id).map_or(format!("#{id}"), |k| k.name.clone())
+    }
+}
+
 // ---- SnapshotFetch（0x0501，3.4.1.7）：follower 向快照源要快照，leader 用 StreamChunk 帧流式返回 ----
 
 /// raft `Snapshot.data` 的内容：`postcard(SnapDesc)`——快照内容不进 raft 消息，follower 凭它去 `source_node` 下载。

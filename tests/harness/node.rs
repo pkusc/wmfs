@@ -28,7 +28,9 @@ use wmfs_core::meta::schema::records::{ClusterSettingsV1, F_INLINE, LayoutV1};
 use wmfs_core::net::client::{Endpoint, RpcClient};
 use wmfs_core::proto::meta::{MetaOp, MetaReply, O_RDONLY, OpenOut, SetAttrIn};
 use wmfs_core::server::{self, Running};
-use wmfs_plugins::{crc32c, fifo, gc, label_match, local_fs, posix_mode, replica, shared_key, tcp};
+use wmfs_plugins::{
+    crc32c, fifo, gc, label_match, local_fs, path_caps, posix_acl, posix_mode, quota, replica, shared_key, tcp,
+};
 
 use super::meta::admin_ctx;
 
@@ -50,6 +52,9 @@ pub fn plugins(cfg: &NodeConfig) -> PluginSet {
     s.transport(Arc::new(tcp::TcpTransport::new(&cfg.plugin_cfg("tcp"), cfg.net.write_timeout_ms).unwrap()));
     s.authn(Arc::new(shared_key::SharedKey::new()));
     s.authz(Arc::new(posix_mode::PosixMode::new()));
+    s.authz(Arc::new(posix_acl::PosixAcl::new()));
+    s.authz(Arc::new(path_caps::PathCaps::new()));
+    s.quota(Arc::new(quota::Quota::new()));
     s.placement(Arc::new(label_match::LabelMatch::new()));
     s.chunk_store(Arc::new(local_fs::LocalFs::new()));
     s.transform(Arc::new(crc32c::Crc32c::new()));
@@ -145,8 +150,15 @@ fn connect(dir: &Path, run: &Running, key: &str, pool: PoolConfig) -> Client {
     connect_seeds(&node_dir(dir), &[ep], key, pool)
 }
 
-/// 用 `<节点目录>/keys/<key>.key` 连到 `seeds` 里的节点（MetaClient 跟随 leader；多节点的测试给全部节点，M8）。
+/// 用 `<节点目录>/keys/<key>.key` 连到 `seeds` 里的节点（MetaClient 跟随 leader；多节点的测试给全部节点，M8）。起会话心跳（M10）。
 pub fn connect_seeds(nd: &Path, seeds: &[Endpoint], key: &str, pool: PoolConfig) -> Client {
+    let c = connect_silent(nd, seeds, key, pool);
+    c.meta.start_heartbeat(); // 没有心跳的会话 30 s 后被驱逐（M10）
+    c
+}
+
+/// 同 [`connect_seeds`]，但不起会话心跳（M10 的驱逐测试：一个"失联"的客户端）。
+pub fn connect_silent(nd: &Path, seeds: &[Endpoint], key: &str, pool: PoolConfig) -> Client {
     let kf = KeyFile::parse(&std::fs::read_to_string(nd.join(format!("keys/{key}.key"))).unwrap()).unwrap();
     let pool = MemPool::new(&pool).unwrap();
     let t = tcp::TcpTransport::new(&Default::default(), 5000).unwrap();

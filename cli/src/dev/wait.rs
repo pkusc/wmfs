@@ -7,12 +7,15 @@
 //!   Serving（问 leader 的 `GET /api/v1/chains`；leader 最近没听到心跳的、刚重启还没被处理的成员不算 Serving）。等的过程中状态变了
 //!   就记一行（最多 50 行），返回时连同最后一行一起打印：演示里看得到"先 Syncing、后 Serving"。
 //!
-//! 其余条件（`task-idle`、`session-evicted`、`alert`、`audit-caught-up`）随功能在后面的里程碑加入。
+//! - `session-evicted <挂载点>`（M10）：这个开发挂载现在的会话（挂载日志里最后一个会话号）两阶段驱逐都做完了——`GET /api/v1/sessions`
+//!   里它的状态是 `evicted`（只剩 EVICTED 记录）。
+//!
+//! 其余条件（`task-idle`、`alert`、`audit-caught-up`）随功能在后面的里程碑加入。
 
 use std::path::Path;
 use std::time::Duration;
 
-use wmfs_core::api::types::ChainsReply;
+use wmfs_core::api::types::{ChainsReply, SessionsReply};
 use wmfs_core::base::clock;
 use wmfs_mgr::api::ApiClient;
 
@@ -20,15 +23,22 @@ use super::{admin_key, health, mgmt_addr, nodes};
 
 pub fn wait(d: &Path, what: &[String], timeout_s: u64) -> Result<Vec<String>, String> {
     let cond = what.first().map(String::as_str).unwrap_or_default();
-    if !matches!(cond, "leader" | "chains-serving") || what.len() > 1 {
-        return Err(format!(
-            "不认识的条件 {what:?}：现在有 leader、chains-serving（task-idle 等随功能在后面的里程碑加入）"
-        ));
-    }
+    let sid = match (cond, what.get(1)) {
+        ("leader" | "chains-serving", None) => 0,
+        ("session-evicted", Some(mp)) if what.len() == 2 => super::mount::session_of(d, Path::new(mp))?,
+        _ => {
+            let have = "leader、chains-serving、session-evicted <挂载点>（task-idle 等随功能在后面的里程碑加入）";
+            return Err(format!("不认识的条件 {what:?}：现在有 {have}"));
+        }
+    };
     let deadline = clock::mono_ms().saturating_add(timeout_s.saturating_mul(1000)); // --timeout 写得再大也不回绕
     let mut seen: Vec<String> = Vec::new();
     loop {
-        let (ok, now) = if cond == "leader" { leader(d) } else { chains(d) };
+        let (ok, now) = match cond {
+            "leader" => leader(d),
+            "chains-serving" => chains(d),
+            _ => evicted(d, sid),
+        };
         if ok {
             seen.push(now);
             return Ok(seen);
@@ -80,5 +90,21 @@ fn chains(d: &Path) -> (bool, String) {
         (true, format!("{n} 条链全部达到期望长度且全部 Serving"))
     } else {
         (false, bad.join("；"))
+    }
+}
+
+fn evicted(d: &Path, sid: u64) -> (bool, String) {
+    let addrs: Vec<String> = nodes(d).iter().filter_map(|n| mgmt_addr(d, *n).ok()).collect();
+    let key = match admin_key(d, 1) {
+        Ok(k) => k,
+        Err(e) => return (false, e),
+    };
+    let id = format!("{sid:x}");
+    match ApiClient::new(addrs, key).get::<SessionsReply>("/api/v1/sessions") {
+        Ok(r) => match r.sessions.iter().find(|s| s.id == id) {
+            Some(s) => (s.state == "evicted", format!("会话 {id}：{}", s.state.to_uppercase())),
+            None => (false, format!("会话 {id} 不在会话列表里（已经正常关闭了？）")),
+        },
+        Err(e) => (false, e.to_string()),
     }
 }

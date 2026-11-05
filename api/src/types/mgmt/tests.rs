@@ -2,11 +2,7 @@
 
 use super::*;
 use crate::types::ChangeEvent;
-
-fn same<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(v: &T, want: &str) {
-    assert_eq!(serde_json::to_string(v).unwrap(), want);
-    assert_eq!(&serde_json::from_str::<T>(want).unwrap(), v);
-}
+use crate::types::same;
 
 fn map(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
     kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -41,16 +37,30 @@ fn attr_json_golden() {
 
 #[test]
 fn usage_status_semantics_json_golden() {
+    let q = QuotaUsage {
+        dir: "/p".into(),
+        class: None,
+        hard: 100 << 20,
+        soft: 80 << 20,
+        grace_ms: 60_000,
+        files: 1000,
+        quantum: 1 << 20,
+        used_bytes: 90 << 20,
+        used_files: 3,
+        soft_since_ms: 1_792_454_400_123,
+        grace_left_ms: Some(42_000),
+    };
     let u = UsageReply {
         path: "/p".into(),
         bytes: 1 << 40,
         files: 3,
         dirs: 2,
         per_class: vec![ClassUsage { class: "default".into(), bytes: 1 << 40, files: 3 }],
+        quotas: vec![q],
     };
     same(
         &u,
-        r#"{"path":"/p","bytes":1099511627776,"files":3,"dirs":2,"per_class":[{"class":"default","bytes":1099511627776,"files":3}]}"#,
+        r#"{"path":"/p","bytes":1099511627776,"files":3,"dirs":2,"per_class":[{"class":"default","bytes":1099511627776,"files":3}],"quotas":[{"dir":"/p","class":null,"hard":104857600,"soft":83886080,"grace_ms":60000,"files":1000,"quantum":1048576,"used_bytes":94371840,"used_files":3,"soft_since_ms":1792454400123,"grace_left_ms":42000}]}"#,
     );
     let a = StatusAttr {
         key: "replicas".into(),

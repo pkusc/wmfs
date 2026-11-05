@@ -2,9 +2,9 @@
 //!
 //! unlink：删目录项；nlink − 1；删的是主链接且还有别的链接 → 主链接改为 extra_links[0]；nlink 为 0 → 标 F_ORPHAN +
 //! GC 记录 kind 1（打开着它的客户端照常读写，无人打开后由 gc 任务删除，3.5.6）。rmdir：只能删空目录（`size == 0`，
-//! 否则 `ENOTEMPTY`）；删目录项、inode、它的 XATTR、RSTAT、DIRATTR、QOS（删了 QOS 就 `map_epoch += 1`：QoS 表在集群图里，
-//! 3.3.6）；父目录 nlink − 1、size − 1。查名字之前先要能在父目录里查名字（执行权限，与 lookup 相同），所以没有权限的人
-//! 从 `ENOENT` 与 `EACCES` 的区别里看不出目录里有哪些名字。
+//! 否则 `ENOTEMPTY`）；删目录项、inode、它的 XATTR、RSTAT、DIRATTR（连同它的配额键的软限起点 QUOTA_STATE，M10 审查）、QOS（删了
+//! QOS 就 `map_epoch += 1`：QoS 表在集群图里，3.3.6）；父目录 nlink − 1、size − 1。查名字之前先要能在父目录里查名字（执行权限，
+//! 与 lookup 相同），所以没有权限的人从 `ENOENT` 与 `EACCES` 的区别里看不出目录里有哪些名字。
 //! 实现注记（M4）：`trash` 属性（回收站）在 M12。实现注记（M7）：祖先 RSTAT 的扣除（3.9）：最后一个链接 → bytes − size、files − 1；
 //! 删的是主链接、还有别的链接 → 计数搬到 extra_links[0] 的目录；rmdir → dirs − 1。
 
@@ -16,9 +16,11 @@ use crate::hooks::traits::AuthzOp;
 use crate::meta::attrs::bump_attr_epoch;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvTxn, OpCtx};
+use crate::meta::quota;
 use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys;
 use crate::meta::schema::kv;
+use crate::meta::schema::records::AttrMapV1;
 use crate::proto::meta::MetaReply;
 
 /// 去掉文件 `n` 在 (parent, name) 的链接（目录项已由调用方处理）：nlink − 1，归零 → 孤儿（立即从祖先 RSTAT 扣掉）；删的是主链接、
@@ -38,13 +40,16 @@ pub fn unlink_file(v: &mut dyn KvTxn, c: &OpCtx, n: &mut Node, parent: u64, name
 }
 
 /// 删掉一个（空）目录自己的记录：inode、XATTR、RSTAT、DIRATTR、QOS（点删除；QOS 在的话同一批里 `map_epoch += 1`；DIRATTR 在的话
-/// `attr_epoch += 1`——属性变了，解析缓存要作废，M7）。
+/// `attr_epoch += 1`——属性变了，解析缓存要作废，M7——并删掉它的配额键的软限起点，M10 审查）。
 pub fn delete_dir_records(v: &mut dyn KvTxn, ino: u64) -> Result<(), ErrCode> {
     if v.get(&keys::qos(ino))?.is_some() {
         v.delete(&keys::qos(ino));
         kv::bump_map_epoch(v)?;
     }
-    if v.get(&keys::dirattr(ino))?.is_some() {
+    if let Some(m) = kv::get::<AttrMapV1>(v, &keys::dirattr(ino))? {
+        for k in m.entries.keys() {
+            quota::forget(v, ino, k)?;
+        }
         bump_attr_epoch(v)?;
     }
     for k in [keys::inode(ino), keys::xattr(ino), keys::rstat(ino), keys::dirattr(ino)] {

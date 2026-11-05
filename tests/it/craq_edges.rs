@@ -1,7 +1,8 @@
 //! CRAQ 组件测试（续，design.md 9.3）：M9 审查发现的边界情况，每个都有回归。3 个数据服务经 mem 传输互连，集群图由测试下发。
 //! - 同步期间写到中间的 Syncing 成员（链 [L, S1(Y), S2(Y)]）：S1 收到后继的确认、本地提交了的新 chunk 要进本轮的 touched，不能被
 //!   第 3 步当成"源端没有的"删掉（审查前丢了约六成）；
-//! - 新的 Syncing 成员先于同步源换上新图：等 0.8 × target_lease 才开始第一轮（同步源那时还当自己是尾，本地提交的写不会转发过来）；
+//! - 新的 Syncing 成员先于同步源换上新图：等一个 target_lease 才开始第一轮（M10 起：ADR-0040 第 12 条，M9 是 0.8 倍）（同步源
+//!   那时还当自己是尾，本地提交的写不会转发过来）；
 //! - 3.4.2.6 规则 2 之后前驱重新驱动同一个版本：新 L 要等后面的 Syncing 成员确认了才回（I3、附录 C 的 C-9）；
 //! - I5：租约没续上、过期、本地集群图比心跳回复里的旧、boot_id 不符 → 读与转发都回 `FENCED`；后继回 `FENCED` 时前驱约 0.5 s 后就重发；
 //! - head 本地提交失败（后继已提交）：pending 留着、版本号不让出（I6）；
@@ -62,10 +63,10 @@ fn a_new_member_waits_before_its_first_sync_round() {
     c.write(0, 0, b"v1").unwrap();
     let m = c.new_map(&[(1, chain(&[(1, S), (3, Y)], 2, 1))]);
     c.deliver(&m, &[3]); // 新的 Syncing 成员先换上新图；node1（同步源）与客户端还在旧图上
-    std::thread::sleep(Duration::from_millis(300)); // 比同步线程的轮询（200 ms）久、比 0.8 × target_lease（800 ms）短
+    std::thread::sleep(Duration::from_millis(300)); // 比同步线程的轮询（200 ms）久、比一个 target_lease（1 s）短
     c.write(0, 0, b"v2").unwrap(); // node1 还当自己是尾：本地提交，不转发
     c.write(1, 0, b"new").unwrap();
-    c.deliver(&m, &[1]); // 0.8 × 租约之内 node1 换上新图（真集群里换不上就按 I5 自我隔离）
+    c.deliver(&m, &[1]); // 一个租约之内 node1 换上新图（真集群里换不上就按 I5 自我隔离）
     c.set_client_map(m);
     wait_sync_done(&c, 3, 2);
     c.set_chains(&[(1, chain(&[(1, S), (3, S)], 3, 1))]);

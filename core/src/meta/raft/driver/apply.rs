@@ -3,7 +3,6 @@
 //! 可以直接用 Driver 的私有字段。实现注记（M8）：另有快照的安装（规则 M5，[`Driver::install`]）与 raft 线程的指标。
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use protobuf::Message as _;
 use raft::StateRole;
@@ -62,8 +61,9 @@ impl Metrics {
 pub(super) struct AppliedEntry {
     index: u64,
     term: u64,
-    ok: bool,        // 批次应用了（空条目、作废的批次为 false）
-    changelog: bool, // 这个批次写了 changelog（0x0E）：提交之后唤醒长轮询
+    ok: bool,                              // 批次应用了（空条目、作废的批次为 false）
+    changelog: bool,                       // 这个批次写了 changelog（0x0E）：提交之后唤醒长轮询
+    plugins: Option<Option<PluginListV1>>, // 这个批次改了 GLOBAL plugins：改成的清单（内层 None = 删掉了或解不开），提交之后比对
 }
 
 impl Driver {
@@ -94,7 +94,7 @@ impl Driver {
         let _ = fail_point("raft.apply.before");
         let mut out = Vec::with_capacity(ents.len());
         for e in ents {
-            let mut a = AppliedEntry { index: e.index, term: e.term, ok: false, changelog: false };
+            let mut a = AppliedEntry { index: e.index, term: e.term, ok: false, changelog: false, plugins: None };
             match e.get_entry_type() {
                 // 新 leader 的空条目，或被 raft-rs 改写成空条目的 conf change（坑 P4 的反面、P21）
                 EntryType::EntryNormal if e.data.is_empty() => {}
@@ -116,7 +116,8 @@ impl Driver {
 
     /// 一个批次：`expect_version == state_version` 才应用并令 `state_version = index`；不等则整批跳过
     /// （所有副本看到同样的日志、做同样的判断，所以是确定性的，3.4.1.5）。follower 只做"按顺序应用 ops"，没有业务逻辑。
-    /// 应用了 → `a.ok = true`；批次里写了 changelog → `a.changelog = true`。
+    /// 应用了 → `a.ok = true`；批次里写了 changelog → `a.changelog = true`；改了 GLOBAL plugins → `a.plugins`（写事务提交之后
+    /// 由 [`Driver::after_apply`] 比对）。
     fn apply_batch(&mut self, tx: &WriteTransaction, e: &Entry, a: &mut AppliedEntry) {
         let wb = WriteBatchV1::decode(&e.data)
             .unwrap_or_else(|c| panic!("不变量破坏：已提交的 raft 条目 {} 无法解码为 WriteBatchV1（{c}）", e.index));
@@ -127,7 +128,6 @@ impl Driver {
             return;
         }
         let plugins_key = keys::global(keys::G_PLUGINS);
-        let mut plugins_changed = None;
         a.changelog =
             wb.ops.iter().any(|op| matches!(op, KvOp::Put { key, .. } if key.first() == Some(&keys::T_CHANGELOG)));
         {
@@ -137,20 +137,17 @@ impl Driver {
                     KvOp::Put { key, value } => {
                         or_abort(kv.insert(key.as_slice(), value.as_slice()), "写 kv");
                         if *key == plugins_key {
-                            plugins_changed = Some(decode_v1::<PluginListV1>(value).ok());
+                            a.plugins = Some(decode_v1::<PluginListV1>(value).ok());
                         }
                     }
                     KvOp::Delete { key } => {
                         or_abort(kv.remove(key.as_slice()), "删 kv");
                         if *key == plugins_key {
-                            plugins_changed = Some(None);
+                            a.plugins = Some(None);
                         }
                     }
                 }
             }
-        }
-        if let Some(c) = plugins_changed {
-            self.check_plugins(c.as_ref()); // 集群插件清单变了：重新比对（3.7.2）
         }
         self.applied.state_version = e.index;
         a.ok = true;
@@ -174,9 +171,14 @@ impl Driver {
         );
     }
 
-    /// 写事务提交之后：在途提议按 (index, term) 认领已应用的条目——队首 index < 条目 → Lost；相等且 term 相同 →
-    /// Applied{ok}；term 不同 → Lost（条目被新 leader 覆盖）。
+    /// 写事务提交之后：改了 GLOBAL plugins 的批次按顺序重新比对插件清单（3.7.2）；在途提议按 (index, term) 认领已应用的条目——
+    /// 队首 index < 条目 → Lost；相等且 term 相同 → Applied{ok}；term 不同 → Lost（条目被新 leader 覆盖）。
+    /// 实现注记（M10）：比对（发布 `mismatch`）从写事务里挪到了这里。以前在写事务里就发布，cluster-mgr 可能先看到 `mismatch`、
+    /// 再读 kv 时读到提交之前的旧清单（与本地相同），退出日志里的差异是空的
     pub(super) fn after_apply(&mut self, applied: &[AppliedEntry]) {
+        for c in applied.iter().filter_map(|a| a.plugins.as_ref()) {
+            self.check_plugins(c.as_ref());
+        }
         for a in applied {
             while self.pending.front().is_some_and(|p| p.index <= a.index) {
                 let Some(p) = self.pending.pop_front() else { break };
@@ -261,6 +263,8 @@ impl Driver {
     /// 实现注记（M9，ADR-0039 第 6 条）：一致了、或已应用的集群清单变了（逃生口被用过了），就不再豁免（`Published::adopt_done`）。
     /// 实现注记（M9）：applied 0 的节点一律不算——只做数据的节点不在 raft 里，它的 kv 只有 join 时预写的、之后不再更新的旧清单（按它
     /// 比对的话，改清单之后按新配置重启的节点会因旧清单退出）；它由心跳线程按每一张集群图比对（`server.rs` 的 `on_map`）。
+    /// 实现注记（M10）：只在已提交的状态上调用（启动时、写事务提交之后）；发布的 `mismatch` 带着这里算出的差异，cluster-mgr 退出时
+    /// 照抄它，不再自己读 kv 重算（`raft/types.rs` 的 `Published`）。
     pub(super) fn check_plugins(&mut self, committed: Option<&PluginListV1>) {
         self.plugins_ok = committed == Some(&self.plugins);
         if self.plugins_ok || self.seen_plugins.as_ref() != committed {
@@ -268,14 +272,13 @@ impl Driver {
         }
         self.seen_plugins = committed.cloned();
         let mismatch = !self.plugins_ok && self.applied.index > 0;
-        self.published.mismatch.store(mismatch, Ordering::Relaxed);
-        if !mismatch {
-            return;
+        let why = mismatch.then(|| plugins::why(&self.plugins, committed));
+        if let Some(why) = &why {
+            log::error(
+                "raft",
+                format_args!("本节点的插件集合与集群插件清单不一致：{why}——不当就绪 leader（3.7.2）。{}", plugins::FIX),
+            );
         }
-        let why = plugins::why(&self.plugins, committed);
-        log::error(
-            "raft",
-            format_args!("本节点的插件集合与集群插件清单不一致：{why}——不当就绪 leader（3.7.2）。{}", plugins::FIX),
-        );
+        *lock(&self.published.mismatch) = why;
     }
 }

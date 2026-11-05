@@ -5,7 +5,7 @@
 //! - [`engine`]：元数据事务模型（3.5.1）与它的实现：单飞批次执行器、读闸门、去重（M3）
 //! - [`service`]：`MetaCall` 与 `NodeCall` 的服务端（M3：调试键空间；M4：命名空间、会话、`GetClusterMap`）
 //! - [`ns`]：命名空间操作（M4）
-//! - [`sessions`]：客户端会话（M4：open / heartbeat / close；驱逐在 M10）
+//! - [`sessions`]：客户端会话（M4：open / heartbeat / close）；[`evict`]：会话租约到期与两阶段驱逐（M10）
 //! - [`changelog`]：changelog 写入（M4）
 //! - [`cluster`]：集群图与集群警告、链的生成、cluster-mgr 线程（M4 起）
 //! - [`attrs`]：目录属性解析（M4 只有内置默认值；M7：继承、来源、按 attr_epoch 的缓存）
@@ -14,7 +14,9 @@
 //! - [`uninline`]：服务端把 inline 小文件转成 chunk（M5，ADR-0034）
 //! - [`gc_meta`]：GC 记录的元数据一侧（gc 任务用，M5）
 //!
-//! 配额（quota，M10）、锁（M12）随里程碑加入。
+//! - [`quota`]：配额的本体一侧——quantum 额度、精确检查、护栏、软限的起点（M10）
+//!
+//! 锁（M12）随里程碑加入。
 
 pub mod attr_ops;
 pub mod attr_registry;
@@ -22,8 +24,10 @@ pub mod attrs;
 pub mod changelog;
 pub mod cluster;
 pub mod engine;
+pub mod evict;
 pub mod gc_meta;
 pub mod ns;
+pub mod quota;
 pub mod raft;
 pub mod rstat;
 pub mod schema;

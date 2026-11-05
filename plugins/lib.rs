@@ -19,6 +19,18 @@ pub mod rdma;
 #[path = "posix-mode/mod.rs"]
 pub mod posix_mode;
 
+#[cfg(feature = "posix-acl")]
+#[path = "posix-acl/mod.rs"]
+pub mod posix_acl;
+
+#[cfg(feature = "path-caps")]
+#[path = "path-caps/mod.rs"]
+pub mod path_caps;
+
+#[cfg(feature = "quota")]
+#[path = "quota/mod.rs"]
+pub mod quota;
+
 #[cfg(feature = "label-match")]
 #[path = "label-match/mod.rs"]
 pub mod label_match;

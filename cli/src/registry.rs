@@ -27,6 +27,12 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     s.authn(Arc::new(wmfs_plugins::shared_key::SharedKey::new()));
     #[cfg(feature = "posix-mode")]
     s.authz(Arc::new(wmfs_plugins::posix_mode::PosixMode::new()));
+    #[cfg(feature = "posix-acl")]
+    s.authz(Arc::new(wmfs_plugins::posix_acl::PosixAcl::new()));
+    #[cfg(feature = "path-caps")]
+    s.authz(Arc::new(wmfs_plugins::path_caps::PathCaps::new()));
+    #[cfg(feature = "quota")]
+    s.quota(Arc::new(wmfs_plugins::quota::Quota::new()));
     #[cfg(feature = "label-match")]
     s.placement(Arc::new(wmfs_plugins::label_match::LabelMatch::new()));
     #[cfg(feature = "local-fs")]

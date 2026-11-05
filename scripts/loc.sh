@@ -8,7 +8,8 @@
 #   - 只数 .rs 文件；不数 target/、测试 crate tests/（wmfs-testkit）、各 crate 的 tests/ 目录、名为 tests.rs 的文件；
 #   - 每个文件从第一行数到第一个 `#[cfg(test)]` 为止（约定：单元测试模块一律放在文件末尾）；
 #   - 不数空行与纯注释行（以 // 开头，含 /// 与 //!）。
-# 预计首发总量 = Σ max(模块当前行数, 模块估算)。上限 36,000（人类于 2026-10-21 从 30,000 放宽，功能不砍）；超过上限就停下来和人类商量。
+# 预计首发总量 = Σ max(模块当前行数, 模块估算)。上限 38,000（人类于 2026-10-21 从 30,000 放宽到 36,000、2026-11-05 再放宽到 38,000，
+# 功能不砍，ADR-0041 第 2 条）；超过上限就停下来和人类商量；超过 37,000 时上报主管。
 # 提醒（只打印，不改退出码）：累计行数超过本里程碑预算；某个模块超过估算（"超出"）或已达估算的 90%（"≥90%"——
 # 后续里程碑还要往里加代码时，请按剩余工作在下面的 MODULES 里上调估算，并在 design.md 2.2 写实现注记）。
 set -u
@@ -32,7 +33,7 @@ fi
 # roadmap §1：每个里程碑结束时的累计行数预算
 declare -A BUDGET=([M0]=2900 [M1]=5440 [M2]=6440 [M3]=8740 [M4]=11390 [M5]=14190 [M6]=17090 [M7]=19190
     [M8]=20500 [M9]=22650 [M10]=23800 [M11]=25900 [M12]=26750 [M13]=28100 [M14]=29290 [M15]=29600)
-LIMIT=36000
+LIMIT=38000
 
 # 首发时各模块的行数估算（顺序即输出顺序）。来自 design.md 2.2，M0 结束时按剩余工作重估了三个模块（见 design.md 2.2
 # 表下的实现注记）：wmfs-api 550 → 900（7.1 约 30 个管理端点的请求/响应结构都还没写）、core/proto 1300 → 900（全部消息
@@ -72,9 +73,24 @@ LIMIT=36000
 # 余下 M10–M14 的约 12 组端点约 200）、core 900 → 920（已约 855；余下 M14 的 mgr 装配约 60）。
 # M9 审查修复（design.md 2.2 的 M9 审查修复注记）：再新增约 150 行（M9 合计约 2,140，预算约 2,220），没有模块超过估算，估算都不变。
 # M9 验证修复（design.md 2.2 的 M9 验证修复注记）：再新增约 23 行。重估一个：core/meta/raft 1750 → 1780（已约 1,757：snap-recv 的排队；余下小改约 25）。
-MODULES="wmfs-api:1100 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1230 core/hooks:1060
-core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2000 core/meta:2220 core/meta/cluster:1260
-core/data:3000 core/client:2200 core/bg:850 core/mgmt:950 core:920 plugins:5380 cli:4900 dashboard:880
+# M10（design.md 2.2 的 M10 注记）：新增约 1,800 行（预算约 1,170）。重估八个：wmfs-api 1100 → 1150（余下 M11–M14 约 10 组端点的结构约 175）、
+# core/net 1230 → 1270（已约 1,250：撤销 key 时关闭连接；余下小改约 20）、core/hooks 1060 → 1120（已约 960；余下 M14 的 cabi.rs 约 150）、
+# core/meta 2220 → 2550（已约 2,200：quota.rs、evict.rs；余下 M12 的 locks.rs、回收站与审计、M11 gc 的去重记录清理约 350）、
+# core/client 2200 → 2350（已约 2,130：lease.rs、配额额度、驱逐之后的处理；余下 M12 的 locks.rs、strong 的读与 O_APPEND 约 220）、
+# core/mgmt 950 → 1250（已约 1,000：keys.rs；余下 M11–M14 的任务、数据密钥、feature、存储类、qos、trace 约 250）、
+# cli 4900 → 5200（已约 4,620：key/session、dev wait session-evicted；余下 M11–M14 的子命令约 565）、
+# plugins 5380 → 5100（已约 3,080；余下 mclock、xxh3/blake3、lz4、zstd、aes-gcm、cache-local-nvme、reconciler、scrub、tiering、rebalance、
+# gc 的其余部分、trash-expire、ttl，按 2.2 的表约 1,925）。Σ max ≈ 34,850（上限 36,000）。
+# M10 审查修复（design.md 2.2 的 M10 审查修复注记）：再新增约 165 行。重估三个已达 90% 的：core/client 2350 → 2430（已约 2,205：
+# 经句柄的请求只在句柄的会话里发；余下 M12 的 locks.rs、strong 的读与 O_APPEND 约 220）、core/meta 2550 → 2600（已约 2,255；余下约 350）、
+# core 920 → 925（已约 865；余下 M14 的 mgr 装配约 60）。Σ max ≈ 34,980（上限 36,000；plugins 若不按 M10 下调到 5,100 则约 35,260）。
+# M10 核对修复（ADR-0041，design.md 2.2 的注记）：再新增约 40 行。重估一个已达 90% 的：core 925 → 930（已约 867；余下 M14 的 mgr 装配
+# 约 60）。上限放宽到 38,000（ADR-0041 第 2 条，plugins 下调到 5,100 主管已确认），Σ max ≈ 34,985。
+# M10 链成员变更的修正（ADR-0041 第 13–17 条，design.md 2.2 的注记）：再新增约 85 行。重估一个已达 90% 的：core/meta/cluster
+# 1260 → 1340（已约 1,247：两步移出约 +76；余下 M13 的存储类 CRUD 与 QoS 表随集群图下发、按用量放置约 90）。Σ max ≈ 35,065。
+MODULES="wmfs-api:1150 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1270 core/hooks:1120
+core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2000 core/meta:2600 core/meta/cluster:1340
+core/data:3000 core/client:2430 core/bg:850 core/mgmt:1250 core:930 plugins:5100 cli:5200 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

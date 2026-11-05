@@ -37,7 +37,8 @@ use crate::hooks::registry::PluginSet;
 use crate::hooks::traits::{CODEC_REPLICA, KeyLookup};
 use crate::init::{NodeFile, read_master};
 use crate::meta::attr_registry;
-use crate::meta::cluster::{cluster_mgr, plugins};
+use crate::meta::cluster::cluster_mgr;
+use crate::meta::cluster::plugins::{self, MapCheck};
 use crate::meta::engine::txn::{MetaEngine, RoleInfo};
 use crate::meta::engine::{self, EmbeddedEngine, EngineOpts};
 use crate::meta::raft::membership::{self, Members};
@@ -114,7 +115,8 @@ pub fn start(
         return Err(format!("没有元数据库 {}（{hint}）", meta_path.display()));
     }
     let meta = EmbeddedEngine::open(&meta_path, eng_opts)?; // 出错时的消息里已经带了元数据库的路径
-    let keys: Arc<dyn KeyLookup + Send + Sync> = Arc::new(meta.keys(master));
+    let kv_keys = Arc::new(meta.keys(master));
+    let keys: Arc<dyn KeyLookup + Send + Sync> = kv_keys.clone();
     let rpc = RpcServer::new(ServerId { cluster_id, node_id: node.node_id }, pipeline.clone(), keys.clone(), &cfg.net);
     let svc = MetaService::start(meta.clone(), cfg.debug_ops)?;
     rpc.add_service(MSG_META_CALL, svc.clone());
@@ -141,11 +143,16 @@ pub fn start(
             cfg.net.control_scheme
         ));
     }
-    cluster_mgr::start(&meta, svc.targets())?;
+    cluster_mgr::start(&meta, svc.targets(), svc.live())?;
     let mgmt = MgmtServer::bind(&cfg.mgmt.listen)?;
     let mgmt_addr = mgmt.addr().to_string();
     let me = NodeAddrs { node_id: node.node_id, addrs: addrs.clone(), mgmt_addr: mgmt_addr.clone() };
-    start_background(cfg, &meta, &svc, me.clone(), data_side, tasks)?;
+    let rs = rpc.clone();
+    let on_keys: Arc<dyn Fn(&ClusterMap) + Send + Sync> = Arc::new(move |m| {
+        kv_keys.note_map(m); // 只做数据的节点据此认得后来建的 key（M10，`KvKeys`）
+        rs.set_revoked(m.keys.iter().filter(|(_, k)| k.revoked).map(|(id, _)| *id).collect()); // 关掉已撤销 key 的连接
+    });
+    start_background(cfg, &meta, &svc, on_keys, me.clone(), data_side, tasks)?;
     let (eng, mine, scheme) = (meta.clone(), me.clone(), cfg.net.control_scheme.clone());
     rpc.set_leader_hint(Arc::new(move || {
         hint_of(leader_addrs(eng.role().leader_id, &mine, &|id| eng.node_addrs(id)), &scheme)
@@ -217,10 +224,12 @@ fn open_data(
 }
 
 /// 数据面的后半段（监听之后，知道了本节点的地址）：target 心跳、Uninline 与后台任务共用的数据面客户端、后台调度器（M5）。
+/// `on_keys` = hb 线程每拉到一张新集群图时对其中的 key 表要做的事（M10：记下 key 表、关掉已撤销 key 的连接）。
 fn start_background(
     cfg: &NodeConfig,
     meta: &Arc<EmbeddedEngine>,
     svc: &Arc<MetaService>,
+    on_keys: Arc<dyn Fn(&ClusterMap) + Send + Sync>,
     me: NodeAddrs,
     side: DataSide,
     tasks: Vec<Box<dyn BgTask>>,
@@ -240,10 +249,13 @@ fn start_background(
     let (boot_id, pipeline) = (rand::random_u64().max(1), side.node.pipeline.clone()); // 0 = 不核对 I5（data/chain.rs）
     let eng = meta.clone();
     let on_map: Arc<dyn Fn(&ClusterMap) + Send + Sync> = Arc::new(move |m| {
-        match plugins::diff(&eng.local_plugins().plugins, &m.plugins.plugins) {
-            None => eng.adopt_done(), // 一致了：逃生口用过了（ADR-0039 第 6 条，与 raft 线程共用这个标志）
-            Some(d) if !eng.adopting() => plugins::exit_mismatch(&d), // 每一张集群图都比对（3.7.2 第 3 条）
-            Some(_) => {}
+        on_keys(m);
+        let data_only = eng.status().applied == 0; // 不在 raft 里（3.7.2 的 M9 注记）
+        // 每一张集群图都比对（3.7.2 第 3 条）；逃生口的标志与 raft 线程共用（ADR-0039 第 6 条、ADR-0041 第 11 条）
+        match plugins::on_map(&eng.local_plugins().plugins, &m.plugins.plugins, data_only, eng.adopting()) {
+            MapCheck::AdoptDone => eng.adopt_done(),
+            MapCheck::Exit(d) => plugins::exit_mismatch(&d),
+            MapCheck::Keep => {}
         }
     });
     let rpc = side.peer.clone();

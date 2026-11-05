@@ -14,9 +14,10 @@
 //! FetchChunk 在 io 线程上、走 QoS 的后台低优先级队列（[`serve`]）。fail point `sync.fetch.midway`：取回第一个 chunk 之后以注入的码
 //! 结束这一轮。
 //!
-//! 实现注记（M9 审查）：本节点**第一次**看到自己是某条链的 Syncing 成员（刚被追加、或刚被降级）之后，等 0.8 × `target_lease` 才开始
+//! 实现注记（M9 审查）：本节点**第一次**看到自己是某条链的 Syncing 成员（刚被追加、或刚被降级）之后，等一个 `target_lease` 才开始
 //! 第一轮：同步源（L）这时也许还没拿到这张图、还当自己是尾，它这段时间提交的写既不会转发过来、也不一定在已经取到的列表里。等这么久，
-//! 还在服务的成员要么已换上不旧于它的图，要么按 I5 自我隔离了（心跳回复带新的 map_epoch）。代价：重同步晚开始约 6.4 s。
+//! 还在服务的成员要么已换上不旧于它的图，要么按 I5 自我隔离了（心跳回复带新的 map_epoch）。代价：重同步晚开始约 8 s。实现注记（M10，
+//! ADR-0040 第 12 条）：M9 等的是 0.8 × 租约；这里比的是两个持有方各自的时钟，与租约协议同样留 25% 的余量，改成整个租约。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -76,11 +77,11 @@ struct Job {
     src: u32,
 }
 
-/// 下一条要同步的链：本节点是它的 Syncing 成员、第一次看到这件事已过了 0.8 × target_lease（见文件头），有 last serving，别的同步
+/// 下一条要同步的链：本节点是它的 Syncing 成员、第一次看到这件事已过了一个 target_lease（见文件头），有 last serving，别的同步
 /// 线程没在做。
 fn pick(node: &DataNode, picker: &Mutex<Picker>) -> Option<Job> {
     let map = node.map.get()?;
-    let (mut p, now, wait) = (lock(picker), clock::mono_ms(), map.settings.target_lease_ms * 4 / 5);
+    let (mut p, now, wait) = (lock(picker), clock::mono_ms(), map.settings.target_lease_ms);
     let syncing: Vec<(u32, u32, u64, Option<u32>)> = map
         .chains
         .iter()

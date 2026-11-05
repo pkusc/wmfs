@@ -4,6 +4,8 @@
 # 正在运行的开发集群（WMFS_DEV_DIR，默认 ~/wmfs-dev；node1 = 127.0.0.1:19100）。
 # 用法：scripts/container-tests.sh pjdfstest   不涉及 chown/权限的子集；失败与 tests/pjdfstest-expected.txt 逐条比对，出现清单外的
 #                                              失败即不通过（清单里每一条都对应 semantics.md 的一条放松）
+#       scripts/container-tests.sh pjdfstest-perm  M10：权限相关的子集（切换用户的用例与 chmod、chown；挂载带 --allow-other），
+#                                              同样与 tests/pjdfstest-perm-expected.txt 逐条比对
 #       scripts/container-tests.sh fsx [N [参数…]]  xfstests 的 fsx，N 次操作（默认 10000），其余参数原样交给 fsx（例如 `-l 65536`）
 #       scripts/container-tests.sh fio         fio 写 + verify=crc32c
 #       scripts/container-tests.sh pathmap     M7：容器里 root 挂载（类型 fuse）时 CLI 的挂载点路径换算
@@ -22,8 +24,8 @@ docker run --rm --name "wmfs-suite-$SUITE-$$" --device /dev/fuse --cap-add SYS_A
     --network host -v "$ROOT/target/release/wmfs:/usr/local/bin/wmfs:ro" -v "$KEY:/root/.config/wmfs/client.key:ro" \
     -v "$ROOT/tests/docker:/opt/wmfs-tests:ro" wmfs-tools /opt/wmfs-tests/run-suite.sh "$SUITE" "$@" | tee "$OUT"
 rc=${PIPESTATUS[0]}
-if [ "$SUITE" = pjdfstest ]; then
-    expected="$(grep -vE '^[[:space:]]*(#|$)' "$ROOT/tests/pjdfstest-expected.txt" | awk '{print $1}' | sort -u)"
+if [ "$SUITE" = pjdfstest ] || [ "$SUITE" = pjdfstest-perm ]; then
+    expected="$(grep -vE '^[[:space:]]*(#|$)' "$ROOT/tests/$SUITE-expected.txt" | awk '{print $1}' | sort -u)"
     got="$(awk '$1 == "FAIL" {print $2}' "$OUT" | sort -u)"
     extra="$(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$got") | grep -v '^$')"
     gone="$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$got") | grep -v '^$')"
@@ -31,7 +33,7 @@ if [ "$SUITE" = pjdfstest ]; then
     if [ -n "$extra" ]; then
         echo "清单外的失败（不通过）："; printf '%s\n' "$extra"; rc=1
     fi
-    [ -n "$gone" ] && { echo "清单里的这些现在通过了（可以从 tests/pjdfstest-expected.txt 删掉）："; printf '%s\n' "$gone"; }
+    [ -n "$gone" ] && { echo "清单里的这些现在通过了（可以从 tests/$SUITE-expected.txt 删掉）："; printf '%s\n' "$gone"; }
 fi
 rm -f "$OUT"
 exit "$rc"

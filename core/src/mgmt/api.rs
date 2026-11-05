@@ -25,11 +25,11 @@ use crate::api::url::param;
 use crate::base::types::{Principal, ReqCtx};
 use crate::base::{ErrCode, Failed, clock};
 use crate::hooks::traits::ConnIdentity;
-use crate::meta::attr_ops;
 use crate::meta::attr_registry::split;
 use crate::meta::cluster::settings;
 use crate::meta::engine::EmbeddedEngine;
 use crate::meta::engine::txn::{KvScan, KvTxn, MetaEngine, OpCtx, TxnOp, txn_blocking, txn_blocking_exclusive};
+use crate::meta::{attr_ops, quota};
 use crate::proto::meta::MetaReply;
 
 /// 这个路径归这里（或 `changelog.rs`、`cluster.rs`）管吗。
@@ -39,6 +39,7 @@ pub fn handles(path: &str) -> bool {
         "/api/v1/attr" | "/api/v1/usage" | "/api/v1/status" | "/api/v1/semantics" | "/api/v1/cluster/settings"
     ) || path.starts_with("/api/v1/changelog")
         || super::cluster::handles(path)
+        || super::keys::handles(path)
 }
 
 /// 签名校验 → 有元数据引擎 → 本节点是就绪的 leader → 按 (方法, 路径) 分派（见文件头）。
@@ -54,10 +55,14 @@ pub(super) fn serve(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&st
     if let Some(r) = leader_gate(eng) {
         return r;
     }
-    let req = req_ctx(&caller);
+    let caps = ctx.keys.meta(caller.key_id).map(|m| m.path_caps).unwrap_or_default(); // 路径限制（M10，ADR-0038 第 2 条）
+    let req = req_ctx(&caller, caps);
     let q = |name: &str| param(query, name);
     if path.starts_with("/api/v1/changelog") {
         return super::changelog::serve(ctx, eng, &req, method, path, query, body);
+    }
+    if super::keys::handles(path) {
+        return super::keys::serve(ctx, eng, &req, method, path, body); // M10：认证 key 与会话
     }
     if super::cluster::handles(path) {
         let usage = ctx.usage.as_deref();
@@ -80,7 +85,7 @@ pub(super) fn serve(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&st
         }
         ("GET", "/api/v1/usage") => {
             let p = q("path").unwrap_or_default();
-            read(eng, &req, |v, c| attr_ops::usage(v, c, &p)).map(|x| json(200, &x))
+            read(eng, &req, |v, c| quota::usage(v, c, &p)).map(|x| json(200, &x))
         }
         ("GET", "/api/v1/status") => {
             let p = q("path").unwrap_or_else(|| "/".into());
@@ -137,15 +142,15 @@ pub(super) fn leader_gate(eng: &EmbeddedEngine) -> Option<Reply> {
     }
 }
 
-/// 管理 API 请求的上下文（见文件头的"身份"）。
-fn req_ctx(c: &Caller) -> ReqCtx {
+/// 管理 API 请求的上下文（见文件头的"身份"）。`path_caps` = 这把 key 的路径限制（M10：按路径的查询只能查允许的子树，`node_at`）。
+fn req_ctx(c: &Caller, path_caps: Vec<(u64, bool)>) -> ReqCtx {
     let conn = Arc::new(ConnIdentity {
         key_id: c.key_id,
         role: c.role,
         tenant: c.tenant,
         uid_ranges: vec![(0, u32::MAX)],
         root_squash: false,
-        path_caps: vec![],
+        path_caps,
     });
     let who = Principal { uid: 0, gid: 0, groups: vec![], tenant: c.tenant, job_id: 0, conn };
     ReqCtx {

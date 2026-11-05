@@ -69,10 +69,13 @@ pub fn sample_init() -> InitialKv {
     }
 }
 
-/// 命名空间测试用的管线：posix-mode（authz）+ label-match（placement），与 `wmfs server` 默认装的一样。
+/// 命名空间测试用的管线：posix-mode、posix-acl、path-caps（authz）+ quota + label-match（placement），与 `wmfs server` 默认装的一样。
 pub fn ns_pipeline() -> Pipeline {
     let mut set = PluginSet::new(&[]);
     set.authz(Arc::new(PosixMode::new()));
+    set.authz(Arc::new(wmfs_plugins::posix_acl::PosixAcl::new()));
+    set.authz(Arc::new(wmfs_plugins::path_caps::PathCaps::new()));
+    set.quota(Arc::new(wmfs_plugins::quota::Quota::new()));
     set.placement(Arc::new(LabelMatch::new()));
     Pipeline::new(set)
 }

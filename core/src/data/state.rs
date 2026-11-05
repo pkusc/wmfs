@@ -11,7 +11,10 @@
 //!
 //! 实现注记（M9）：pending 的 `upstream` 是回复句柄（head 上是客户端，后继上是前驱）；重新驱动时可被替换，回复过 RETRY 后置 None。
 //! "脏"（[`ChunkTable::has_dirty`]）= 有**还没在本地提交**的 pending；3.4.2.6 规则 2 在本地提交了、还在等后面成员确认的 pending
-//! 不算脏，但照样占着 chunk（[`ChunkTable::pendings`] 里有它）。
+//! 不算脏，但照样占着 chunk（[`ChunkTable::pendings`] 里有它）。实现注记（M10 审查，ADR-0041 第 15 条）：正忙也算脏——`take_pending`
+//! 取走 pending 到提交的 rename 完成之间，状态表里已没有 pending，已提交文件却还是旧版本，而下游的 L 早已提交、可能已回给读者。
+//! "被占着"（[`ChunkTable::held`]）= 正忙或有 pending（含规则 2 已在本地提交的）：刚成为 last serving 的成员一个租约内对它的读回 `BUSY`
+//! （ADR-0041 第 14 条，`chain::read_busy`）。
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -177,9 +180,14 @@ impl ChunkTable {
         Some(f(p))
     }
 
-    /// 这个 chunk 脏吗：有没有还没在本地提交的版本（3.4.2.5：脏，且本成员不是 last serving → `CHUNK_DIRTY`）。
+    /// 这个 chunk 脏吗：正忙，或有还没在本地提交的版本（3.4.2.5：脏，且本成员不是 last serving → `CHUNK_DIRTY`；见文件头）。
     pub fn has_dirty(&self, id: &ChunkId) -> bool {
-        self.shard(id).get(id).is_some_and(|e| e.pending.as_ref().is_some_and(|p| !p.committed))
+        self.shard(id).get(id).is_some_and(|e| e.busy || e.pending.as_ref().is_some_and(|p| !p.committed))
+    }
+
+    /// 这个 chunk 被占着吗：正忙，或有 pending（含规则 2 已在本地提交、还在等确认的；见文件头）。
+    pub fn held(&self, id: &ChunkId) -> bool {
+        self.shard(id).get(id).is_some_and(|e| e.busy || e.pending.is_some())
     }
 
     /// 有 pending（含已在本地提交、还在等确认的）的全部 chunk（`pred` 过滤）：链变化时的处理与 chain-timer 用（pending 很少，扫一遍

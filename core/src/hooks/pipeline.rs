@@ -23,8 +23,8 @@ use crate::hooks::policy::{BuiltinPolicy, PolicyEvaluator};
 use crate::hooks::registry::PluginSet;
 use crate::hooks::traits::{
     AuthnInput, AuthnPlugin, AuthnResult, AuthzInput, AuthzPlugin, ChainView, ChunkStore, CodecPlugin, ConnIdentity,
-    Decision, KeyLookup, PlacementInput, PlacementPlugin, QosPlugin, QuotaDecision, QuotaInput, TransformKind,
-    TransformPlugin, Transport,
+    Decision, KeyLookup, PlacementInput, PlacementPlugin, QosPlugin, QuotaDecision, QuotaInput, QuotaPlugin,
+    TransformKind, TransformPlugin, Transport,
 };
 use crate::meta::schema::records::PluginListV1;
 
@@ -88,6 +88,7 @@ pub struct Pipeline {
     set: PluginSet,
     authn: Vec<(Arc<dyn AuthnPlugin>, HookCall)>, // altitude 升序；每个插件配好自己的调用包装
     authz: Vec<(Arc<dyn AuthzPlugin>, HookCall)>,
+    quota: Vec<(Arc<dyn QuotaPlugin>, HookCall)>,
     placement: Vec<(Arc<dyn PlacementPlugin>, HookCall)>,
     qos: Option<(Arc<dyn QosPlugin>, HookCall)>,
     codecs: Vec<(Arc<dyn CodecPlugin>, HookCall)>,
@@ -101,6 +102,11 @@ impl Pipeline {
     pub fn new(set: PluginSet) -> Pipeline {
         let authn = set.authn_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Authn))).collect();
         let authz = set.authz_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Authz))).collect();
+        let quota = set
+            .quota_plugins()
+            .iter()
+            .map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::QuotaAdmission)))
+            .collect();
         let placement =
             set.placement_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Placement))).collect();
         let qos = set.qos_plugins().first().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Qos)));
@@ -109,7 +115,7 @@ impl Pipeline {
         let transforms =
             set.transform_plugins().iter().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::Transform))).collect();
         let chunk_store = set.chunk_store_plugin().map(|p| (p.clone(), HookCall::new(p.manifest(), Hook::ChunkStore)));
-        Pipeline { set, authn, authz, placement, qos, codecs, transforms, chunk_store, policy: BuiltinPolicy }
+        Pipeline { set, authn, authz, quota, placement, qos, codecs, transforms, chunk_store, policy: BuiltinPolicy }
     }
 
     pub fn transports(&self) -> &[Arc<dyn Transport>] {
@@ -153,9 +159,32 @@ impl Pipeline {
         }
         if allowed { Ok(()) } else { Err(ErrCode::EACCES) }
     }
-    /// 按 3.7.2 合并多个插件的结果
-    pub fn quota(&self, _input: &QuotaInput) -> QuotaDecision {
-        unimplemented!("M10：Pipeline::quota")
+    /// quota_admission（3.7.2，M10）：altitude 升序串行；任一 Deny 即拒绝；SoftWarn 记下第一个（core 写起点与事件）；额度取所有结果里
+    /// 最小的 `max_growth`。没有 quota 插件 → 不限。fail point `plugin.<名字>.quota_admission` 触发 = 以注入的码拒绝。
+    pub fn quota(&self, input: &QuotaInput) -> QuotaDecision {
+        let (mut max, mut warn) = (u64::MAX, None);
+        for (p, call) in &self.quota {
+            let d = match call.enter() {
+                Ok(t0) => {
+                    let d = p.admit(input);
+                    call.exit(t0, true); // 拒绝是正常的判定，不算插件出错
+                    d
+                }
+                Err(code) => QuotaDecision::Deny { dir: 0, code },
+            };
+            match d {
+                QuotaDecision::Deny { .. } => return d,
+                QuotaDecision::SoftWarn { dir, max_growth } => {
+                    warn = warn.or(Some(dir));
+                    max = max.min(max_growth);
+                }
+                QuotaDecision::Allow { max_growth } => max = max.min(max_growth),
+            }
+        }
+        match warn {
+            Some(dir) => QuotaDecision::SoftWarn { dir, max_growth: max },
+            None => QuotaDecision::Allow { max_growth: max },
+        }
     }
     /// placement（3.7.2）：altitude 升序，依次过滤/排序同一个候选链列表；core 再取前 k 条（3.4.2.1）。
     /// 没有 placement 插件时候选原样返回（core 已按 class/replicas 预先筛过）。

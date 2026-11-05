@@ -3,6 +3,8 @@
 # 先以 root 把宿主机的开发集群挂到 /mnt/wmfs（wmfs 二进制与 client key 是只读挂进来的），跑完卸载。
 #   run-suite.sh pjdfstest      不涉及 chown/权限的子集：12 个目录里没有切换到别的用户（-u/-g）的测试文件；每个失败打印一行
 #                               "FAIL <目录>/<文件>:<编号> <说明>"，最后 "SUMMARY files=… tests=… failed=…"
+#   run-suite.sh pjdfstest-perm M10：权限相关的子集——上面 12 个目录里切换用户的测试文件，加上 chmod 与 chown 两个目录的全部；
+#                               挂载带 --allow-other（只在容器里：别的用户要能进这个挂载）。输出格式同上
 #   run-suite.sh fsx <次数> [fsx 的其余参数…]   xfstests 的 fsx（随机读写、截断、mmap，与内存模型比对）；例如 `-l 65536`：文件一直
 #                               不超过 64 KiB（全程 inline，内容常比长度短）
 #   run-suite.sh fio            fio 顺序写 + verify=crc32c（冒烟）
@@ -12,7 +14,9 @@ set -u
 SUITE="${1:-}"
 MNT=/mnt/wmfs
 mkdir -p "$MNT"
-wmfs mount 127.0.0.1:19100 "$MNT" --log /tmp/mount.log >/tmp/mount.out 2>&1 &
+EXTRA=()
+[ "$SUITE" = pjdfstest-perm ] && EXTRA=(--allow-other) # 切换到别的用户的测试：别的 uid 要能进这个挂载
+wmfs mount 127.0.0.1:19100 "$MNT" --log /tmp/mount.log "${EXTRA[@]}" >/tmp/mount.out 2>&1 &
 # 以 root 直接挂载（不经 fusermount3）时类型显示为 fuse（没有 .wmfs 子类型），来源仍是 wmfs:<集群号>
 mounted() { grep -qE " $MNT .* - fuse(\.wmfs)? wmfs:" /proc/self/mountinfo; }
 for _ in $(seq 1 300); do
@@ -27,11 +31,19 @@ mkdir -p "$WORK"
 cd "$WORK" || exit 2
 rc=0
 case "$SUITE" in
-pjdfstest)
+pjdfstest | pjdfstest-perm)
     files=0; tests=0; failed=0
-    for d in ftruncate link mkdir mkfifo mknod open rename rmdir symlink truncate unlink utimensat; do
+    dirs="ftruncate link mkdir mkfifo mknod open rename rmdir symlink truncate unlink utimensat"
+    [ "$SUITE" = pjdfstest-perm ] && dirs="$dirs chmod chown"
+    for d in $dirs; do
         for t in /opt/pjdfstest/tests/$d/*.t; do
-            grep -qE -- '-[ug] ([0-9]|\$)' "$t" && continue # 切换到别的用户（-u 65534、-u $UID_NOBODY）= 权限测试，不在子集里
+            perm=0
+            grep -qE -- '-[ug] ([0-9]|\$)' "$t" && perm=1 # 切换到别的用户（-u 65534、-u $UID_NOBODY）= 权限测试
+            if [ "$SUITE" = pjdfstest ]; then
+                [ "$perm" = 1 ] && continue # 不涉及权限的子集：跳过切换用户的
+            elif [ "$perm" = 0 ] && [ "$d" != chmod ] && [ "$d" != chown ]; then
+                continue # 权限子集：只要切换用户的（chmod、chown 两个目录全要）
+            fi
             files=$((files + 1))
             out="$(bash "$t" 2>/dev/null)"
             n=$(printf '%s\n' "$out" | grep -cE '^(not )?ok ')

@@ -105,7 +105,7 @@ pub enum DevCmd {
     /// 打印某个开发挂载点的挂载进程号
     ClientPid { mountpoint: PathBuf },
     /// 等某个条件成立（满足立即返回 0；超时返回 1 并打印当前状态）：leader（有就绪的元数据 leader）、chains-serving（每条链都达到
-    /// 期望长度且全部 Serving；等的过程中状态变了就打印一行）
+    /// 期望长度且全部 Serving；等的过程中状态变了就打印一行）、session-evicted <挂载点>（这个挂载的会话被驱逐完）
     Wait {
         /// 条件（及其参数），例如 leader、chains-serving
         #[arg(required = true, num_args = 1..)]

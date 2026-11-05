@@ -26,8 +26,8 @@ use crate::base::lock;
 use crate::bg::task::BgTask;
 use crate::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
 use crate::hooks::traits::{
-    AuthnPlugin, AuthzPlugin, CacheStore, ChunkStore, CodecPlugin, PlacementPlugin, QosPlugin, TransformKind,
-    TransformPlugin, Transport,
+    AuthnPlugin, AuthzPlugin, CacheStore, ChunkStore, CodecPlugin, PlacementPlugin, QosPlugin, QuotaPlugin,
+    TransformKind, TransformPlugin, Transport,
 };
 use crate::meta::schema::records::PluginListV1;
 
@@ -38,6 +38,7 @@ pub struct PluginSet {
     transports: Vec<Arc<dyn Transport>>,
     authn: Vec<Arc<dyn AuthnPlugin>>,
     authz: Vec<Arc<dyn AuthzPlugin>>,
+    quota: Vec<Arc<dyn QuotaPlugin>>, // M10
     placement: Vec<Arc<dyn PlacementPlugin>>,
     meta_engines: Vec<&'static Manifest>,
     qos: Vec<Arc<dyn QosPlugin>>,
@@ -78,6 +79,18 @@ impl PluginSet {
             self.authz.push(a);
             self.authz.sort_by_key(|p| p.manifest().altitude);
         }
+    }
+
+    /// quota_admission（M10）：altitude 升序，串行（3.7.2）。
+    pub fn quota(&mut self, q: Arc<dyn QuotaPlugin>) {
+        if self.enabled(q.manifest()) {
+            self.quota.push(q);
+            self.quota.sort_by_key(|p| p.manifest().altitude);
+        }
+    }
+
+    pub fn quota_plugins(&self) -> &[Arc<dyn QuotaPlugin>] {
+        &self.quota
     }
 
     pub fn placement(&mut self, p: Arc<dyn PlacementPlugin>) {
@@ -186,6 +199,7 @@ impl PluginSet {
         let t = self.transports.iter().map(|p| (Hook::Transport, p.manifest()));
         let a = self.authn.iter().map(|p| (Hook::Authn, p.manifest()));
         let z = self.authz.iter().map(|p| (Hook::Authz, p.manifest()));
+        let qa = self.quota.iter().map(|p| (Hook::QuotaAdmission, p.manifest()));
         let pl = self.placement.iter().map(|p| (Hook::Placement, p.manifest()));
         let me = self.meta_engines.iter().map(|m| (Hook::MetaEngine, *m));
         let q = self.qos.iter().map(|p| (Hook::Qos, p.manifest()));
@@ -194,7 +208,8 @@ impl PluginSet {
         let cs = self.chunk_stores.iter().map(|p| (Hook::ChunkStore, p.manifest()));
         let bg = self.bg_manifests.iter().map(|m| (Hook::BgTask, *m));
         let cc = self.cache_stores.iter().map(|p| (Hook::CacheStore, p.manifest()));
-        t.chain(a).chain(z).chain(pl).chain(me).chain(q).chain(c).chain(tf).chain(cs).chain(bg).chain(cc).collect()
+        let all = t.chain(a).chain(z).chain(qa).chain(pl).chain(me).chain(q).chain(c).chain(tf).chain(cs).chain(bg);
+        all.chain(cc).collect()
     }
 
     /// 启动时校验（3.7.2）：每个插件的 manifest（[`check_one`]）；同一钩子内不重名、altitude 不相同；不同的插件不同名；

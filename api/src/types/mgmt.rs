@@ -74,7 +74,7 @@ pub struct ClassUsage {
 }
 
 /// `GET /api/v1/usage?path=`：目录的递归用量（RSTAT，常量时间，3.9）——子树里普通文件的逻辑字节、非目录文件数、子目录数
-/// （都不含目录自己）。配额在 M10 加入（只增）。
+/// （都不含目录自己）。实现注记（M10）：`quotas` = 这个目录与它上面的每个配额（只增）。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct UsageReply {
     pub path: String,
@@ -82,6 +82,25 @@ pub struct UsageReply {
     pub files: u64,
     pub dirs: u64,
     pub per_class: Vec<ClassUsage>,
+    #[serde(default)]
+    pub quotas: Vec<QuotaUsage>,
+}
+
+/// 一个配额（M10，3.9）：设在哪个目录、按哪个存储类（总量配额为 null）、硬限 / 软限 / 宽限期（毫秒）/ 文件数上限（0 = 不限）/ quantum，
+/// 它管的那部分的用量（总量配额的文件数含子目录），软限的计时起点（墙钟毫秒，0 = 没在计时）与宽限还剩多久（没在计时为 null）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct QuotaUsage {
+    pub dir: String,
+    pub class: Option<String>,
+    pub hard: u64,
+    pub soft: u64,
+    pub grace_ms: u64,
+    pub files: u64,
+    pub quantum: u64,
+    pub used_bytes: u64,
+    pub used_files: u64,
+    pub soft_since_ms: u64,
+    pub grace_left_ms: Option<u64>,
 }
 
 /// 一个属性的"实际"（3.10）。M7：`new_files` = 这个目录下的新文件此刻实际得到的值（例如 replicas 是

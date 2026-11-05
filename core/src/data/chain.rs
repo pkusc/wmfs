@@ -8,7 +8,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::DataNode;
-use crate::base::{ErrCode, clock};
+use crate::base::types::ChunkId;
+use crate::base::{ErrCode, clock, lock, log};
 use crate::meta::cluster::chains::SERVING;
 use crate::meta::schema::records::ChainRecV1;
 use crate::net::client::Endpoint;
@@ -95,6 +96,47 @@ pub fn predecessor(c: &ChainRecV1, pos: usize) -> Option<u32> {
 /// last serving（L）：最后一个 Serving 成员（脏读的仲裁者、同步源）。
 pub fn last_serving(c: &ChainRecV1) -> Option<u32> {
     c.members.iter().rev().find(|(_, s)| *s == SERVING).map(|(t, _)| *t)
+}
+
+/// 换上新图 `new` 时（在 3.4.2.6 规则 2、3 之前，`redrive::switch`），本节点的成员在这条链上新成为 last serving → 记下"一个 target 租约
+/// （新图的）之后"；在那之前读回可重试的 `BUSY`（[`read_busy`]；写与转发照常）。换图那一刻各节点的视图不一致，旧图里的 L 也许还在旧图上
+/// 服务读——等一个租约，还在服务的成员要么已换图，要么已按 I5 自我隔离。用整个租约、不用 0.8 倍：比的是两个持有方各自的时钟，与租约
+/// 协议同样留余量。
+/// - 旧图里它是 Syncing（被提升，ADR-0040 第 11 条）→ 整条链的读都 `BUSY`：它在物理链尾、先提交了 V，旧的 L 还只有 V 的 pending、会回
+///   旧版本。
+/// - 旧图里它是排在 L 前面的 Serving（L 被降级或移出、force-serving，ADR-0041 第 14 条）→ 只对被占着的 chunk（有 pending——包括规则 2
+///   在本地提交、还在等确认的——或正忙）回 `BUSY`：干净的 chunk 上，它已提交的版本不旧于下游任何成员的（I2）。
+///
+/// 要在规则 2 之前登记：规则 2 在换图途中就把在途的 pending 本地提交，晚登记的话，换图途中按旧图的读会读到旧 L 还没有的版本。
+pub fn note_promotions(node: &DataNode, old: Option<&ClusterMap>, new: &ClusterMap) {
+    let now = clock::mono_ms();
+    let mut busy = lock(&node.promoted);
+    busy.retain(|_, (until, _)| *until > now);
+    for (id, c) in &new.chains {
+        // 新图里本节点的成员是 last serving……
+        let Some((t, p)) = local(node, c) else { continue };
+        if !serving_at(c, p) || last_serving(c) != Some(t) {
+            continue;
+        }
+        // ……而在旧图里它不是（还是 Syncing，或排在 L 前面）
+        let Some(o) = old.and_then(|m| find(m, *id)) else { continue };
+        let Some((_, op)) = local(node, o) else { continue };
+        if last_serving(o) == Some(t) {
+            continue;
+        }
+        let (ms, all) = (new.settings.target_lease_ms, !serving_at(o, op));
+        let which = if all { "全部 chunk（从 Syncing 被提升）" } else { "有 pending 或正忙的 chunk" };
+        log::info("data", format_args!("链 {id}：target {t} 成为 last serving，{ms} ms 内读{which}回 BUSY"));
+        let w = busy.entry(*id).or_insert((0, false));
+        *w = (w.0.max(now + ms), w.1 || all); // 还没过去的"整条链"不能缩成"只挡被占着的 chunk"
+    }
+}
+
+/// 读这个 chunk 要回 `BUSY` 吗：这条链刚让本节点的成员成为 last serving、还在一个租约之内，并且是整条链都挡，或这个 chunk 被占着
+/// （[`note_promotions`]）。
+pub fn read_busy(node: &DataNode, id: &ChunkId) -> bool {
+    let w = lock(&node.promoted).get(&id.chain).copied();
+    w.is_some_and(|(until, all)| clock::mono_ms() < until && (all || node.chunks.held(id)))
 }
 
 /// target `t` 所在节点的地址（集群图里找不到 → None）。

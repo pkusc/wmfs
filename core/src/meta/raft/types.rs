@@ -42,12 +42,15 @@ pub enum ProposeOutcome {
 /// 据此退出（退出码 3），`--adopt-local-plugins` 的节点则在当选就绪之后把清单改成本地的（3.7.2）。
 /// 实现注记（M9，ADR-0039 第 6 条）：`adopting` = 还在用逃生口：本地清单第一次与已应用的集群清单一致、或已应用的集群清单变了（逃生口
 /// 已被别的节点用过）之后清掉，之后照常比对（raft 线程、cluster-mgr 与节点心跳拿到集群图时的比对共用它）。
+/// 实现注记（M10）：`mismatch` 带着 raft 线程比对时算出的差异（一致 → None），而且写事务提交之后才发布（`driver/apply.rs` 的
+/// `after_apply`）。以前在写事务里就发布一个标志，cluster-mgr 看到它再自己读 kv 算差异，可能读到提交之前的旧清单（与本地相同），
+/// 退出日志里的差异就是空的（`scripts/accept.sh all` 的 M8 第 27 项偶发失败）。
 pub struct Published {
     pub(super) role: Mutex<RoleInfo>,
     pub(super) status: Mutex<EngineStatus>,
     changelog: Mutex<u64>,
     changelog_cv: Condvar,
-    pub(super) mismatch: AtomicBool,
+    pub(super) mismatch: Mutex<Option<String>>,
     pub(super) adopting: AtomicBool,
 }
 
@@ -55,7 +58,7 @@ impl Published {
     pub(super) fn new(adopt: bool) -> Published {
         let role = RoleInfo { role: StateRole::Follower, term: 0, leader_id: 0, ready: false };
         let (changelog, changelog_cv) = (Mutex::new(0), Condvar::new());
-        let (status, mismatch) = (Mutex::new(EngineStatus::default()), AtomicBool::new(false));
+        let (status, mismatch) = (Mutex::new(EngineStatus::default()), Mutex::new(None));
         let adopting = AtomicBool::new(adopt);
         Published { role: Mutex::new(role), status, changelog, changelog_cv, mismatch, adopting }
     }
@@ -67,9 +70,9 @@ impl Published {
     pub fn adopt_done(&self) {
         self.adopting.store(false, Ordering::Relaxed);
     }
-    /// 已应用的集群插件清单与本地的不一致（见类型的说明）。
-    pub fn plugins_mismatch(&self) -> bool {
-        self.mismatch.load(Ordering::Relaxed)
+    /// 已应用的集群插件清单与本地的不一致时是差异（见类型的说明），一致 → None。
+    pub fn plugins_mismatch(&self) -> Option<String> {
+        lock(&self.mismatch).clone()
     }
     pub fn role(&self) -> RoleInfo {
         *lock(&self.role)

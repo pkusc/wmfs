@@ -1,0 +1,14 @@
+# quota 配额插件的 manifest（design.md 3.7.1、4.4）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "quota"
+version = "0.1.0"
+hooks = ["quota_admission"]
+altitude = 310
+hot_path = true
+abi_version = 1
+attrs = ["quota", "quota.*"]
+budget_ns = 5000
+fail_points = ["plugin.quota.quota_admission"]
+
+[config_schema]
+# quota 没有部署参数：宽限期的缺省值（7d）与 quantum 的缺省值（64M）在本体的 core/src/meta/quota.rs（DEFAULT_GRACE_MS、DEFAULT_QUANTUM；
+# 属性注册表的 quota 项用它解析），只能用 quota=…,grace=,quantum= 逐目录覆盖（3.8）——行为策略一律不进插件配置。

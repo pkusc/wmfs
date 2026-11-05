@@ -30,7 +30,7 @@ accept_m7() {
     check "金样：MetaOp::ReopenHandle 追加在 MetaOp 末尾（只增不改）" cargo test --release -p wmfs-core --test golden_proto
     check "第一步 ②（ADR-0037 第 13 条）：readdir 的 .. 是父目录（根是它自己；自己 rename 之后跟着变；另一个挂载 lookup / readdirplus 之后也对）" \
         one_test --release -p wmfs --test fuse_attrs dotdot_in_readdir_is_the_parent_directory
-    check "属性注册表：服务端切分的规则、各键的校验与规范化、显示形式、还不能设置的键（strong、quota……）明确拒绝、manifest 对账" \
+    check "属性注册表：服务端切分的规则、各键的校验与规范化、显示形式、还不能设置的键（strong、compress……）明确拒绝、manifest 对账" \
         tests_at_least 5 --release -p wmfs-core --lib meta::attr_registry
     check "继承解析与缓存：最近的祖先值、inherit=false、来源、按 attr_epoch 失效、批次作废时 clear 丢掉没提交的结果" \
         tests_at_least 3 --release -p wmfs-core --lib meta::attrs
@@ -62,7 +62,7 @@ accept_m7() {
     check "wmfs unset proj/a chunk 之后 get proj/a/b：chunk=1M 来自 /proj" m7_unset
     check "inherit=false：proj/a 自己的值仍生效、上面的 Inherit 键被挡住（proj/a/b 的 chunk、stripe 回到默认值）；get proj/a 显示 inherit=false 来自 /proj/a" \
         m7_inherit_false
-    check "未知属性名被拒绝：wmfs set proj chunck=4M → einval「未知属性 chunck」；get/unset 的键写错也报错（unset quota 与 set 一样 eopnotsupp）" m7_unknown
+    check "未知属性名被拒绝：wmfs set proj chunck=4M → einval「未知属性 chunck」；get/unset 的键写错也报错（unset compress 与 set 一样 eopnotsupp）" m7_unknown
     check "没有插件消费的值被拒绝：checksum=xxh3（xxh3 插件没有启用）；consistency=strong 在 M12 之前 → eopnotsupp；属性只能挂在目录上" \
         m7_rejects
     check "单节点上 replicas=3 设置成功但警告「当前只有 1 个故障域，新文件实际为 1 副本」" m7_replicas_warn
@@ -71,7 +71,7 @@ accept_m7() {
     check "wmfs usage 挂载根 = 整个挂载点下普通文件大小之和（按 inode 去重：硬链接只计一次）" m7_usage_root
     check "changelog 包含 AttrSet、Mkdir、Create（wmfs changelog tail -n 100000 --json：边读边打印，每页一行）" m7_changelog
     check "changelog 长轮询：wmfs changelog tail -f 挂上长轮询之后，新的 mkdir 提交后 2 s 内打印出它（立即唤醒，不是等 5 s 到期）" m7_follow
-    check "wmfs status --json：8 个已实现的属性都有 declared 与 actual；replicas 声明 3、实际 1、不一致" m7_status
+    check "wmfs status --json：M7 的 8 个属性都在（之后的里程碑只增），每个都有 declared 与 actual；replicas 声明 3、实际 1、不一致" m7_status
     check "wmfs cluster set epoch_gc_grace=0s：集群运行参数更新，changelog 里有 ClusterSet；写错的参数 --json 下回 einval" m7_cluster_set
     if docker image inspect wmfs-tools >/dev/null 2>&1; then
         check "容器里以 root 挂载（mountinfo 类型 fuse）：wmfs get <挂载点下的路径> 照样换算、找到集群" \
@@ -148,14 +148,14 @@ m7_unknown() {
     expect_error einval wmfs get "$M/proj" chunck --json || return 1 # 不静默输出空行
     wmfs get "$M/proj" chunk >/dev/null || return 1                    # 写对了照常
     expect_error einval wmfs unset "$M/proj" chunck --json || return 1
-    expect_error eopnotsupp wmfs unset "$M/proj" quota --json # 与 set 的说法相同（在 M10 实现）
+    expect_error eopnotsupp wmfs unset "$M/proj" compress --json # 与 set 的说法相同（在 M11 实现；M10 之前这里用的是 quota）
 }
 
 m7_rejects() {
     expect_error einval wmfs set "$M/proj" checksum=xxh3 --json || return 1
     wmfs set "$M/proj" checksum=xxh3 --json | jq -e '.message | test("xxh3 的插件没有启用")' || return 1
     expect_error eopnotsupp wmfs set "$M/proj" consistency=strong --json || return 1
-    expect_error eopnotsupp wmfs set "$M/proj" quota=10G --json || return 1
+    expect_error eopnotsupp wmfs set "$M/proj" compress=lz4 --json || return 1 # M11 的键（M10 之前这里用的是 quota=10G）
     echo x >"$M/proj/file" && expect_error einval wmfs set "$M/proj/file" chunk=1M --json
 }
 
@@ -224,7 +224,8 @@ m7_follow() {
 }
 
 m7_status() {
-    json_expect '([.attrs[].key] | sort) == (["checksum", "chunk", "class", "consistency", "inherit", "inline", "replicas", "stripe"])
+    # M7 的 8 个属性都在（之后的里程碑实现的属性只增：M10 起另有 quota、quota.*、acl.default）
+    json_expect '(["checksum", "chunk", "class", "consistency", "inherit", "inline", "replicas", "stripe"] - [.attrs[].key]) == []
         and all(.attrs[]; (.declared | length) > 0 and (.actual.new_files | length) > 0)
         and (.attrs[] | select(.key == "replicas") | .declared == "3" and .actual.new_files == "1" and .mismatched)' \
         wmfs status --json

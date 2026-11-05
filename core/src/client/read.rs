@@ -3,7 +3,7 @@
 //!
 //! - 副本选择、`CHUNK_DIRTY` 改问 last serving、坏副本换下一个、`STALE_CHAIN` 拉新集群图都在 DataClient 里；这里处理
 //!   `CHUNK_NOT_FOUND`（C5：先 `GetAttr` 确认 epoch 没变，才把这一段当空洞读 0；epoch 变了 → 重新 Open 取新 layout 再读）与
-//!   `BAD_CAP`（经 `FileClient::with_cap`：续一次 cap 再试，再失败 → `EACCES`）。
+//!   `BAD_CAP`（经 `FileClient::with_cap`：续一次 cap 再试，再失败 → `EACCES`）。经句柄的请求只在句柄的会话里发（M10 审查）。
 //! - 本地还没提交的数据在读之前先拷一份（在途的、脏区的），读完数据节点再盖上去：这期间后台写线程提交了、放掉了那份数据也不要紧。
 //! - inline 文件：`[len(INLINE), size)` 读为 0（3.2.7 的不变式 `len(INLINE) ≤ size`；例如 `truncate -s 100K` 一个小文件之后）。
 //!   手上的 inline 副本不是当前版本的（只写打开、别人改过，`inode.rs`）→ 读方式的 Open 取回最新的属性与内容再读（照常检查读权限）。
@@ -50,7 +50,7 @@ impl FileClient {
             let mut out = vec![0u8; len];
             let committed = s.meta_end.saturating_sub(off).min(len as u64) as usize;
             if committed > 0 && s.inline_file && s.inline.is_none() {
-                self.refetch_inline(&inode, who)?;
+                self.refetch_inline(&inode, who, h.session)?;
                 continue;
             }
             let r = if committed == 0 {
@@ -59,11 +59,11 @@ impl FileClient {
                 copy_inline(d, off, &mut out[..committed]);
                 Ok(())
             } else {
-                self.read_chunks(&inode, who, &s, off, &mut out[..committed], h.direct)
+                self.read_chunks(&inode, who, h, &s, off, &mut out[..committed])
             };
             match r {
                 Err(ErrCode::STALE_LAYOUT) => {
-                    self.stale(&inode, who, Reopen::Read)?;
+                    self.stale(&inode, who, h.session, Reopen::Read)?;
                     continue;
                 }
                 r => r?,
@@ -80,23 +80,23 @@ impl FileClient {
 
     /// 手上的 inline 副本不是当前版本的：经读句柄重新取回最新的属性与内容（`ReopenHandle{write: false}`，M8 第一步：属主不看
     /// 权限位，其他人照常检查读权限），只换上、不前进"见过的 change_id"。
-    fn refetch_inline(&self, inode: &Inode, who: &Caller) -> Result<(), ErrCode> {
-        let o = expect_open_out(self.meta.read(who, MetaOp::ReopenHandle { ino: inode.ino, write: false }))?;
+    fn refetch_inline(&self, inode: &Inode, who: &Caller, sid: u64) -> Result<(), ErrCode> {
+        let o = expect_open_out(self.meta.read_in(sid, who, MetaOp::ReopenHandle { ino: inode.ino, write: false }))?;
         lock(&inode.st).install(&o);
         Ok(())
     }
 
-    /// 已提交的部分：有 cache_store 时按块（先问它，没有再问数据节点并放进去），否则按 chunk 直接读这一段。
+    /// 经句柄 `h` 读已提交的部分：有 cache_store 时按块（先问它，没有再问数据节点并放进去），否则按 chunk 直接读这一段。
     fn read_chunks(
         &self,
         inode: &Inode,
         who: &Caller,
+        h: &Handle,
         s: &Snap,
         off: u64,
         out: &mut [u8],
-        direct: bool,
     ) -> Result<(), ErrCode> {
-        let cache = self.cache.as_ref().filter(|_| !direct);
+        let cache = self.cache.as_ref().filter(|_| !h.direct);
         let cs = s.layout.chunk_size as u64;
         let step = if cache.is_some() { BLOCK.min(cs) } else { cs }; // 没有 cache_store 时一块就是一个 chunk
         let end = off + out.len() as u64;
@@ -117,7 +117,7 @@ impl FileClient {
                         }
                     };
                     if hit.is_none() {
-                        let n = self.fetch(inode, who, s, lo, &mut blk)?;
+                        let n = self.fetch(inode, who, h.session, s, lo, &mut blk)?;
                         let put = hc.call(|| {
                             c.put(&key, &blk[..n]);
                             Ok(())
@@ -129,7 +129,7 @@ impl FileClient {
                     dst.copy_from_slice(&blk[(pos - lo) as usize..(piece_end - lo) as usize]);
                 }
                 None => {
-                    self.fetch(inode, who, s, pos, dst)?;
+                    self.fetch(inode, who, h.session, s, pos, dst)?;
                 }
             }
             pos = piece_end;
@@ -139,7 +139,15 @@ impl FileClient {
 
     /// 从数据节点读文件内 `[at, at + into.len())`（不跨 chunk）进 `into`，元数据长度之后与 chunk 的 logical_len 之后补 0；
     /// 返回实际读到的字节数。
-    fn fetch(&self, inode: &Inode, who: &Caller, s: &Snap, at: u64, into: &mut [u8]) -> Result<usize, ErrCode> {
+    fn fetch(
+        &self,
+        inode: &Inode,
+        who: &Caller,
+        sid: u64,
+        s: &Snap,
+        at: u64,
+        into: &mut [u8],
+    ) -> Result<usize, ErrCode> {
         let cs = s.layout.chunk_size as u64;
         let idx = u32::try_from(at / cs).map_err(|_| ErrCode::EFBIG)?;
         let want = (into.len() as u64).min(s.meta_end.saturating_sub(at)) as u32;
@@ -148,7 +156,7 @@ impl FileClient {
             return Ok(0);
         }
         let chunk = chunk_id(&s.layout, inode.ino, idx)?;
-        let got = self.with_cap(inode, who, false, |cap| {
+        let got = self.with_cap(inode, who, sid, false, |cap| {
             let buf = self.data.pool().get(want as usize, Lane::Normal, CLIENT_POOL_WAIT)?;
             self.data.read(cap, &s.layout, chunk, (at % cs) as u32, want, buf, None)
         });

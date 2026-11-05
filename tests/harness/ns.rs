@@ -73,8 +73,9 @@ pub struct Ns {
     pub kv: View,
     pipeline: Pipeline,
     attrs: AttrResolver,
-    pub now: i64,     // 每个操作之后 + 1 秒（于是能看出 mtime/ctime 是不是被更新了）
-    pub session: u64, // 请求带的会话号（默认 SESSION；测试可以改，看会话检查）
+    pub now: i64,               // 每个操作之后 + 1 秒（于是能看出 mtime/ctime 是不是被更新了）
+    pub session: u64,           // 请求带的会话号（默认 SESSION；测试可以改，看会话检查）
+    pub caps: Vec<(u64, bool)>, // 连接身份的路径限制（M10 的 path-caps；默认没有）
 }
 
 impl Default for Ns {
@@ -101,7 +102,14 @@ impl Ns {
             evict_map_epoch: 0,
         };
         kv.put(&keys::session(SESSION), encode_v1(&s));
-        Ns { kv, pipeline: ns_pipeline(), attrs: AttrResolver::default(), now: 1_800_000_000, session: SESSION }
+        Ns {
+            kv,
+            pipeline: ns_pipeline(),
+            attrs: AttrResolver::default(),
+            now: 1_800_000_000,
+            session: SESSION,
+            caps: vec![],
+        }
     }
 
     fn ctx(&mut self, who: &Who) -> ReqCtx {
@@ -112,7 +120,7 @@ impl Ns {
             tenant: 0,
             uid_ranges: vec![(0, u32::MAX)],
             root_squash: false,
-            path_caps: vec![],
+            path_caps: self.caps.clone(),
         });
         let w = Principal { uid: who.uid, gid: who.gid, groups: who.groups.clone(), tenant: 0, job_id: 9, conn };
         let now = Ts { secs: self.now, nanos: 0 };

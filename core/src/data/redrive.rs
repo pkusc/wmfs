@@ -12,6 +12,9 @@
 //!      replica.rs）并让 chain-timer 下一拍（≤ 0.5 s）就重新驱动——按切换之后的视图发（新链的 chain_ver、按新图找新后继的地址：新加入
 //!      的节点在旧图里没有地址），打包读盘也不在 hb 线程上。后继没变、只是链版本变了的也这样（旧版本下发出的转发会被已换图的后继拒绝；
 //!      本节点换图晚于后继时就不必等满 3 s，重新驱动永远安全）。
+//!
+//!   这些之前先登记"新成为 last serving 的链一个租约内读回 BUSY"（`chain::note_promotions`，ADR-0041 第 14 条）：规则 2 在换图途中就
+//!   本地提交，这时按旧图来的读（本节点在旧图里还不是 L、chunk 又不算脏）就会读到旧 L 还没有的版本。
 //! - **chain-timer**（[`start`]）：每 500 ms 扫描 pending 表，超过 3 s 未确认的按当前视图重新驱动（有后继 → 完整重发；没有后继 →
 //!   提交并确认；自己已不在链上 → 放弃）。计数 `wmfs_craq_redrive_total`。
 
@@ -74,7 +77,18 @@ pub fn redrive(node: &Arc<DataNode>, id: &ChunkId) {
 /// 换上一张新集群图（hb 线程拉到新图时；组件测试直接调用）：先按 3.4.2.6 处理变了的链上的 pending，再切换视图，最后把解决了 pending
 /// 的 chunk 上排着的写交给 repl 线程（见文件头）。
 pub fn switch(node: &Arc<DataNode>, new: Arc<ClusterMap>) {
-    let queued = apply_map(node, node.map.get().as_deref(), &new);
+    let old = node.map.get();
+    chain::note_promotions(node, old.as_deref(), &new); // 先于规则 2 登记（见文件头）
+    let queued = apply_map(node, old.as_deref(), &new);
+    if let Some(o) = &old {
+        // 新驱逐的会话（M10，3.4.4）：从这张图起 io 线程执行请求时拒绝它的 cap
+        for (sid, _) in &new.evicted {
+            if !o.evicted.iter().any(|(x, _)| x == sid) {
+                let e = new.map_epoch;
+                log::info("data", format_args!("集群图 map_epoch {e}：会话 {sid:x} 已被驱逐，此后拒绝它的 cap"));
+            }
+        }
+    }
     node.map.set(new);
     for j in queued {
         let j = match node.repl.get() {

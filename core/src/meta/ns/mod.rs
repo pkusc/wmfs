@@ -4,6 +4,7 @@
 //!
 //! - [`common`]：读写 inode 与目录项、名字检查、属主与权限位、AttrOut/OpenOut、authz、孤儿
 //! - [`layout`]：新文件与截断到 0 的文件按生效属性选链、建 layout（M7 从 common 搬出）
+//! - [`path_view`]：有路径限制的 key 的祖先链与路径遍历的放宽（M10，从 common 搬出）
 //! - [`read_ops`]：lookup、getattr、readdir、readlink、按路径解析、open
 //! - [`create`]：create、mkdir、mknod、symlink、link
 //! - [`remove`]：unlink、rmdir（孤儿标记）
@@ -15,8 +16,9 @@
 //!   ReopenHandle（M7，ADR-0037 第 4 条：经句柄重新取 layout）
 //!
 //! 实现注记（M4）：`GetLock`/`SetLock`/`AppendReserve`（M12）还没有实现，回 `FEATURE_UNSUPPORTED`；回收站（M12）、递归计数（M7）、
-//! 配额（M10）、目录属性的继承（M7）随各自的里程碑加入（M7 已实现递归计数与属性继承：见 `meta/rstat.rs`、`meta/attrs.rs`）。实现注记（M5）：`StatFs`（要心跳报上来的 target 容量，
-//! `meta/cluster/targets.rs`）与 `Uninline`（要经数据面写 chunk，`meta/uninline.rs`）由元数据服务另外处理。实现注记（M6）：
+//! 配额（M10）、目录属性的继承（M7）随各自的里程碑加入（M7 已实现递归计数与属性继承：见 `meta/rstat.rs`、`meta/attrs.rs`；M10 已实现
+//! 配额：`meta/quota.rs`——open/create/CommitWrite 的 `quota_end`、精确检查与护栏）。实现注记（M5）：`StatFs`（要心跳报上来的 target
+//! 容量，`meta/cluster/targets.rs`）与 `Uninline`（要经数据面写 chunk，`meta/uninline.rs`）由元数据服务另外处理。实现注记（M6）：
 //! `SetAtime` 与 ADR-0036 的 `TruncateHandle`（与 SetAttr{size} 同一段代码，授权用 `AuthzOp::Handle`）加入。
 
 pub mod acl;
@@ -24,6 +26,7 @@ pub mod common;
 pub mod create;
 pub mod file_ops;
 pub mod layout;
+pub mod path_view;
 pub mod read_ops;
 pub mod remove;
 pub mod rename;
@@ -66,13 +69,14 @@ pub fn txn_op(op: MetaOp) -> Option<TxnOp> {
             Box::new(move |v, c| xattr::setxattr(v, c, ino, &name, &value, flags))
         }
         MetaOp::RemoveXattr { ino, name } => Box::new(move |v, c| xattr::removexattr(v, c, ino, &name)),
-        MetaOp::CommitWrite { ino, epoch, new_size, inline_patches, uninline_expect_change_id, .. } => {
+        MetaOp::CommitWrite { ino, epoch, new_size, inline_patches, uninline_expect_change_id, want_quota, .. } => {
             let w = file_ops::CommitIn {
                 ino,
                 epoch,
                 new_size,
                 patches: inline_patches,
                 expect_change_id: uninline_expect_change_id,
+                want_quota,
             };
             Box::new(move |v, c| file_ops::commit_write(v, c, &w))
         }

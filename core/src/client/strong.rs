@@ -17,6 +17,8 @@
 //!      TruncateChunk）→ 0，否则 = 看到的 epoch（ADR-0035 第 9 条）；`STALE_LAYOUT` → 重新 Open、回到第 3 步（最多 3 次）。回复是
 //!      `Opened(OpenOut)`，用它更新 InodeState（C4：截断到 0 之后的写直接进新 epoch）。
 //!
+//!   经句柄（同步写、ftruncate、fallocate）的请求只在句柄的会话里发（M10 审查，`files.rs` 的文件头）；被驱逐的会话里打开的句柄 → `EIO`。
+//!
 //!   实现注记（M6）：内核对 `open(O_TRUNC)` 发的 SETATTR 不带 fh（6.17 的 `fuse_do_setattr` 遇到 ATTR_OPEN 把 file 置空），与按路径的
 //!   truncate 分不出来，所以它发的是 `SetAttr`——刚做完的 Open 已经按当前权限检查过写权限，结果相同（ADR-0036 第 3 条的偏离，
 //!   design.md 8.1 的注记）。
@@ -47,30 +49,30 @@ impl FileClient {
         for _ in 0..STALE_RETRIES {
             let (inline, imax, cs) = lock(&inode.st).layout_view()?;
             let r = if inline && end <= imax {
-                self.commit(inode, who, end, vec![(off, data.to_vec())], false)
+                self.commit(inode, who, h.session, end, vec![(off, data.to_vec())], false, false)
             } else {
                 if inline {
-                    self.uninline(inode, who)?;
+                    self.uninline(inode, who, h.session)?;
                 }
-                self.write_through(inode, who, off, data, cs, h.sync)
+                self.write_through(inode, who, h, off, data, cs)
             };
             match r {
-                Err(ErrCode::STALE_LAYOUT) => self.stale(inode, who, Reopen::Handle)?,
+                Err(ErrCode::STALE_LAYOUT) => self.stale(inode, who, h.session, Reopen::Handle)?,
                 r => return r.map(|()| data.len() as u32),
             }
         }
         Err(ErrCode::ESTALE)
     }
 
-    /// 按 chunk 把 `data` 写进链（每段拷进一个池缓冲）→（`O_SYNC` 时）SyncChunks → 提交长度。
+    /// 经句柄 `h` 按 chunk 把 `data` 写进链（每段拷进一个池缓冲）→（`O_SYNC` 时）SyncChunks → 提交长度。
     fn write_through(
         &self,
         inode: &Inode,
         who: &Caller,
+        h: &Handle,
         off: u64,
         data: &[u8],
         cs: u64,
-        sync: bool,
     ) -> Result<(), ErrCode> {
         let mut pos = 0usize;
         while pos < data.len() {
@@ -80,19 +82,19 @@ impl FileClient {
             let mut b = self.data.pool().get(n, Lane::Normal, CLIENT_POOL_WAIT)?;
             b.as_mut_slice().copy_from_slice(&data[pos..pos + n]);
             let b = b.freeze();
-            self.write_chunk(inode, who, idx, vec![((at % cs) as u32, n as u32)], vec![b.whole()])?;
+            self.write_chunk(inode, who, h.session, idx, vec![((at % cs) as u32, n as u32)], vec![b.whole()])?;
             pos += n;
         }
-        if sync {
-            self.sync_chunks(inode, who)?;
+        if h.sync {
+            self.sync_chunks(inode, who, h.session)?;
         }
-        self.commit(inode, who, off + data.len() as u64, vec![], false)
+        self.commit(inode, who, h.session, off + data.len() as u64, vec![], false, false)
     }
 
-    /// `setattr(size)`（见文件头）。`fh` = 带着的句柄（是这个文件的写句柄时经句柄截断）。返回新属性。
+    /// `setattr(size)`（见文件头）。`fh` = 带着的句柄（是这个文件的写句柄时经句柄截断；被驱逐的会话里打开的 → `EIO`）。返回新属性。
     pub fn set_size(&self, who: &Caller, ino: u64, size: u64, fh: Option<u64>) -> Result<AttrOut, ErrCode> {
-        let by_handle = fh.and_then(|f| self.handle(f).ok()).is_some_and(|h| h.write && h.ino == ino);
-        let fresh = if by_handle {
+        let h = fh.map(|f| self.handle(f)).transpose()?.filter(|h| h.write && h.ino == ino);
+        let fresh = if h.is_some() {
             None
         } else {
             Some(expect_open_out(self.meta.read(who, MetaOp::Open { ino, flags: O_WRONLY }))?) // 第 1 步
@@ -111,7 +113,7 @@ impl FileClient {
         self.flush_held(&inode, false, false)?;
         let mut known = fresh.map(|o| o.attr.size); // 线性一致的最新长度；None = 还不知道（经句柄：用到时 GetAttr）
         for _ in 0..STALE_RETRIES {
-            match self.truncate_once(&inode, who, size, by_handle, known, local_end) {
+            match self.truncate_once(&inode, who, size, h, known, local_end) {
                 Ok(o) => {
                     let mut st = lock(&inode.st);
                     st.install(&o);
@@ -119,7 +121,8 @@ impl FileClient {
                     return Ok(o.attr);
                 }
                 Err(ErrCode::STALE_LAYOUT) => {
-                    self.stale(&inode, who, if by_handle { Reopen::Handle } else { Reopen::Path })?;
+                    let how = if h.is_some() { Reopen::Handle } else { Reopen::Path };
+                    self.stale(&inode, who, self.session_for(h), how)?;
                     known = Some(lock(&inode.st).attr.size); // 重新 Open 回来的长度就是最新的
                 }
                 Err(e) => return Err(e),
@@ -128,17 +131,18 @@ impl FileClient {
         Err(ErrCode::ESTALE)
     }
 
-    /// 截断的第 3、4 步（见文件头）按手上的 layout 做一遍；layout 变了 → `STALE_LAYOUT`（调用方重新 Open 再来）。
+    /// 截断的第 3、4 步（见文件头）按手上的 layout 做一遍；layout 变了 → `STALE_LAYOUT`（调用方重新 Open 再来）。`h` = 经这个写句柄
+    /// 截断（None = 按路径）。
     fn truncate_once(
         &self,
         inode: &Inode,
         who: &Caller,
         size: u64,
-        by_handle: bool,
+        h: Option<Handle>,
         known: Option<u64>,
         local_end: u64,
     ) -> Result<OpenOut, ErrCode> {
-        let ino = inode.ino;
+        let (ino, sid) = (inode.ino, self.session_for(h));
         let (inline, l, cached) = {
             let st = lock(&inode.st);
             (st.layout_view()?.0, st.layout.clone().ok_or(ErrCode::EINVAL)?, st.attr.size)
@@ -149,18 +153,24 @@ impl FileClient {
                 None => self.size_now(who, ino)?,
             };
             let old = latest.max(cached).max(local_end);
-            let done = self.with_cap(inode, who, true, |cap| truncate_chunks(&self.data, cap, &l, ino, old, size))?;
+            let done =
+                self.with_cap(inode, who, sid, true, |cap| truncate_chunks(&self.data, cap, &l, ino, old, size))?;
             lock(&inode.st).unsynced.extend(done);
         }
         let epoch_seen = if inline { 0 } else { l.epoch };
-        let op = if by_handle {
+        let op = if h.is_some() {
             MetaOp::TruncateHandle { ino, size, epoch_seen }
         } else {
             let set =
                 SetAttrIn { mode: None, uid: None, gid: None, size: Some(size), atime: None, mtime: None, epoch_seen };
             MetaOp::SetAttr { ino, set }
         };
-        expect_open_out(self.meta.write(who, op))
+        expect_open_out(self.meta.write_in(sid, who, op))
+    }
+
+    /// 截断的请求在哪个会话里发：经写句柄 = 它的会话；按路径 = 现在的会话。
+    fn session_for(&self, h: Option<Handle>) -> u64 {
+        h.map_or_else(|| self.meta.session(), |h| h.session)
     }
 
     /// 线性一致的最新长度（GetAttr）。
@@ -196,12 +206,13 @@ impl FileClient {
         self.slots.release(freed);
     }
 
-    /// `fallocate`（只支持 mode 0：扩展长度，3.1.1）：经句柄（ADR-0036）。返回新属性。
-    pub fn fallocate(&self, who: &Caller, ino: u64, off: u64, len: u64, mode: u32) -> Result<AttrOut, ErrCode> {
-        let MetaReply::Entry { attr } = self.meta.write(who, MetaOp::Fallocate { ino, offset: off, len, mode })? else {
+    /// `fallocate`（只支持 mode 0：扩展长度，3.1.1）：经句柄 `h`（ADR-0036；只在它的会话里发）。返回新属性。
+    pub fn fallocate(&self, who: &Caller, h: &Handle, off: u64, len: u64, mode: u32) -> Result<AttrOut, ErrCode> {
+        let op = MetaOp::Fallocate { ino: h.ino, offset: off, len, mode };
+        let MetaReply::Entry { attr } = self.meta.write_in(h.session, who, op)? else {
             return Err(ErrCode::INTERNAL);
         };
-        if let Some(i) = self.inode(ino) {
+        if let Some(i) = self.inode(h.ino) {
             let mut st = lock(&i.st);
             st.patch_inline(&attr, &[]); // inline 内容不变（新增的区域读 0）
             st.mine(&attr);
