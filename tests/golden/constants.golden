@@ -22,6 +22,7 @@ KIND_CHR 06
 KIND_BLK 07
 GC_ORPHAN 01
 GC_EPOCH 02
+GC_MOVED 03
 BLK_COMPRESSED 01
 BLK_ENCRYPTED 02
 CK_CRC32C 01
@@ -216,6 +217,7 @@ changelog_op.SwitchLayout 6800
 changelog_op.ChecksumRepaired 6900
 changelog_op.DataLossDetected 6a00
 changelog_op.TrashExpire 6b00
+changelog_op.RStatDrift 6c00
 changelog_op.ClassCreate c800
 changelog_op.ClassUpdate c900
 changelog_op.ClassDelete ca00
@@ -253,3 +255,7 @@ O_RDWR 02000000
 O_ACCMODE 03000000
 CODEC_REPLICA 01
 SET_ATIME_MAX_ITEMS 00040000
+task_state.RUNNING 01
+task_state.PAUSED 02
+task_state.DONE 03
+CHECK_EPOCHS_MAX e8030000

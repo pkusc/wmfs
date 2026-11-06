@@ -4,8 +4,10 @@
 //!   （以前 `EACCES`）；
 //! - 非属主只读打开 0644 文件，属主 `chmod o-r` 之后碰上 layout 变化 → `EACCES`（与 `Open` 只读的规则相同）。
 //!
-//! 读句柄怎样"碰上 layout 变化"：旧 epoch 的 chunk 被 gc 删掉（`epoch_gc_grace = 0`）之后再读 → `CHUNK_NOT_FOUND` → C5 先 GetAttr，
-//! 发现 epoch 变了 → 重新取 layout（大文件一段）；新内容写成 inline 时，读句柄手上的属性比 inline 副本新 → 重新取 inline 内容（小文件一段）。
+//! 读句柄怎样"碰上 layout 变化"：旧 epoch 的 chunk 没了之后再读 → `CHUNK_NOT_FOUND` → C5 先 GetAttr，发现 epoch 变了 → 重新取 layout
+//! （大文件一段）；新内容写成 inline 时，读句柄手上的属性比 inline 副本新 → 重新取 inline 内容（小文件一段）。实现注记（M11）：gc 在文件
+//! 还被打开着时不再删它的旧 epoch（roadmap M11 的验收），所以这里直接删掉旧 epoch 的 chunk 文件来造出"旧 chunk 没了"（M10 之前靠
+//! `epoch_gc_grace = 0` 的 gc）。
 
 use std::path::Path;
 
@@ -15,7 +17,7 @@ use wmfs_core::client::files::FileClient;
 use wmfs_core::meta::schema::keys::ROOT_INO;
 use wmfs_core::proto::meta::{MetaOp, O_RDONLY, O_RDWR, O_WRONLY, SetAttrIn};
 use wmfs_plugins::local_fs::committed_path;
-use wmfs_testkit::harness::node::{TempDir, file_client, init, set_settings, start, target_dir, wait_for, who};
+use wmfs_testkit::harness::node::{TempDir, file_client, init, set_settings, start, target_dir, who};
 
 fn chmod(c: &FileClient, ino: u64, mode: u32) {
     let set = SetAttrIn { mode: Some(mode), uid: None, gid: None, size: None, atime: None, mtime: None, epoch_seen: 0 };
@@ -50,12 +52,11 @@ fn opened_by(a: &FileClient, b: &FileClient, name: &str, mode: u32, reader_uid: 
     (o.attr.ino, r.fh)
 }
 
-/// 另一个挂载（属主）截断到 0 并写入 `new`；等旧 epoch 的 chunk 被 gc 删掉（读句柄再读就一定碰上 layout 变化）。
+/// 另一个挂载（属主）截断到 0 并写入 `new`；删掉旧 epoch 的 chunk（读句柄再读就一定碰上 layout 变化，见文件头）。
 fn rewrite(b: &FileClient, d: &Path, ino: u64, old: ChunkId, new: &[u8]) {
     b.set_size(&who(1000, 1000), ino, 0, None).unwrap(); // 按路径截断：Open(O_WRONLY)，属主有写权限
     write_wronly(b, ino, new);
-    let gone = wait_for(15, || !committed_path(&target_dir(d), &old).exists());
-    assert!(gone, "旧 epoch 的 chunk 应在宽限期 0 之后被 gc 删掉");
+    std::fs::remove_file(committed_path(&target_dir(d), &old)).unwrap();
 }
 
 #[test]

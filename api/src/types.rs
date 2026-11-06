@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 mod access;
 mod cluster;
 mod mgmt;
+mod tasks;
 pub use access::*; // M10 的管理端点：认证 key 与会话（types/access.rs）
 pub use cluster::*; // M8 的管理端点：集群概览与节点、集群插件清单、元数据哈希（types/cluster.rs）
 pub use mgmt::*; // M7 的管理端点：目录属性、用量、声明 vs 实际、语义、changelog 与游标、集群运行参数（types/mgmt.rs）
+pub use tasks::*; // M11 的管理端点：后台任务、本节点的任务进度、数据加密密钥（types/tasks.rs）
 
 /// 所有错误回复的 body：`{"error": "<code>", "message": "<中文说明>"}`（7.1）。
 /// `error` 是错误码名的小写（例如 `auth_failed`、`eacces`、`einval`、`enoent`、`not_leader`）。

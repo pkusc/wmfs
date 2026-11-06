@@ -84,7 +84,10 @@ fn minimal_profile_smoke() {
     std::fs::create_dir(mp.join("attrs")).unwrap();
     let d = mp.join("attrs");
     let set = wmfs(&dir, &["set", d.to_str().unwrap(), "chunk=1M,replicas=1", "--json"]);
-    assert!(set.contains("\"warnings\":[\"class、replicas"), "1 个故障域、声明 1 副本：只有\"已有文件\"的提醒：{set}");
+    let only_reminder = set.contains("\"warnings\":[\"replicas 是")
+        && set.contains("已有文件由协调器在后台转换")
+        && !set.contains("故障域");
+    assert!(only_reminder, "1 个故障域、声明 1 副本：只有\"已有文件由协调器转换\"的提醒：{set}");
     std::fs::write(d.join("f"), &big).unwrap();
     assert!(stat_json(&dir, "/attrs/f").contains("\"chunk_size\":1048576"), "新文件按目录属性的 chunk");
     let get = wmfs(&dir, &["get", d.to_str().unwrap()]);

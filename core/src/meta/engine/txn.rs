@@ -51,6 +51,22 @@ pub fn txn_blocking(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp) -> Result<Meta
     blocking(eng, ctx, op, false)
 }
 
+/// 同 [`txn_blocking`]，闭包算出的值经一个容量为 1 的通道带出来（执行器的闭包只能回 `MetaReply`；实现注记（M11）：迁移原语、
+/// 递归计数的在线自检用）。
+pub fn txn_value<T: Send + 'static>(
+    eng: &dyn MetaEngine,
+    ctx: ReqCtx,
+    f: impl FnOnce(&mut dyn KvTxn, &OpCtx) -> Result<T, ErrCode> + Send + 'static,
+) -> Result<T, ErrCode> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let op: TxnOp = Box::new(move |v, c| {
+        let _ = tx.try_send(f(v, c)?);
+        Ok(MetaReply::Ok)
+    });
+    txn_blocking(eng, ctx, op)?;
+    rx.try_recv().map_err(|_| ErrCode::INTERNAL)
+}
+
 /// 同 [`txn_blocking`]，用于改变集群拓扑（链、target、节点、存储类）的内部操作：`exclusive`，本批最后一个（3.4.1.4 规则 5）。
 pub fn txn_blocking_exclusive(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp) -> Result<MetaReply, ErrCode> {
     blocking(eng, ctx, op, true)

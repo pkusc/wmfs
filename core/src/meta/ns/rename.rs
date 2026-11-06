@@ -10,7 +10,7 @@
 //! 归零即孤儿 → changelog。
 //! 实现注记（M4）：回收站（M12）随它的里程碑加入。实现注记（M7）：递归计数的搬移——换了目录的主链接（目录、或文件的主链接）把它的
 //! 那一份计数从旧祖先链搬到新祖先链，到最近公共祖先为止；被覆盖的目标按 unlink / rmdir 扣；涉及目录的 rename 令 `attr_epoch += 1`
-//! 并写 `RECONCILE_Q(dir, 2)`（同一个目录里改名也算：3.8"任何目录 rename"；协调器在 M11）。实现注记（M10）：跨配额域的检查——换了
+//! 并写 `RECONCILE_Q(dir, 2)`（同一个目录里改名也算：3.8"任何目录 rename"；由 M11 的协调器消费）。实现注记（M10）：跨配额域的检查——换了
 //! 目录的那一份计数先在新祖先链一侧过配额（`quota::admit_move`）；M10 审查：被覆盖的目标先扣掉再查（否则装得下的覆盖也被误拒），
 //! RENAME_EXCHANGE 按两份计数对调之后的净增量查；有多个链接的非目录把一个链接搬进配额范围不同的目录 → `EXDEV`（对调的两边各看
 //! 各的，[`links_stay`]，ADR-0041 第 1 条）。
@@ -50,7 +50,7 @@ fn dir_changing_parent(across: bool, n: &Node) -> Option<&Node> {
     (across && n.is_dir()).then_some(n)
 }
 
-/// 目录被移动了（任何目录 rename，同一个目录里改名也算）：继承关系变了 → 写 `RECONCILE_Q(dir, 2)`（3.1.2；协调器在 M11）、
+/// 目录被移动了（任何目录 rename，同一个目录里改名也算）：继承关系变了 → 写 `RECONCILE_Q(dir, 2)`（3.1.2；由 M11 的协调器消费）、
 /// `attr_epoch += 1`（3.8 的缓存规则；之后这个操作里不再解析属性）。
 fn note_dir_moved(v: &mut dyn KvTxn, dir: u64) -> Result<(), ErrCode> {
     queue_reconcile(v, dir, 2)?;

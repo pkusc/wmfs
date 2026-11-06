@@ -1,0 +1,13 @@
+# zstd transform 插件的 manifest（design.md 3.7.1、4.8）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "zstd"
+version = "0.1.0"
+hooks = ["transform"]
+altitude = 732
+hot_path = true
+abi_version = 1
+attrs = ["compress"]
+budget_ns = 600000
+fail_points = ["plugin.zstd.transform"]
+
+[config_schema]
+# 没有部署参数：压不压缩、用哪种算法是目录属性 compress（wmfs set <目录> compress=zstd 或 zstd:1…19）

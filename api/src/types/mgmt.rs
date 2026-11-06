@@ -106,12 +106,27 @@ pub struct QuotaUsage {
 /// 一个属性的"实际"（3.10）。M7：`new_files` = 这个目录下的新文件此刻实际得到的值（例如 replicas 是
 /// min(声明, 可用故障域数)）；逐文件扫描已有文件的统计在 M11 加入（只增）。实现注记（M9）：`replicas` 多一个 `short_files`——子树里
 /// 已有文件中实际副本数（= min(layout.replicas, 它的每条链此刻的 Serving 成员数)）少于声明的个数（3.10 表里 replicas 一行的最小部分；
-/// 别的键没有这一项，不输出）。
+/// 别的键没有这一项，不输出）。实现注记（M11）：逐文件的统计（3.10 的表，只增、`None` 时不输出）——`files` = 子树里扫到的已有普通文件数，
+/// `mismatched_files` = 其中实际与声明不同的个数，`open_files` = 其中一直写打开、协调器跳过的（class、replicas、compress、encrypt），
+/// `migrates` = 协调器会不会迁移这个键（chunk、stripe、inline、checksum 为 false："不迁移"）；stripe 的 `short_files` = 条带数少于声明的
+/// 文件（可用链不够）。没有逐文件统计的键（consistency、acl.default、inherit、quota 等）这几项都不输出。`quota`、`quota.<类>` 的实际是
+/// `quotas`：这个目录与它上面的每个（总量 / 按类的）配额此刻的用量、上限、软限的计时与宽限剩余（与 `wmfs usage` 同一个 [`QuotaUsage`]）；
+/// 超了软限、宽限已过或超了硬限的算不一致。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct AttrActual {
     pub new_files: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub short_files: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mismatched_files: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_files: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrates: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quotas: Option<Vec<QuotaUsage>>,
 }
 
 /// `GET /api/v1/status` 里一个属性的声明 vs 实际。
@@ -125,12 +140,24 @@ pub struct StatusAttr {
     pub mismatched: bool,
 }
 
-/// `GET /api/v1/status?path=`：`warnings` 是集群警告与这棵子树里无法满足的声明（`wmfs status` 第一行起打印）。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+/// `GET /api/v1/status?path=`：`warnings` 是集群警告与这棵子树里无法满足的声明（`wmfs status` 第一行起打印）。实现注记（M11，只增）：
+/// `scanned` = 逐文件统计扫过的 inode 数，`truncated` = 扫到上限（100 万）就停了（统计不全，warnings 里另有一句）；`degraded_files`/
+/// `degraded_bytes` = 位于降级链（正常服务的副本少于期望）上的文件数与字节数；`reconciler` = 协调器的进度与积压（leader 上的样子）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct StatusReply {
     pub path: String,
     pub warnings: Vec<String>,
     pub attrs: Vec<StatusAttr>,
+    #[serde(default)]
+    pub scanned: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub degraded_files: u64,
+    #[serde(default)]
+    pub degraded_bytes: u64,
+    #[serde(default)]
+    pub reconciler: Option<super::TaskInfo>,
 }
 
 /// `GET /api/v1/semantics`：一致性等级与放松清单的要点（semantics.md）、当前的集群运行参数（显示形式）。

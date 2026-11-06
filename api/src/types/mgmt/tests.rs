@@ -67,16 +67,33 @@ fn usage_status_semantics_json_golden() {
         declared: "3".into(),
         source: "/home".into(),
         effect: "新文件 + 协调器".into(),
-        actual: AttrActual { new_files: "1".into(), short_files: None },
+        actual: AttrActual { new_files: "1".into(), ..Default::default() },
         mismatched: true,
     };
-    let s = StatusReply { path: "/".into(), warnings: vec!["w".into()], attrs: vec![a] };
+    let s = StatusReply { path: "/".into(), warnings: vec!["w".into()], attrs: vec![a], ..Default::default() };
     same(
         &s,
-        r#"{"path":"/","warnings":["w"],"attrs":[{"key":"replicas","declared":"3","source":"/home","effect":"新文件 + 协调器","actual":{"new_files":"1"},"mismatched":true}]}"#,
+        r#"{"path":"/","warnings":["w"],"attrs":[{"key":"replicas","declared":"3","source":"/home","effect":"新文件 + 协调器","actual":{"new_files":"1"},"mismatched":true}],"scanned":0,"truncated":false,"degraded_files":0,"degraded_bytes":0,"reconciler":null}"#,
     );
-    let a2 = AttrActual { new_files: "3".into(), short_files: Some(1 << 33) }; // M9：replicas 的 short_files
+    let old: StatusReply = serde_json::from_str(r#"{"path":"/","warnings":[],"attrs":[]}"#).unwrap();
+    assert_eq!(old, StatusReply { path: "/".into(), ..Default::default() }, "M11 之前的回复照样解得开（只增）");
+    let a2 = AttrActual { new_files: "3".into(), short_files: Some(1 << 33), ..Default::default() }; // M9：replicas 的 short_files
     same(&a2, r#"{"new_files":"3","short_files":8589934592}"#);
+    let a3 = AttrActual {
+        new_files: "zstd:3".into(),
+        files: Some(20),
+        mismatched_files: Some(19),
+        open_files: Some(1),
+        migrates: Some(true),
+        ..Default::default()
+    }; // M11：逐文件的统计
+    same(&a3, r#"{"new_files":"zstd:3","files":20,"mismatched_files":19,"open_files":1,"migrates":true}"#);
+    let q1 = QuotaUsage { dir: "/p".into(), hard: 100, used_bytes: 3, ..Default::default() };
+    let a4 = AttrActual { new_files: "100B".into(), quotas: Some(vec![q1]), ..Default::default() }; // M11：quota 的实际
+    same(
+        &a4,
+        r#"{"new_files":"100B","quotas":[{"dir":"/p","class":null,"hard":100,"soft":0,"grace_ms":0,"files":0,"quantum":0,"used_bytes":3,"used_files":0,"soft_since_ms":0,"grace_left_ms":null}]}"#,
+    );
     let m = SemanticsReply {
         consistency: vec!["c".into()],
         relaxations: vec!["r".into()],

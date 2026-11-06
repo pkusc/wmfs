@@ -44,7 +44,7 @@ pub const F_ORPHAN: u32 = 2;
 pub const F_HAS_ACL: u32 = 4;
 pub const F_TRASH_DIR: u32 = 8;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct InodeV1 {
     pub kind: u8,
     pub mode: u32, // 权限位 + suid/sgid/sticky（不含类型位）
@@ -70,7 +70,7 @@ pub struct InodeV1 {
     pub symlink: Vec<u8>,         // 只有符号链接
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct LayoutV1 {
     pub epoch: u32, // fencing token
     pub chunk_size: u32,

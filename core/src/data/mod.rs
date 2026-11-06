@@ -11,6 +11,7 @@
 //! - [`packed`]：packed 形式与增量转发的应用；[`forward`]：发转发、提交与确认（M9）
 //! - [`replica`]：PeerCall 服务与 repl 线程（后继处理转发、确认、同步与删除的传播，M9）
 //! - [`redrive`]：链变化时的前滚与 chain-timer（3.4.2.6，M9）；[`sync`]：重同步（3.4.2.8，M9）
+//! - [`datakey`]：数据加密密钥的包裹、解包与内存里的缓存（M11）；[`repair`]：校验与修复一个 chunk 副本、上报，写路径要的修复（M11）
 //!
 //! 实现注记（M5）：单节点数据路径——链长 1，head 写完 pending 就本地提交（3.4.2.3 第 5 步"无后继"一支）。实现注记（M9）：多成员链
 //! ——转发不占线程（`call_cb` + pending 表，回调只把结果 try_send 进 repl 队列）、逆向确认、前滚、重同步、target 租约与自我隔离（I5）。
@@ -18,12 +19,14 @@
 
 pub mod build;
 pub mod chain;
+pub mod datakey;
 pub mod format;
 pub mod forward;
 pub mod node_hb;
 pub mod packed;
 pub mod read;
 pub mod redrive;
+pub mod repair;
 pub mod replica;
 pub mod service;
 pub mod state;
@@ -33,6 +36,7 @@ pub mod write;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_channel::Sender;
@@ -51,12 +55,21 @@ use replica::ReplJob;
 use state::ChunkTable;
 use superblock::TargetSuperblock;
 
-/// 本节点的一个 target。
+/// 连续多少次本地提交失败就把 target 当作坏盘、从此只读（实现注记（M11），ADR-0040 第 10 条）。
+pub const FAILED_COMMITS: u32 = 3;
+
+/// 本节点的一个 target。实现注记（M11）：只读有两个来源——启动时超级块里不认识的 ro_compat 位（`ro_compat`），与运行中连续
+/// [`FAILED_COMMITS`] 次本地提交失败（多半是盘坏了：`broken`，[`Target::note_commit`]）；两者都经心跳报 `read_only = true`，链管理器把它
+/// 两步移出写路径（ADR-0041 第 13 条）。只读的 target 不写盘：运行中坏了的，写与截断回可重试的 `NOT_SERVING`（客户端拉新集群图、等它
+/// 被移出；启动时就只读的回 `EROFS`）；当 head 时 DeleteEpoch 回 `EROFS`（两种都是；gc 下一轮再试，service.rs）；当后继收到的转发、
+/// 同步与删除的传播回可重试的 `NOT_SERVING`（前驱稍后重发，replica.rs）；当 Syncing 成员时不同步（sync.rs，`EROFS`）。
 pub struct Target {
     pub id: u32,
     pub path: String,
     pub store: Arc<dyn TargetStore>,
-    pub read_only: bool,        // 超级块里有不认识的 ro_compat 位（3.2.3）：只读服务
+    pub ro_compat: bool,        // 超级块里有不认识的 ro_compat 位（3.2.3）：只读服务
+    broken: AtomicBool,         // 运行中连续提交失败（M11）
+    fail_streak: AtomicU32,     // 连续失败的次数
     pub capacity: u64,          // node.toml 的 `[[target]] capacity`（0 = 不限）
     pub phys_devs: Vec<String>, // 它所在的物理整盘（`base::devinfo`，建 Target 时解析一次；心跳上报）
     read_bytes: Arc<Counter>,
@@ -65,19 +78,48 @@ pub struct Target {
 }
 
 impl Target {
-    pub fn new(id: u32, path: &str, store: Arc<dyn TargetStore>, read_only: bool, capacity: u64) -> Target {
+    pub fn new(id: u32, path: &str, store: Arc<dyn TargetStore>, ro_compat: bool, capacity: u64) -> Target {
         let t = id.to_string();
         let l = [("target", t.as_str())];
         Target {
             id,
             path: path.to_string(),
             store,
-            read_only,
+            ro_compat,
+            broken: AtomicBool::new(false),
+            fail_streak: AtomicU32::new(0),
             capacity,
             phys_devs: devinfo::phys_devs(Path::new(path)),
             read_bytes: metrics::counter("wmfs_chunk_read_bytes_total", "读出的 chunk 明文字节数", &l),
             write_bytes: metrics::counter("wmfs_chunk_write_bytes_total", "写进 pending 文件的字节数", &l),
             corrupt: metrics::counter("wmfs_chunk_corrupt_total", "发现损坏（头 CRC 或块校验和不符）的次数", &l),
+        }
+    }
+
+    /// 只读吗（见结构体的注释）。
+    pub fn read_only(&self) -> bool {
+        self.ro_compat || self.broken()
+    }
+
+    /// 运行中坏了（变成只读，不是启动时就只读）吗。
+    pub fn broken(&self) -> bool {
+        self.broken.load(Ordering::Relaxed)
+    }
+
+    /// 记一次本地提交的结果：连续 [`FAILED_COMMITS`] 次失败 → 从此只读（写一行错误日志）。
+    pub fn note_commit(&self, ok: bool) {
+        if ok {
+            self.fail_streak.store(0, Ordering::Relaxed);
+        } else if self.fail_streak.fetch_add(1, Ordering::Relaxed) + 1 >= FAILED_COMMITS
+            && !self.broken.swap(true, Ordering::Relaxed)
+        {
+            log::error(
+                "data",
+                format_args!(
+                    "target {} 连续 {FAILED_COMMITS} 次提交失败（盘坏了？）：从此只读，心跳上报，等链管理器把它移出写路径",
+                    self.id
+                ),
+            );
         }
     }
 
@@ -114,6 +156,8 @@ pub struct DataNode {
     pub sync_done: Mutex<Vec<(u32, u32, u64)>>, // (链, target, chain_ver)：同步完了，等 hb 线程报给 leader
     pub promoted: Mutex<HashMap<u32, (u64, bool)>>, // 链 → 本节点的成员刚成为 last serving：到这个时刻（mono_ms）之前读回 BUSY、整条链吗
     pub craq: Craq,
+    pub keys: datakey::DataKeys, // 实现注记（M11）：解包过的数据密钥（只在内存里）
+    pub repair_q: OnceLock<Sender<(u32, ChunkId)>>, // 实现注记（M11）：交给 repair 线程修的 (target, chunk)（repair.rs）
 }
 
 /// CRAQ 的计数器（7.3 的"数据"一行）。
@@ -162,6 +206,8 @@ impl DataNode {
             sync_done: Mutex::default(),
             promoted: Mutex::default(),
             craq: Craq::new(),
+            keys: datakey::DataKeys::default(),
+            repair_q: OnceLock::new(),
         })
     }
 
@@ -213,10 +259,10 @@ pub fn open_targets(
         if sb.cluster_id != *cluster_id {
             return Err(format!("target {} 属于别的集群（超级块里的 cluster_id 不符）：插错盘了？", t.path));
         }
-        let read_only = sb.features_ro_compat != 0; // 首发不认识任何 ro_compat 位
+        let ro_compat = sb.features_ro_compat != 0; // 首发不认识任何 ro_compat 位
         let s = store.open_target(root, sb.target_id).map_err(|e| format!("打开 target {} 失败：{e}", t.path))?;
         s.clear_temp().map_err(|e| format!("清空 target {} 的 p/、t/ 失败：{e}", t.path))?;
-        out.push(Target::new(sb.target_id, &t.path, s, read_only, t.capacity_bytes()?));
+        out.push(Target::new(sb.target_id, &t.path, s, ro_compat, t.capacity_bytes()?));
     }
     Ok(out)
 }

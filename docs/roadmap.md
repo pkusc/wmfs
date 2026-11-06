@@ -419,8 +419,9 @@ cat ~/wmfs-mnt/home/data/f* | md5sum; du -sch ~/wmfs-dev/n*/targets | tail -1   
 wmfs task set reconciler bw=2M                      # 先把协调器限速到 2 MiB/s，方便看清进度
 wmfs set ~/wmfs-mnt/home/data compress=zstd:3       # 预期：成功，并提醒"已有文件要等协调器转换完才按新设置"
 wmfs status ~/wmfs-mnt/home/data                    # 预期：compress 声明 zstd:3、不一致约 20 个文件；协调器进度
-wmfs task list                                      # 预期：reconciler 的进度、速率（约 2 MiB/s）、积压
-L=$(wmfs dev leader); wmfs dev kill $L && wmfs dev wait leader && wmfs task list   # 预期：新 leader 从断点继续推进
+wmfs task list                                      # 预期：reconciler 的进度、速率（约 2 MiB/s）、积压（N 个目录）
+# 等 wmfs task list 显示"已处理"≥ 2 再执行下一行（协调器有了进度，才看得出新 leader 从断点继续推进）
+L=$(wmfs dev leader); wmfs dev kill $L && wmfs dev wait leader && wmfs task list   # 预期：新 leader 从断点继续推进（进度最多每 5 秒保存一次，"已处理"可能先少几个，之后接着涨，不会从 0 重来）
 wmfs dev start $L && wmfs dev wait chains-serving   # 被杀的节点回来并同步完
 wmfs task set reconciler bw=200M && wmfs dev wait task-idle reconciler --timeout 300
 wmfs status ~/wmfs-mnt/home/data                    # 预期：不一致 0

@@ -39,12 +39,28 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     s.chunk_store(Arc::new(wmfs_plugins::local_fs::LocalFs::new()));
     #[cfg(feature = "crc32c")]
     s.transform(Arc::new(wmfs_plugins::crc32c::Crc32c::new()));
+    #[cfg(feature = "xxh3")]
+    s.transform(Arc::new(wmfs_plugins::xxh3::Xxh3::new()));
+    #[cfg(feature = "blake3")]
+    s.transform(Arc::new(wmfs_plugins::blake3::Blake3::new()));
+    #[cfg(feature = "lz4")]
+    s.transform(Arc::new(wmfs_plugins::lz4::Lz4::new()));
+    #[cfg(feature = "zstd")]
+    s.transform(Arc::new(wmfs_plugins::zstd::Zstd::new()));
+    #[cfg(feature = "aes-gcm")]
+    s.transform(Arc::new(wmfs_plugins::aes_gcm::AesGcm::new()));
     #[cfg(feature = "replica")]
     s.codec(Arc::new(wmfs_plugins::replica::Replica::new()));
     #[cfg(feature = "fifo")]
     s.qos(Arc::new(wmfs_plugins::fifo::Fifo::new()));
     #[cfg(feature = "gc")]
     s.bg_task(Box::new(wmfs_plugins::gc::Gc::new()));
+    #[cfg(feature = "gc")]
+    s.bg_task(Box::new(wmfs_plugins::gc::GcLocal::new())); // gc 的数据节点部分（本地孤儿扫描，M11）
+    #[cfg(feature = "reconciler")]
+    s.bg_task(Box::new(wmfs_plugins::reconciler::Reconciler::new()));
+    #[cfg(feature = "scrub")]
+    s.bg_task(Box::new(wmfs_plugins::scrub::Scrub::new()));
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST); // embedded-kv：代码在 core（元数据 Raft 是契约，4.10）
     if !cfg.plugins.dylib.is_empty() {
         return Err("node.toml 的 [plugins] dylib：动态库插件 M14 才支持".into());

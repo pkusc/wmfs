@@ -5,6 +5,7 @@ use wmfs_core::base::ErrCode;
 use wmfs_core::base::clock::ts_ms;
 use wmfs_core::base::log::utc_string;
 use wmfs_core::base::units::fmt_size;
+use wmfs_core::data::format::{CMP_ZSTD, compress_name};
 use wmfs_core::meta::ns::common::{S_ISGID, S_ISUID, S_ISVTX};
 use wmfs_core::meta::schema::records::{
     F_INLINE, KIND_BLK, KIND_CHR, KIND_DIR, KIND_FIFO, KIND_FILE, KIND_SOCK, KIND_SYMLINK, LayoutV1,
@@ -91,8 +92,14 @@ pub fn stat(path: &str, a: &AttrOut, layout: Option<&LayoutV1>, map: &ClusterMap
             .filter_map(|id| chain(*id).map(|c| format!("chain {id} 实际 {} 个成员", c.members.len())))
             .collect();
         let inline = if a.flags & F_INLINE != 0 { "yes（内容存在元数据里）" } else { "no" };
+        let compress = if l.compress == CMP_ZSTD {
+            format!("zstd:{}", l.compress_level)
+        } else {
+            compress_name(l.compress).into()
+        };
+        let encrypt = if l.encrypt_key == 0 { "none".to_string() } else { format!("数据密钥 {}", l.encrypt_key) };
         text += &format!(
-            "\n  layout：chunk={}、epoch={}、{} 条链（{}），声明 {} 副本（{}）\n  inline={inline}（阈值 {}）",
+            "\n  layout：chunk={}、epoch={}、{} 条链（{}），声明 {} 副本（{}）\n  inline={inline}（阈值 {}），压缩 {compress}，加密 {encrypt}",
             fmt_size(l.chunk_size as u64),
             l.epoch,
             l.chains.len(),
@@ -108,7 +115,8 @@ pub fn stat(path: &str, a: &AttrOut, layout: Option<&LayoutV1>, map: &ClusterMap
     }
     let layout_json = layout.map(|l| {
         json!({"epoch": l.epoch, "chunk_size": l.chunk_size, "chains": l.chains, "replicas": l.replicas,
-               "inline_max": l.inline_max, "checksum": l.checksum})
+               "inline_max": l.inline_max, "checksum": l.checksum, "compress": l.compress,
+               "compress_level": l.compress_level, "encrypt_key": l.encrypt_key})
     });
     let j = json!({
         "path": path, "ino": a.ino, "kind": kind, "mode": a.mode, "nlink": a.nlink, "uid": a.uid, "gid": a.gid,

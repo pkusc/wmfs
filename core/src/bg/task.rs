@@ -5,15 +5,19 @@
 //! 以 `atomic_write` 存在 `<data_dir>/run/task-<kind>.cursor`。每步：取令牌 → `step` → 持久化游标与进度。
 //! `step` 必须幂等：它的副作用与游标持久化不在同一个事务里，崩溃后从旧游标重放不能出错。
 //!
-//! 接口骨架（M0）：签名以这里为准；`Walker`、`Migrator` 这里先是空壳，实现时移到 walker.rs、migrator.rs（M11）。
+//! 接口骨架（M0）：签名以这里为准；`Walker`、`Migrator` 在 walker.rs、migrator.rs（M11）。
 //! 实现注记（M5）：`RateLimiter` 移到了 limiter.rs；`TaskCtx` 加了一个字段 `live`（leader 内存里的打开文件集合，`sessions::Live`）——
 //! 孤儿 GC 的 3.5.6 条件 ①③ 要看它，而 M0 的骨架没有预见；首发之前还没有任何 bg_task 插件，所以 `CORE_ABI_VERSION` 不变。
+//! 实现注记（M11）：只增——`TaskCtx.node`（`EveryDataNode` 任务拿到本节点的数据面：scrub 要解码、修复、上报，`data::repair`；
+//! `targets` 只有存储接口，不够用；内置任务都用 `node`，`targets` 留给只需要存储接口的第三方任务）与 `BgTask::default_rate`（任务自己的
+//! 默认限速，例如 scrub 的 50 MiB/s，4.12；`wmfs task set` 设了就用设的）。都有默认值或只读，`CORE_ABI_VERSION` 不变。
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::base::ErrCode;
 use crate::client::data_client::DataClient;
+use crate::data::DataNode;
 use crate::hooks::manifest::Manifest;
 use crate::hooks::policy::PolicyEvaluator;
 use crate::hooks::traits::TargetStore;
@@ -21,6 +25,8 @@ use crate::meta::engine::txn::MetaEngine;
 use crate::meta::sessions::Live;
 
 pub use super::limiter::RateLimiter;
+pub use super::migrator::Migrator;
+pub use super::walker::Walker;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOn {
@@ -44,6 +50,10 @@ pub trait BgTask: Send {
     fn interval(&self) -> Duration; // 一轮结束后隔多久开始下一轮
     /// 做一小步（≤ 100 个对象 / ≤ 64 MiB / ≤ 1 s）。必须幂等：从同一游标重放，效果相同。
     fn step(&mut self, ctx: &mut TaskCtx, cursor: &[u8]) -> Result<StepResult, ErrCode>;
+    /// 任务级限速的默认值（字节/秒，0 = 只受节点级限速；实现注记（M11））。
+    fn default_rate(&self) -> u64 {
+        0
+    }
 }
 
 pub struct TaskCtx<'a> {
@@ -52,17 +62,12 @@ pub struct TaskCtx<'a> {
     pub walker: &'a Walker,                  // 可续跑的命名空间遍历
     pub migrate: &'a Migrator,               // 迁移原语
     pub limiter: &'a RateLimiter,            // 任务级 + 节点级令牌桶
-    pub targets: &'a [Arc<dyn TargetStore>], // 只有 EveryDataNode 任务有
+    pub targets: &'a [Arc<dyn TargetStore>], // 只有 EveryDataNode 任务有（内置任务用 node；见文件头）
     pub policy: &'a dyn PolicyEvaluator,
     pub now_ms: u64,
     pub live: &'a Live, // 实现注记（M5）：leader 内存里的打开文件集合（孤儿 GC 的条件，3.5.6）
+    pub node: Option<&'a Arc<DataNode>>, // 实现注记（M11）：EveryDataNode 任务所在节点的数据面
 }
-
-/// 遍历器（3.10）：子树 DFS（游标 = `Vec<(dir_ino, 最后处理的名字)>` 的 postcard 编码）与全量扁平扫描（按 ino）。M11。
-pub struct Walker {}
-
-/// 迁移原语 `Migrator::migrate(ino, declared)`（3.10）：协调器、tiering、rebalance 共用。M11。
-pub struct Migrator {}
 
 #[cfg(test)]
 mod tests {

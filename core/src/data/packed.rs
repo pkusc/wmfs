@@ -54,24 +54,32 @@ pub fn pack(pool: &MemPool, r: ReadAt) -> Result<(Buf, ChunkHeader), ErrCode> {
 /// 要写进文件的 (偏移, 字节)。
 pub type Writes<'a> = Vec<(u64, &'a [u8])>;
 
-/// 解 packed：(头, 要写的 (偏移, 字节))。长度对不上、头 CRC 不符 → `EINVAL`/`CORRUPT`。
-pub fn unpack(b: &[u8]) -> Result<(ChunkHeader, Writes<'_>), ErrCode> {
+/// 解开的 packed：头、块表、要写的 (偏移, 字节)（第一项是头 + 块表，之后是各个有数据的块，按块号顺序）。
+pub struct Unpacked<'a> {
+    pub header: ChunkHeader,
+    pub table: Vec<BlockEntry>,
+    pub writes: Writes<'a>,
+}
+
+/// 解 packed（见 [`Unpacked`]）。长度对不上、头 CRC 不符 → `EINVAL`/`CORRUPT`。
+pub fn unpack(b: &[u8]) -> Result<Unpacked<'_>, ErrCode> {
     let fixed: &[u8; CHUNK_HEADER_LEN] =
         b.get(..CHUNK_HEADER_LEN).and_then(|x| x.try_into().ok()).ok_or(ErrCode::EINVAL)?;
     let head = CHUNK_HEADER_LEN + table_len_of(fixed);
-    let table = b.get(CHUNK_HEADER_LEN..head).ok_or(ErrCode::EINVAL)?;
-    let h = ChunkHeader::decode(fixed, table)?;
+    let raw = b.get(CHUNK_HEADER_LEN..head).ok_or(ErrCode::EINVAL)?;
+    let header = ChunkHeader::decode(fixed, raw)?;
+    let table = decode_table(raw)?;
     let mut writes = vec![(0, &b[..head])];
     let mut at = head;
-    for (i, e) in decode_table(table)?.iter().enumerate().filter(|(_, e)| e.stored_len > 0) {
+    for (i, e) in table.iter().enumerate().filter(|(_, e)| e.stored_len > 0) {
         let d = b.get(at..at + e.stored_len as usize).ok_or(ErrCode::EINVAL)?;
-        writes.push((h.block_offset(i as u32), d));
+        writes.push((header.block_offset(i as u32), d));
         at += d.len();
     }
     if at != b.len() {
         return Err(ErrCode::EINVAL);
     }
-    Ok((h, writes))
+    Ok(Unpacked { header, table, writes })
 }
 
 /// 一个增量转发落到本地之后要写的东西：头 + 新块表（写在偏移 0）、改动块（各自的固定偏移）、要从已提交版本复制的块。

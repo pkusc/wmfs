@@ -20,10 +20,13 @@ use wmfs_api::metrics;
 use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health, NodeAddrs};
 
 use crate::base::{ErrCode, log};
+use crate::bg::progress::TaskBoard;
+use crate::data::datakey::Wrapper;
 use crate::hooks::traits::KeyLookup;
 use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::engine::EmbeddedEngine;
-use crate::mgmt::{api, auth, cluster};
+use crate::meta::sessions::Live;
+use crate::mgmt::{api, auth, cluster, tasks};
 
 /// 请求体上限（字节）。
 const MAX_BODY: usize = 1 << 20;
@@ -33,7 +36,9 @@ const THREADS: usize = 4;
 pub type RoleFn = Arc<dyn Fn() -> (String, Option<NodeAddrs>) + Send + Sync>;
 
 /// 各端点要用的本节点信息。实现注记（M7）：`meta` = 本节点的元数据引擎（依赖元数据的端点用，`mgmt/api.rs`；只有传输与认证的
-/// 组件测试里为 None）；`polls` = 正在挂着的 changelog 长轮询数（每个节点最多 2 个，1.2）。
+/// 组件测试里为 None）；`polls` = 正在挂着的 changelog 长轮询数（每个节点最多 2 个，1.2）。实现注记（M11）：`board` = 本节点后台任务的
+/// 进度板（`bg::progress`），`wrapper` = 包裹数据密钥要的东西（`data::datakey`），`live` = leader 内存里的打开文件集合（status 的
+/// "写打开着"一栏）。
 pub struct MgmtCtx {
     pub health: Health, // 不变的部分（版本、cluster_id、本节点地址）
     pub role: Option<RoleFn>,
@@ -42,6 +47,9 @@ pub struct MgmtCtx {
     pub meta: Option<Arc<EmbeddedEngine>>,
     pub usage: Option<Arc<TargetUsage>>, // leader 内存里的 target 心跳情况（M9：链成员的状态，`mgmt/cluster.rs`）
     pub polls: AtomicUsize,
+    pub board: Option<Arc<TaskBoard>>,
+    pub wrapper: Option<Arc<Wrapper>>,
+    pub live: Option<Arc<Live>>,
 }
 
 /// 已经绑定好地址、还没开始处理请求的管理 API（先绑定，才知道实际地址写进 health）。
@@ -133,6 +141,7 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
         }
         (_, "/api/v1/failpoints") => failpoints(ctx, method, url, auth, body),
         ("GET", "/api/v1/debug/meta-hash") => cluster::meta_hash(ctx, method, url, auth, body), // 每个节点都回答本节点的（M8）
+        ("GET", "/api/v1/node") => tasks::node_info(ctx, method, url, auth, body), // 每个节点都回答本节点的（M11）
         (_, p) if api::handles(p) => api::serve(ctx, method, url, auth, body),
         _ => err(404, "enoent", format!("没有这个接口：{method} {path}")),
     }
@@ -209,7 +218,8 @@ mod tests {
         };
         let keys = Arc::new(InitKeys::new(MASTER, 0));
         let (meta, usage, polls) = (None, None, AtomicUsize::new(0));
-        let ctx = MgmtCtx { health, role: None, keys, failpoints_api, meta, usage, polls };
+        let (board, wrapper, live) = (None, None, None);
+        let ctx = MgmtCtx { health, role: None, keys, failpoints_api, meta, usage, polls, board, wrapper, live };
         m.start(Arc::new(ctx)).unwrap();
         addr
     }

@@ -193,6 +193,11 @@ impl Live {
         lock(&self.m).values().any(|s| s.open.contains_key(&ino))
     }
 
+    /// 有没有哪个会话写打开着 `ino`（迁移原语的第 1、5 步，3.10；实现注记（M11））。
+    pub fn is_write_open(&self, ino: u64) -> bool {
+        lock(&self.m).values().any(|s| s.open.get(&ino) == Some(&true))
+    }
+
     /// `sessions`（全部存活会话）里的每一个都在 `term` 里报过打开文件的全集，或是在 `term` 里新开的（孤儿 GC 的条件 ③：
     /// 换过 leader 之后，要等每个存活会话都重发过全集，打开集合才可信）。
     pub fn covers(&self, term: u64, sessions: &[u64]) -> bool {

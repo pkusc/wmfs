@@ -26,6 +26,7 @@
 #   expect_error <错误码> 命令…                      命令失败（退出码非 0），且 --json 输出里 .error 是这个错误码
 # 以及给检查函数用的：
 #   dev_metric <指标名>                              node1（127.0.0.1:19180）/metrics 里一个不带标签的指标的值（没有就是空）
+#   poll <次数> <间隔秒> 命令…                       反复运行命令直到它成功（最多这么多次）：按条件等待，不用固定的 sleep
 # 每条检查的完整输出写在日志目录里的 NN.log（NN = 检查序号）。
 set -u
 # 这两个变量会改变测试的行为：WMFS_GOLDEN_UPDATE=1 让金样测试"重写金样并直接通过"（假通过），
@@ -166,6 +167,17 @@ expect_error() {
 # dev_metric <指标名>：node1 的 /metrics 里一个不带标签的指标的值（没有这个指标就输出空，调用方当失败处理）。
 dev_metric() {
     curl --noproxy '*' -s "http://127.0.0.1:19180/metrics" | awk -v n="$1" '$1 == n { print $2 }'
+}
+
+# poll <次数> <间隔秒> 命令…：反复运行命令，成功就返回 0；试满这么多次还不成功就返回 1（命令自己的输出照常留在日志里）。
+poll() {
+    local n="$1" gap="$2" i
+    shift 2
+    for i in $(seq 1 "$n"); do
+        "$@" && return 0
+        [ "$i" -lt "$n" ] && sleep "$gap"
+    done
+    return 1
 }
 
 # 跑一个里程碑（在子 shell 里，失败时 check 用 exit 结束它）。

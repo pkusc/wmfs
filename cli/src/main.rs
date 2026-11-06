@@ -9,7 +9,8 @@
 //! `debug rstat-check`。M8 加了 `join`、`server --adopt-local-plugins`、`node list|drain|remove|promote`（`node_admin.rs`）、
 //! `cluster plugins show|add|remove`、`dev up --nodes N`、`dev leader`、`debug meta-hash`。M9 加了 `chain list|show|force-serving`
 //! （`chain.rs`）、`dev restart-all`、`dev pause|resume`、`dev wait chains-serving`、`dev up --profile nas-safe`。M10 加了
-//! `key create|list|revoke`、`session list|evict`（`key.rs`）、`dev wait session-evicted`、`mount --allow-other`。
+//! `key create|list|revoke`、`session list|evict`（`key.rs`）、`dev wait session-evicted`、`mount --allow-other`。M11 加了
+//! `task list|show|pause|resume|run|set` 与 `datakey create`（`task.rs`）、`dev wait task-idle <任务>`。
 //! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod attr;
@@ -29,6 +30,7 @@ mod node_admin;
 mod pathmap;
 mod ping;
 mod registry;
+mod task;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -130,6 +132,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: key::SessionCmd,
     },
+    /// 后台任务（list、show、pause、resume、run、set）
+    Task {
+        #[command(subcommand)]
+        cmd: task::TaskCmd,
+    },
+    /// 数据加密密钥（create）
+    Datakey {
+        #[command(subcommand)]
+        cmd: task::DataKeyCmd,
+    },
     /// 调试工具
     Debug {
         #[command(subcommand)]
@@ -216,6 +228,8 @@ fn main() {
         Cmd::Chain { cmd } => chain::run_chain(cmd),
         Cmd::Key { cmd } => key::run_key(cmd),
         Cmd::Session { cmd } => key::run_session(cmd),
+        Cmd::Task { cmd } => task::run_task(cmd),
+        Cmd::Datakey { cmd } => task::run_datakey(cmd),
         Cmd::Debug { cmd: DebugCmd::RstatCheck { data_dir, json } } => debug::rstat_check(&data_dir, json),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),
@@ -318,11 +332,18 @@ mod tests {
             "authz:posix-acl",
             "authz:posix-mode",
             "bg_task:gc",
+            "bg_task:reconciler",
+            "bg_task:scrub",
             "codec:replica",
             "placement:label-match",
             "qos:fifo",
             "quota_admission:quota",
+            "transform:aes-gcm",
+            "transform:blake3",
             "transform:crc32c",
+            "transform:lz4",
+            "transform:xxh3",
+            "transform:zstd",
         ];
         assert_eq!(s.plugin_list().plugins, want, "chunk_store（local-fs）与传输插件不进集群插件清单（3.7.2）");
         assert!(s.chunk_store_plugin().is_some());

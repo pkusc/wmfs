@@ -1,0 +1,13 @@
+# xxh3 transform 插件的 manifest（design.md 3.7.1、4.8）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "xxh3"
+version = "0.1.0"
+hooks = ["transform"]
+altitude = 702
+hot_path = true
+abi_version = 1
+attrs = ["checksum"]
+budget_ns = 20000
+fail_points = ["plugin.xxh3.transform"]
+
+[config_schema]
+# 没有部署参数：用哪种校验和是目录属性 checksum（wmfs set <目录> checksum=xxh3）

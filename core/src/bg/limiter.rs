@@ -1,5 +1,6 @@
-//! 后台任务的限速（design.md 3.10）：任务级（`TaskRecV1.bytes_per_sec / items_per_sec`，`wmfs task set` 改，0 = 不限）与节点级
-//! （`ClusterSettingsV1.bg_bytes_per_sec`，默认 200 MiB/s）两个上限，取更严的那个。
+//! 后台任务的限速（design.md 3.10）：任务级（`TaskRecV1.bytes_per_sec / items_per_sec`，`wmfs task set` 改；字节/秒是 0 时用任务自己的
+//! 默认值——scrub 50 MiB/s，其余的只受节点级上限；对象/秒是 0 时不限）与节点级（`ClusterSettingsV1.bg_bytes_per_sec`，默认 200 MiB/s）
+//! 两个上限，取更严的那个。
 //!
 //! 实现：按"这一步做了多少"算出它在限速下至少该花多久，没花够就让调度器在下一步之前睡够（与令牌桶等价、不攒额度的写法）。
 //! 一步本身很小（≤ 100 个对象 / ≤ 64 MiB / ≤ 1 s，3.10），所以不攒额度也不会让速率明显低于上限。
@@ -25,10 +26,25 @@ impl RateLimiter {
         (self.node_bps, self.task_bps, self.task_ips) = (node_bps, task_bps, task_ips);
     }
 
+    /// 字节/秒的上限（节点级与任务级里更严的；0 = 不限）。
+    pub fn bytes_per_sec(&self) -> u64 {
+        [self.node_bps, self.task_bps].into_iter().filter(|x| *x > 0).min().unwrap_or(0)
+    }
+
+    /// 一步做多少字节（实现注记（M11））：大约一秒的限速量，最多 `cap`（3.10："≤ 64 MiB"；不限速时就是 `cap`）。
+    pub fn step_bytes(&self, cap: u64) -> u64 {
+        match self.bytes_per_sec() {
+            0 => cap,
+            r => r.min(cap),
+        }
+    }
+
     /// 这一步做了 `bytes` 字节、`items` 个对象、花了 `took`：下一步之前还要等多久。
     pub fn wait_after(&self, bytes: u64, items: u64, took: Duration) -> Duration {
-        let bps = [self.node_bps, self.task_bps].into_iter().filter(|x| *x > 0).min();
-        let need_b = bps.map_or(0.0, |r| bytes as f64 / r as f64);
+        let need_b = match self.bytes_per_sec() {
+            0 => 0.0,
+            r => bytes as f64 / r as f64,
+        };
         let need_i = if self.task_ips > 0 { items as f64 / self.task_ips as f64 } else { 0.0 };
         Duration::from_secs_f64(need_b.max(need_i)).saturating_sub(took)
     }
@@ -53,5 +69,8 @@ mod tests {
             "对象数上限，减去已经花掉的 1 s"
         );
         assert_eq!(r.wait_after(0, 5, Duration::from_secs(1)), Duration::ZERO, "已经花够了");
+        assert_eq!(r.step_bytes(64), 64, "不限速：一步做满上限");
+        r.set(100, 50, 0);
+        assert_eq!((r.step_bytes(64), r.step_bytes(1000)), (50, 50), "大约一秒的限速量，不超过上限");
     }
 }

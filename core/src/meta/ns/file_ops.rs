@@ -251,11 +251,18 @@ pub fn uninline_prepare(v: &dyn KvRead, c: &OpCtx, ino: u64) -> Result<(OpenOut,
     Ok((open, Some(UninlineTodo { change_id: n.rec.change_id, content })))
 }
 
-/// `(ino, epoch)` 记为垃圾（GC 记录 kind 2，宽限 `epoch_gc_grace` 之后由 gc 删掉它在这些链上的数据）。
+/// `(ino, epoch)` 记为垃圾（GC 记录 kind 2：截断到 0、覆盖写换下来的、作废的意图；宽限 `epoch_gc_grace` 之后由 gc 删掉它在这些链上的
+/// 数据）。
 pub fn gc_epoch(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, epoch: u32, chains: &[u32]) {
+    gc_record(v, c, GC_EPOCH, ino, epoch, chains);
+}
+
+/// 写一条废弃 epoch 的 GC 记录：`kind` 是 [`GC_EPOCH`]（只等宽限期）或 [`keys::GC_MOVED`]（迁移换下来的旧 layout：还要等没人打开着
+/// 这个文件，ADR-0042 第 5 条）。
+pub fn gc_record(v: &mut dyn KvTxn, c: &OpCtx, kind: u8, ino: u64, epoch: u32, chains: &[u32]) {
     let now = c.req.now_ms;
     let rec = GcRecV1 { due_ms: now + c.settings.epoch_gc_grace_ms, chains: chains.to_vec(), created_ms: now };
-    kv::put(v, &keys::gc(GC_EPOCH, ino, epoch), &rec);
+    kv::put(v, &keys::gc(kind, ino, epoch), &rec);
 }
 
 /// 仍是 inline、change_id 仍是 `cid`（否则 `STALE_LAYOUT`：uninline 从头再来），调用者能经写句柄写它；返回 (inode, layout)。

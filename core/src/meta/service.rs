@@ -26,20 +26,22 @@
 //!
 //! 实现注记（M8）：NodeCall 加了 `Join`（`meta/cluster/join.rs`：读、批次、再读一次集群图，也在 meta-read 线程上同步做）；被拒绝时
 //! 原因（例如插件清单的差异）放在 ERROR 帧的 `ErrorBody.msg` 里（`Responder::error_with`）。
+//! 实现注记（M11）：NodeCall 加了 `CheckEpochs`（数据节点的本地孤儿扫描问 (ino, epoch) 死了没有）与 `ReportCorrupt`（scrub 修好或修不了
+//! 一个坏块，leader 写 changelog），都在 `meta/data_reports.rs`。
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crossbeam_channel::{Sender, TrySendError, bounded};
 use wmfs_api::failpoint::fail_point_hit;
-use wmfs_api::metrics::{self, Counter};
 
 use crate::base::types::{Principal, ReqCtx, Role};
-use crate::base::{ErrCode, clock, lock, log};
+use crate::base::{ErrCode, clock, log};
 use crate::client::data_client::DataClient;
 use crate::hooks::traits::ConnIdentity;
 use crate::meta::cluster::map::filtered;
 use crate::meta::cluster::targets::{self, TargetUsage};
 use crate::meta::cluster::{chain_mgr, join};
+use crate::meta::data_reports;
 use crate::meta::engine::txn::{MetaEngine, TxnOp, TxnRequest};
 use crate::meta::ns;
 use crate::meta::schema::keys;
@@ -50,6 +52,9 @@ use crate::proto::frame::{InFrame, MSG_NODE_CALL};
 use crate::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
 use crate::proto::peer::{NodeOp, NodeReply};
 use crate::proto::{decode_body, encode_body};
+use stats::OpStats;
+
+mod stats;
 
 /// meta-read 线程数与它们的输入队列长度（1.2）。
 const READ_THREADS: usize = 8;
@@ -68,9 +73,9 @@ struct ReadJob {
 enum ReadOp {
     Meta(MetaOp),
     Map { since: u64, full: bool }, // NodeOp::GetClusterMap；full = 带 keys、datakeys（只给 server 角色）
-    Node(NodeOp),                   // NodeOp::Heartbeat（M5）、Join（M8）、SyncDone（M9）
-    StatFs,                         // MetaOp::StatFs（M5）
-    Uninline(u64),                  // MetaOp::Uninline（M5，ADR-0034）
+    Node(NodeOp),  // NodeOp::Heartbeat（M5）、Join（M8）、SyncDone（M9）、CheckEpochs、ReportCorrupt（M11）
+    StatFs,        // MetaOp::StatFs（M5）
+    Uninline(u64), // MetaOp::Uninline（M5，ADR-0034）
 }
 
 /// meta-read 线程与服务共用的状态。
@@ -80,6 +85,7 @@ struct Shared {
     usage: Arc<TargetUsage>,
     data: OnceLock<Arc<DataClient>>, // Uninline 用的数据面客户端（服务端装配时交进来）
     uninlining: InFlight,            // 正在做的 Uninline（见文件头）
+    lost: data_reports::Lost,        // 报过 DataLossDetected 的 chunk（M11：同一个坏块只报一次）
 }
 
 /// 修改型请求成功之后，要不要更新 leader 内存里的会话状态（[`Live`]）。
@@ -105,8 +111,8 @@ impl MetaService {
         let stats = Arc::new(OpStats::default());
         let live = Arc::new(Live::default());
         let uninlining = InFlight::new(READ_THREADS / 2);
-        let shared =
-            Arc::new(Shared { eng: eng.clone(), live, usage: Arc::default(), data: OnceLock::new(), uninlining });
+        let (data, lost) = (OnceLock::new(), Default::default());
+        let shared = Arc::new(Shared { eng: eng.clone(), live, usage: Arc::default(), data, uninlining, lost });
         for i in 0..READ_THREADS {
             let (rx, stats, shared) = (rx.clone(), stats.clone(), shared.clone());
             std::thread::Builder::new()
@@ -195,11 +201,10 @@ impl MetaService {
                 let ctx = base_ctx(&ReqHead::default(), id, f.hdr.trace_id, NOBODY, NOBODY, vec![]);
                 self.read(ctx, ReadOp::Map { since: since_epoch, full }, r);
             }
-            op @ (NodeOp::Heartbeat(_) | NodeOp::Join(_) | NodeOp::SyncDone { .. }) => {
+            op => {
                 let ctx = base_ctx(&ReqHead::default(), r.identity(), f.hdr.trace_id, 0, 0, vec![]);
                 self.read(ctx, ReadOp::Node(op), r); // 角色表已保证只有 Server 能发（3.3.3）
             }
-            other => self.stats.reply(r, other.name(), Err(ErrCode::FEATURE_UNSUPPORTED)), // CheckEpochs、ReportCorrupt：M11
         }
     }
 }
@@ -287,6 +292,12 @@ fn read_job(sh: &Shared, ctx: &ReqCtx, op: ReadOp) -> Result<Vec<u8>, ErrCode> {
         ReadOp::Node(NodeOp::SyncDone { target, chain, chain_ver }) => {
             chain_mgr::sync_done(eng, ctx, &sh.usage, target, chain, chain_ver).map(|()| encode_body(&NodeReply::Ok))
         }
+        ReadOp::Node(NodeOp::CheckEpochs { items }) => {
+            data_reports::check_epochs(eng, ctx, &items).map(|dead| encode_body(&NodeReply::Epochs { dead }))
+        }
+        ReadOp::Node(NodeOp::ReportCorrupt { target, chunk }) => {
+            data_reports::report(eng, &sh.lost, target, chunk).map(|()| encode_body(&NodeReply::Ok))
+        }
         // 走不到这里：meta-read 线程的循环先单独处理了 Join（它要带原因回复），别的 NodeOp 不会进 ReadOp::Node
         ReadOp::Node(_) => Err(ErrCode::INTERNAL),
         ReadOp::StatFs => targets::statfs(eng, ctx, &sh.usage).map(|r| encode_body(&r)),
@@ -361,36 +372,4 @@ fn base_ctx(h: &ReqHead, id: &ConnIdentity, trace_id: u64, uid: u32, gid: u32, g
     let who = Principal { uid, gid, groups, tenant: id.tenant, job_id: h.job_id, conn };
     let (session, seq, pid) = (h.session, h.seq, h.pid);
     ReqCtx { who, session, seq, pid, trace_id, now: clock::wall_ts(), now_ms: clock::wall_ms(), internal: false }
-}
-
-/// `wmfs_meta_ops_total{op,code}`：每个 (操作, 结果码) 的计数器第一次出现时注册，之后从这张小表里取。
-#[derive(Default)]
-struct OpStats {
-    counters: Mutex<Vec<(&'static str, ErrCode, Arc<Counter>)>>,
-}
-
-impl OpStats {
-    fn reply(&self, r: Responder, op: &'static str, res: Result<MetaReply, ErrCode>) {
-        self.reply_raw(r, op, res.map(|reply| encode_body(&reply)));
-    }
-
-    fn reply_raw(&self, r: Responder, op: &'static str, res: Result<Vec<u8>, ErrCode>) {
-        let code = res.as_ref().err().copied().unwrap_or(ErrCode(0));
-        self.counter(op, code).inc();
-        match res {
-            Ok(body) => r.reply(body, vec![]),
-            Err(c) => r.error(c, 0),
-        }
-    }
-
-    fn counter(&self, op: &'static str, code: ErrCode) -> Arc<Counter> {
-        let mut v = lock(&self.counters);
-        if let Some((_, _, c)) = v.iter().find(|(o, c, _)| *o == op && *c == code) {
-            return c.clone();
-        }
-        let name = if code == ErrCode(0) { "OK".to_string() } else { code.to_string() };
-        let c = metrics::counter("wmfs_meta_ops_total", "元数据服务处理的请求数", &[("op", op), ("code", &name)]);
-        v.push((op, code, c.clone()));
-        c
-    }
 }

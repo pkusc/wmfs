@@ -12,7 +12,8 @@
 //! - [`attr_registry`]：属性注册表与服务端切分（M7）；[`attr_ops`]：设置、删除、查询、用量、声明 vs 实际（M7，管理 API 用）
 //! - [`rstat`]：递归用量计数（M7）
 //! - [`uninline`]：服务端把 inline 小文件转成 chunk（M5，ADR-0034）
-//! - [`gc_meta`]：GC 记录的元数据一侧（gc 任务用，M5）
+//! - [`gc_meta`]：GC 记录的元数据一侧（gc 任务用，M5；M11：去重记录的清理、changelog 修剪）
+//! - [`data_reports`]：数据节点报上来的 CheckEpochs（本地孤儿扫描）与 ReportCorrupt（scrub 修好或修不了的坏块，M11）
 //!
 //! - [`quota`]：配额的本体一侧——quantum 额度、精确检查、护栏、软限的起点（M10）
 //!
@@ -23,6 +24,7 @@ pub mod attr_registry;
 pub mod attrs;
 pub mod changelog;
 pub mod cluster;
+pub mod data_reports;
 pub mod engine;
 pub mod evict;
 pub mod gc_meta;

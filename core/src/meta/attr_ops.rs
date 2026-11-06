@@ -5,7 +5,7 @@
 //!
 //! - **set**（执行器闭包里，全部是点查）：目标必须是目录（属性只挂在目录上，文件 → `EINVAL`）→ 每个键要有消费者（"core" 或已启用
 //!   插件的 manifest 声明了它，3.8）→ 交叉检查（存储类存在、校验算法的插件已启用）→ 写 DIRATTR、每个键一条 changelog `AttrSet`
-//!   （extra = key/old/new，显示形式）、"新数据 + 协调器"类的键写一条 `RECONCILE_Q(dir, 1)`（协调器在 M11）→ 最后 `attr_epoch += 1`
+//!   （extra = key/old/new，显示形式）、"新数据 + 协调器"类的键写一条 `RECONCILE_Q(dir, 1)`（协调器消费，M11）→ 最后 `attr_epoch += 1`
 //!   （之后这个闭包里不再解析属性，见 `attrs.rs`）。警告（成功但要说的话）：副本数大于存储类可用的故障域数、条带数大于可用的链数
 //!   （ADR-0016）、改了 class/replicas 时已有文件不会马上转换。
 //! - **unset**：删一个键（后面里程碑才有的键与 set 一样回 `EOPNOTSUPP`；目录上没设这个键 → `ENOENT`）、changelog `AttrUnset`、
@@ -13,11 +13,13 @@
 //! - **get**：生效值 + 来源 + 生效方式（每个注册表里的键一行）+ `semantics:` 一行（3.1.5）；文件 = 它所在目录的生效属性；
 //!   `recursive` 时另列出子树里显式设置了属性的目录（扫描 DIRATTR，最多 1000 个）。
 //! - **status**：每个键的声明、来源、实际、是否一致；实现注记（M7）：实际 = 这个目录下的新文件此刻实际得到的值（replicas 是
-//!   min(声明, 可用故障域数)、stripe 是 min(声明, 可用链数)，其余就是声明值）；逐文件扫描已有文件在 M11 的 `bg/status.rs`。
+//!   min(声明, 可用故障域数)、stripe 是 min(声明, 可用链数)，inline 是 `ns::layout::inline_of`（加密生效时为 0），其余就是声明值）；
+//!   实现注记（M11）：逐文件统计（已有文件里与声明不同的、写打开的、副本或条带不足的、降级链上的）在这个读之外由 `bg/status.rs` 受限速地
+//!   扫子树、再填进回复（`mgmt/api.rs`）；`quota`、`quota.<类>` 的实际是管着这个目录的每个配额此刻的用量与上限（`quota::quotas_of`，
+//!   超了软限、宽限已过或超了硬限算不一致）。
 //!   `warnings` = 集群警告 + 这棵子树里显式写着、当前满足不了的 replicas/stripe 声明（例如单节点上 init 写的 `/home replicas=3`；
 //!   最多查 1000 个这样的目录，多了明确说一句）+ 这个目录自己的。实现注记（M9）：replicas 另给 `short_files`——子树里已有文件中
-//!   实际副本数少于声明的个数（`wmfs status` 的"replicas 声明 3、实际 2 的文件数"，[`short_files`]；inline 文件的数据在元数据里、
-//!   与 raft 同样多份，不算；扫到上限时在 warnings 里明说）。
+//!   实际副本数少于声明的个数（M11 起由 `bg/status.rs` 数）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -27,22 +29,26 @@ use crate::api::types::{
     AttrActual, AttrEntry, AttrGetReply, AttrSetReply, AttrUnsetReply, DEFAULT_SOURCE, DirAttrs, StatusAttr,
     StatusReply,
 };
+use crate::base::types::Role;
 use crate::base::units::{fmt_duration, fmt_size};
 use crate::base::{ErrCode, Failed};
-use crate::data::format::checksum_name;
+use crate::data::format::{CMP_NONE, CMP_ZSTD, ENC_AES256GCM, checksum_name, compress_name};
 use crate::hooks::traits::TransformKind;
 use crate::meta::attr_registry::{AttrKind, Effect, Parsed, REGISTRY, find, spec_of};
-use crate::meta::attrs::{CONSISTENCY_STRONG, EffectiveAttrs, bump_attr_epoch, checksum_id, queue_reconcile};
+use crate::meta::attrs::{
+    CONSISTENCY_STRONG, EffectiveAttrs, bump_attr_epoch, checksum_id, compress_id, queue_reconcile,
+};
 use crate::meta::changelog::{self, Change};
-use crate::meta::cluster::chains::{SERVING, candidates, serving_count};
+use crate::meta::cluster::chains::{SERVING, candidates};
 use crate::meta::engine::txn::{KvRead, KvScan, KvTxn, OpCtx};
 use crate::meta::ns::acl;
 use crate::meta::ns::common::Node;
+use crate::meta::ns::layout::inline_of;
 use crate::meta::ns::read_ops::{node_at, path_of};
 use crate::meta::quota;
-use crate::meta::schema::keys::{self, ROOT_INO, T_DIRATTR};
+use crate::meta::schema::keys::{self, T_DIRATTR};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::{AttrMapV1, ChainRecV1, ClassIdV1, F_INLINE, InodeV1, decode_v1};
+use crate::meta::schema::records::{AttrMapV1, ChainRecV1, ClassIdV1, DataKeyIdV1, DataKeyV1, decode_v1};
 use crate::proto::peer::ClusterMap;
 
 /// `-r` 最多列出、status 最多检查多少个目录。
@@ -61,8 +67,9 @@ fn own_attrs(v: &dyn KvRead, dir: u64) -> Result<AttrMapV1, ErrCode> {
     Ok(kv::get(v, &keys::dirattr(dir))?.unwrap_or(AttrMapV1 { entries: BTreeMap::new() }))
 }
 
-/// 3.8 的"必须有插件消费"与交叉检查（存储类存在、校验算法的插件已启用）。
-fn check(v: &dyn KvRead, c: &OpCtx, p: &Parsed) -> Result<(), Failed> {
+/// 3.8 的"必须有插件消费"与交叉检查（存储类存在、校验与压缩算法的插件已启用、数据密钥存在且属于设置者的租户）；回要存进 DIRATTR 的
+/// 规范化值（`encrypt=tenant:<名字>` 在这里换成数据密钥的数字 id，3.8）。
+fn check(v: &dyn KvRead, c: &OpCtx, p: &Parsed) -> Result<String, Failed> {
     let (k, s) = (p.spec.key, p.spec);
     if !s.consumers.contains(&"core") && !c.pipeline.consumes(k) {
         let who = s.consumers.join("、");
@@ -76,27 +83,62 @@ fn check(v: &dyn KvRead, c: &OpCtx, p: &Parsed) -> Result<(), Failed> {
     {
         return Err(Failed::new(ErrCode::EINVAL, format!("存储类 {name} 不存在")));
     }
-    let alg = checksum_id(&p.norm).unwrap_or(0);
-    if k == "checksum" && c.pipeline.transform(TransformKind::Checksum, alg).is_none() {
-        return Err(Failed::new(ErrCode::EINVAL, format!("校验算法 {} 的插件没有启用", p.norm)));
+    let off = |kind, alg| c.pipeline.transform(kind, alg).is_none();
+    let bad = |what: &str| Err(Failed::new(ErrCode::EINVAL, format!("{what} {} 的插件没有启用", p.norm)));
+    match k {
+        "checksum" if off(TransformKind::Checksum, checksum_id(&p.norm).unwrap_or(0)) => bad("校验算法"),
+        "compress" if compress_id(&p.norm).is_some_and(|(a, _)| a != CMP_NONE && off(TransformKind::Compress, a)) => {
+            bad("压缩算法")
+        }
+        "encrypt" if p.norm != "none" => datakey_of(v, c, &p.norm),
+        _ => Ok(p.norm.clone()),
     }
-    Ok(())
+}
+
+/// `encrypt=tenant:<名字>`：加密插件已启用、数据密钥存在（DATAKEY_NAME 点查）、属于设置者的租户（admin 例外）→ 它的数字 id。
+fn datakey_of(v: &dyn KvRead, c: &OpCtx, norm: &str) -> Result<String, Failed> {
+    let einval = |m: String| Failed::new(ErrCode::EINVAL, m);
+    if c.pipeline.transform(TransformKind::Encrypt, ENC_AES256GCM).is_none() {
+        return Err(einval("加密插件 aes-gcm 没有启用".into()));
+    }
+    let name = norm.strip_prefix("tenant:").unwrap_or(norm);
+    let hint = format!("数据密钥 {name} 不存在（先 wmfs datakey create {name}）");
+    let id = kv::get::<DataKeyIdV1>(v, &keys::datakey_name(name))?.ok_or_else(|| einval(hint))?.id;
+    let k = kv::get::<DataKeyV1>(v, &keys::datakey(id))?.ok_or(ErrCode::INTERNAL)?;
+    let who = &c.req.who;
+    if k.tenant != who.tenant && who.conn.role != Role::Admin {
+        return Err(Failed::new(ErrCode::EACCES, format!("数据密钥 {name} 属于租户 {}，不是你的", k.tenant)));
+    }
+    Ok(id.to_string())
+}
+
+/// 一个键的存储形式 → 显示形式：`encrypt` 存的是数据密钥的 id，按集群图显示成 `tenant:<名字>`；其余按注册表的 `show`。
+fn shown(c: &OpCtx, key: &str, norm: &str) -> String {
+    match (key, norm.parse::<u32>()) {
+        ("encrypt", Ok(id)) => format!("tenant:{}", datakey_name(c, id)),
+        _ => find(key).map_or(norm.to_string(), |s| (s.show)(norm)),
+    }
+}
+
+fn datakey_name(c: &OpCtx, id: u32) -> String {
+    c.map.datakeys.iter().find(|(i, _)| *i == id).map_or(format!("#{id}"), |(_, k)| k.name.clone())
 }
 
 pub fn set(v: &mut dyn KvTxn, c: &OpCtx, path: &str, items: &[Parsed]) -> Result<AttrSetReply, Failed> {
     let d = dir_at(v, c, path)?;
+    let mut norms = Vec::new();
     for p in items {
-        check(v, c, p)?;
+        norms.push(check(v, c, p)?);
     }
     let before = c.attrs.resolve(v, d.ino)?; // 在 attr_epoch 加一之前解析（警告要用）
     let mut m = own_attrs(v, d.ino)?;
     let mut out = AttrSetReply { path: path.into(), ..Default::default() };
-    for p in items {
-        let (k, show) = (p.key.as_str(), p.spec.show);
-        let old = m.entries.insert(k.into(), p.norm.clone()).map(|o| show(&o)).unwrap_or_default();
-        let extra = vec![("key".into(), k.into()), ("old".into(), old), ("new".into(), show(&p.norm))];
+    for (p, norm) in items.iter().zip(norms) {
+        let (k, new) = (p.key.as_str(), shown(c, p.spec.key, &norm));
+        let old = m.entries.insert(k.into(), norm).map(|o| shown(c, p.spec.key, &o)).unwrap_or_default();
+        let extra = vec![("key".into(), k.into()), ("old".into(), old), ("new".into(), new.clone())];
         changelog::append(v, c, Change { op: "AttrSet", ino: d.ino, extra, ..Default::default() })?;
-        out.set.insert(k.into(), show(&p.norm));
+        out.set.insert(k.into(), new);
     }
     if items.iter().any(|p| p.spec.effect == Effect::NewDataAndReconcile) {
         queue_reconcile(v, d.ino, 1)?;
@@ -115,12 +157,14 @@ pub fn set(v: &mut dyn KvTxn, c: &OpCtx, path: &str, items: &[Parsed]) -> Result
     let topo = given("replicas").is_some() || given("class").is_some();
     let check_stripe = topo || given("stripe").is_some();
     out.warnings = unmet(c.map, class, replicas, stripe, topo, check_stripe, "");
-    if topo {
-        out.warnings.push(
-            "class、replicas 是\"新数据 + 协调器\"类的属性：已有文件在协调器转换完成前，新写入仍按旧设置（协调器在 M11 实现，现在不会\
-             转换已有文件）；一直写打开的文件不会被转换"
-                .into(),
-        );
+    let moved: Vec<&str> =
+        items.iter().filter(|p| p.spec.effect == Effect::NewDataAndReconcile).map(|p| p.spec.key).collect();
+    if !moved.is_empty() {
+        out.warnings.push(format!(
+            "{} 是\"新数据 + 协调器\"类的属性：新文件立即按新设置；已有文件由协调器在后台转换（进度见 wmfs status、wmfs task list），\
+             转换完成前往已有文件里新写的数据仍按旧设置；一直写打开的文件会被跳过（wmfs status 单独计数）",
+            moved.join("、")
+        ));
     }
     Ok(out)
 }
@@ -130,7 +174,7 @@ pub fn unset(v: &mut dyn KvTxn, c: &OpCtx, path: &str, key: &str) -> Result<Attr
     let d = dir_at(v, c, path)?;
     let mut m = own_attrs(v, d.ino)?;
     let not_set = || Failed::new(ErrCode::ENOENT, format!("{path} 上没有设置 {key}"));
-    let old = (s.show)(&m.entries.remove(key).ok_or_else(not_set)?);
+    let old = shown(c, s.key, &m.entries.remove(key).ok_or_else(not_set)?);
     if m.entries.is_empty() {
         v.delete(&keys::dirattr(d.ino));
     } else {
@@ -197,6 +241,10 @@ fn display(c: &OpCtx, e: &EffectiveAttrs, own: &AttrMapV1, key: &str) -> String 
         "stripe" => e.stripe.to_string(),
         "inline" => fmt_size(e.inline_max as u64),
         "checksum" => checksum_name(e.checksum).into(),
+        "compress" if e.compress == CMP_ZSTD => format!("zstd:{}", e.compress_level),
+        "compress" => compress_name(e.compress).into(),
+        "encrypt" if e.encrypt_key == 0 => "none".into(),
+        "encrypt" => format!("tenant:{}", datakey_name(c, e.encrypt_key)),
         "consistency" if e.consistency == CONSISTENCY_STRONG => "strong".into(),
         "consistency" => format!("cto,attr_ttl={}", ttl(e)),
         "inherit" => own.entries.get(key).cloned().unwrap_or_else(|| "true".into()), // 只看目录自己的
@@ -230,15 +278,14 @@ fn source(v: &dyn KvRead, e: &EffectiveAttrs, own: &AttrMapV1, dir: u64, key: &s
     if src == 0 { Ok(DEFAULT_SOURCE.into()) } else { path_of(v, src) }
 }
 
-/// `path` 的生效属性所属的目录（文件 = 它的主父目录）、它的解析结果、它自己的 DIRATTR。
-fn dir_attrs_of_path(v: &dyn KvRead, c: &OpCtx, path: &str) -> Result<(u64, Arc<EffectiveAttrs>, AttrMapV1), Failed> {
-    let n = node_at(v, c, path)?;
+/// `n` 的生效属性所属的目录（文件 = 它的主父目录）、它的解析结果、它自己的 DIRATTR。
+fn dir_attrs_of(v: &dyn KvRead, c: &OpCtx, n: &Node) -> Result<(u64, Arc<EffectiveAttrs>, AttrMapV1), ErrCode> {
     let dir = if n.is_dir() { n.ino } else { n.rec.parent };
     Ok((dir, c.attrs.resolve(v, dir)?, own_attrs(v, dir)?))
 }
 
 pub fn get(v: &dyn KvScan, c: &OpCtx, path: &str, recursive: bool) -> Result<AttrGetReply, Failed> {
-    let (dir, e, own) = dir_attrs_of_path(v, c, path)?;
+    let (dir, e, own) = dir_attrs_of(v, c, &node_at(v, c, path)?)?;
     let mut attrs = Vec::new();
     for s in REGISTRY.iter() {
         let value = display(c, &e, &own, s.key);
@@ -291,14 +338,16 @@ fn subtree(v: &dyn KvScan, c: &OpCtx, root: u64) -> Result<(Vec<DirAttrs>, bool)
     let (dirs, truncated) = dirattrs_under(v, c, root, &[])?;
     let mut out = Vec::new();
     for (d, m) in dirs {
-        let attrs = m.entries.iter().map(|(k, x)| (k.clone(), find(k).map_or(x.clone(), |s| (s.show)(x)))).collect();
+        let attrs = m.entries.iter().map(|(k, x)| (k.clone(), shown(c, k, x))).collect();
         out.push(DirAttrs { path: path_of(v, d)?, attrs });
     }
     Ok((out, truncated))
 }
 
-pub fn status(v: &dyn KvScan, c: &OpCtx, path: &str) -> Result<StatusReply, Failed> {
-    let (dir, e, own) = dir_attrs_of_path(v, c, path)?;
+/// 回复与逐文件统计要扫的根（`path` 自己；逐文件统计由 `bg::status` 在这个读之外做、再填进来，3.10 的 M11 注记）。
+pub fn status(v: &dyn KvScan, c: &OpCtx, path: &str) -> Result<(StatusReply, Node), Failed> {
+    let n = node_at(v, c, path)?;
+    let (dir, e, own) = dir_attrs_of(v, c, &n)?;
     let mut warnings = c.map.warnings.clone();
     // 子树里显式写着、当前满足不了的 replicas/stripe 声明；这个目录自己的在后面按全部生效值查一遍，这里跳过
     let (dirs, truncated) = dirattrs_under(v, c, dir, &["replicas", "stripe"])?;
@@ -314,54 +363,26 @@ pub fn status(v: &dyn KvScan, c: &OpCtx, path: &str) -> Result<StatusReply, Fail
         ));
     }
     warnings.extend(unmet(c.map, e.class_id, e.replicas, e.stripe, true, true, "这个目录："));
+    let quotas = quota::quotas_of(v, c, dir)?;
     let mut attrs = Vec::new();
     for s in REGISTRY.iter() {
         let declared = display(c, &e, &own, s.key);
-        let actual = match s.key {
+        let new_files = match s.key {
             "replicas" => domains(c.map, e.class_id).min(e.replicas as usize).to_string(),
             "stripe" => usable_chains(c.map, e.class_id, e.replicas).min(e.stripe as usize).to_string(),
+            "inline" => fmt_size(inline_of(&e) as u64),
             _ => declared.clone(), // 每次 open/create 由 core 按生效属性执行，新文件就是声明值
         };
         let source = source(v, &e, &own, dir, s.key)?;
         let effect = s.effect.name().to_string();
-        let short = if s.key == "replicas" { Some(short_files(v, c, dir, &mut warnings)?) } else { None };
-        let mismatched = actual != declared || short.is_some_and(|n| n > 0);
-        let actual = AttrActual { new_files: actual, short_files: short };
+        let mut mismatched = new_files != declared && s.key != "inline"; // inline 的差别是加密决定的，不算不一致
+        let mut actual = AttrActual { new_files, ..Default::default() };
+        if s.key == "quota" || s.key == "quota.*" {
+            let mine: Vec<_> = quotas.iter().filter(|q| q.class.is_some() == (s.key == "quota.*")).cloned().collect();
+            mismatched = mine.iter().any(quota::over);
+            actual.quotas = (!mine.is_empty()).then_some(mine);
+        }
         attrs.push(StatusAttr { key: s.key.into(), declared, source, effect, actual, mismatched });
     }
-    Ok(StatusReply { path: path.into(), warnings, attrs })
-}
-
-/// 子树里实际副本数少于声明的已有文件数（3.10 的 replicas 一行，M9 的最小部分：实际 = min(layout.replicas, 它的每条链此刻的 Serving
-/// 成员数)；inline 文件（数据在元数据里）与 nlink 为 0 的孤儿不算）。没有降级的链就不用扫；按 inode 号分页扫，最多看 `SCAN_MAX` 个
-/// inode，看不完就在 `warnings` 里说（M11 的 `bg/status.rs` 换成受限速的子树扫描）。
-fn short_files(v: &dyn KvScan, c: &OpCtx, dir: u64, warnings: &mut Vec<String>) -> Result<u64, ErrCode> {
-    const SCAN_MAX: usize = 1_000_000;
-    const PAGE: usize = 1024;
-    let serving = |id: &u32| c.map.chains.iter().find(|(i, _)| i == id).map_or(0, |(_, r)| serving_count(r));
-    if c.map.chains.iter().all(|(id, r)| serving(id) >= r.replicas as usize) {
-        return Ok(0);
-    }
-    let (mut start, end) = keys::tag_range(keys::T_INODE);
-    let (mut n, mut seen) = (0, 0);
-    loop {
-        let page = v.scan(&start, &end, PAGE)?;
-        for (k, b) in &page {
-            let ino: InodeV1 = decode_v1(b)?;
-            let Some(l) = ino.layout.as_ref().filter(|_| ino.flags & F_INLINE == 0 && ino.nlink > 0) else { continue };
-            let short = l.chains.iter().any(|ch| serving(ch) < l.replicas as usize);
-            if short && (dir == ROOT_INO || ino.parent == dir || c.attrs.ancestors(v, ino.parent)?.contains(&dir)) {
-                n += 1;
-            }
-            start = [k.as_slice(), &[0]].concat();
-        }
-        seen += page.len();
-        if page.len() < PAGE {
-            return Ok(n);
-        }
-        if seen >= SCAN_MAX {
-            warnings.push(format!("副本数不足的文件只数了前 {SCAN_MAX} 个 inode 里的（M11 起由后台扫描数全）"));
-            return Ok(n);
-        }
-    }
+    Ok((StatusReply { path: path.into(), warnings, attrs, ..Default::default() }, n))
 }

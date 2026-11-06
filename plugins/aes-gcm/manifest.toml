@@ -1,0 +1,13 @@
+# aes-gcm transform 插件的 manifest（design.md 3.7.1、4.8）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "aes-gcm"
+version = "0.1.0"
+hooks = ["transform"]
+altitude = 761
+hot_path = true
+abi_version = 1
+attrs = ["encrypt"]
+budget_ns = 100000
+fail_points = ["plugin.aes-gcm.transform"]
+
+[config_schema]
+# 没有部署参数：加不加密、用哪把数据密钥是目录属性 encrypt（wmfs datakey create k1；wmfs set <目录> encrypt=tenant:k1）

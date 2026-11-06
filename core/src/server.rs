@@ -25,10 +25,12 @@ use wmfs_api::types::{Health, NodeAddrs};
 
 use crate::base::config::NodeConfig;
 use crate::base::{clock, log, rand, sys};
-use crate::bg::scheduler::{self, BgDeps};
+use crate::bg::progress::TaskBoard;
+use crate::bg::scheduler::{self, BgDeps, LocalGet};
 use crate::bg::task::BgTask;
 use crate::buf::MemPool;
 use crate::client::data_client::DataClient;
+use crate::data::datakey::Wrapper;
 use crate::data::node_hb::{self, HbDeps, MapHolder};
 use crate::data::service::DataService;
 use crate::data::{self, DataNode, replica};
@@ -39,7 +41,7 @@ use crate::init::{NodeFile, read_master};
 use crate::meta::attr_registry;
 use crate::meta::cluster::cluster_mgr;
 use crate::meta::cluster::plugins::{self, MapCheck};
-use crate::meta::engine::txn::{MetaEngine, RoleInfo};
+use crate::meta::engine::txn::MetaEngine;
 use crate::meta::engine::{self, EmbeddedEngine, EngineOpts};
 use crate::meta::raft::membership::{self, Members};
 use crate::meta::schema::records::NODE_REMOVED;
@@ -48,8 +50,11 @@ use crate::mgmt::{MgmtCtx, MgmtServer, RoleFn};
 use crate::net::client::{Endpoint, RpcClient};
 use crate::net::server::{RpcServer, ServerId};
 use crate::proto::frame::{MSG_DATA_CALL, MSG_META_CALL, MSG_NODE_CALL, MSG_PEER_CALL, MSG_RAFT, MSG_SNAPSHOT_FETCH};
-use crate::proto::handshake::{SERVER_KEY, cap_key, derive_secret};
+use crate::proto::handshake::{SERVER_KEY, cap_key, derive_secret, wrap_key};
 use crate::proto::peer::ClusterMap;
+use roles::{hint_of, leader_addrs, meta_role};
+
+mod roles;
 
 /// 运行中的节点。
 pub struct Running {
@@ -152,7 +157,12 @@ pub fn start(
         kv_keys.note_map(m); // 只做数据的节点据此认得后来建的 key（M10，`KvKeys`）
         rs.set_revoked(m.keys.iter().filter(|(_, k)| k.revoked).map(|(id, _)| *id).collect()); // 关掉已撤销 key 的连接
     });
-    start_background(cfg, &meta, &svc, on_keys, me.clone(), data_side, tasks)?;
+    let board = Arc::new(TaskBoard::default());
+    let wrapper =
+        Arc::new(Wrapper { pipeline: pipeline.clone(), pool: pool.clone(), key: wrap_key(&master), cluster_id });
+    data_side.node.keys.set_wrap(wrapper.clone()); // 数据节点解包数据密钥用（M11）
+    let bg = Bg { tasks, board: board.clone(), run_dir: data_dir.join("run") };
+    start_background(cfg, &meta, &svc, on_keys, me.clone(), data_side, bg)?;
     let (eng, mine, scheme) = (meta.clone(), me.clone(), cfg.net.control_scheme.clone());
     rpc.set_leader_hint(Arc::new(move || {
         hint_of(leader_addrs(eng.role().leader_id, &mine, &|id| eng.node_addrs(id)), &scheme)
@@ -180,6 +190,9 @@ pub fn start(
         meta: Some(meta.clone()), // 依赖元数据的端点（M7）
         usage: Some(svc.targets()),
         polls: AtomicUsize::new(0),
+        board: Some(board),
+        wrapper: Some(wrapper),
+        live: Some(svc.live()),
     };
     if let Err(e) = mgmt.start(Arc::new(ctx)) {
         let _ = std::fs::remove_file(&pid_file);
@@ -188,6 +201,13 @@ pub fn start(
     let rpc_list: Vec<String> = addrs.iter().map(|(s, a)| format!("{s} {a}")).collect();
     log::info("server", format_args!("node{} started（rpc {}，http {mgmt_addr}）", node.node_id, rpc_list.join("，")));
     Ok(Running { node_id: node.node_id, addrs, mgmt_addr, rpc, meta, pid_file })
+}
+
+/// 后台调度器要的本节点的东西（M11）：后台任务、进度板（管理 API 也看它）、本地任务的游标目录。
+struct Bg {
+    tasks: Vec<Box<dyn BgTask>>,
+    board: Arc<TaskBoard>,
+    run_dir: PathBuf,
 }
 
 /// 数据面里监听之前就建好的东西（[`open_data`]）。
@@ -232,7 +252,7 @@ fn start_background(
     on_keys: Arc<dyn Fn(&ClusterMap) + Send + Sync>,
     me: NodeAddrs,
     side: DataSide,
-    tasks: Vec<Box<dyn BgTask>>,
+    bg: Bg,
 ) -> Result<(), String> {
     let (eng, node) = (meta.clone(), me.node_id);
     let leader = Arc::new(move || {
@@ -258,7 +278,7 @@ fn start_background(
             MapCheck::Keep => {}
         }
     });
-    let rpc = side.peer.clone();
+    let (rpc, data_node) = (side.peer.clone(), side.node.clone());
     let hb = HbDeps { node, boot_id, host_id, machine_id, data: side.node, rpc, leader, peers, on_map };
     node_hb::start(hb)?;
     // 服务端用的数据面客户端：集群图直接取 leader 自己已应用的（总是最新的，不用另外刷新）
@@ -277,41 +297,29 @@ fn start_background(
     let (rpc_t, op_t) = (std::time::Duration::from_secs(10), std::time::Duration::from_secs(30));
     let data = Arc::new(DataClient::new(side.peer, map_of, false).with_timeouts(rpc_t, op_t));
     svc.set_data(data.clone());
-    scheduler::start(tasks, BgDeps { eng: meta.clone(), data, live: svc.live(), pipeline })
-}
-
-/// health 里的元数据角色与 leader 的地址（实现注记（M3），7.1）。
-fn meta_role(eng: &EmbeddedEngine, me: &NodeAddrs) -> (String, Option<NodeAddrs>) {
-    let r = eng.role();
-    let learner = r.role == StateRole::Follower && eng.status().learners.contains(&me.node_id);
-    (role_name(&r, learner).to_string(), leader_addrs(r.leader_id, me, &|id| eng.node_addrs(id)))
-}
-
-/// leader 的地址（health 与 NOT_LEADER 的 `leader_hint` 共用）：不知道 leader（`leader_id` 为 0）→ None；是自己 → 本节点
-/// 实际监听的地址；是别人 → `others(id)`（已应用的 NodeRecV1，查不到 → None。注意：`wmfs dev up --rdma` 改了 node.toml
-/// 之后，KV 里的地址不会跟着变——那只影响 rdma 一项，control_scheme 的 tcp 地址不变）。
-fn leader_addrs(leader_id: u32, me: &NodeAddrs, others: &dyn Fn(u32) -> Option<NodeAddrs>) -> Option<NodeAddrs> {
-    match leader_id {
-        0 => None,
-        id if id == me.node_id => Some(me.clone()),
-        id => others(id),
-    }
-}
-
-/// NOT_LEADER 的 `leader_hint`（实现注记（M4），3.3.1、3.3.7）：leader 在 control_scheme 上的 rpc 地址（"127.0.0.1:19100"）。
-fn hint_of(leader: Option<NodeAddrs>, scheme: &str) -> Option<String> {
-    leader?.addrs.into_iter().find(|(s, _)| s == scheme).map(|(_, a)| a)
-}
-
-/// `meta_role` 的取值：`leader` = **就绪**的 leader（可以服务请求，`wmfs dev wait leader` 等的就是它）；`candidate` =
-/// 正在选举，或已当选但还没就绪；`follower` / `learner`。
-fn role_name(r: &RoleInfo, learner: bool) -> &'static str {
-    match r.role {
-        StateRole::Leader if r.ready => "leader",
-        StateRole::Leader | StateRole::Candidate | StateRole::PreCandidate => "candidate",
-        StateRole::Follower if learner => "learner",
-        StateRole::Follower => "follower",
-    }
+    let eng = meta.clone();
+    let local: LocalGet = Arc::new(move |k| {
+        if eng.status().applied == 0 {
+            return None; // 只做数据的节点：一个条目也没应用过
+        }
+        eng.local_get(k)
+            .inspect_err(|e| log::warn("server", format_args!("读本地已应用的 KV 失败：{e}（这一次按没有记录处理）")))
+            .ok()
+            .flatten()
+    });
+    let has_targets = !data_node.targets.is_empty();
+    let deps = BgDeps {
+        eng: meta.clone(),
+        data,
+        live: svc.live(),
+        pipeline,
+        node: has_targets.then_some(data_node),
+        local,
+        run_dir: bg.run_dir,
+        board: bg.board,
+        node_id: node,
+    };
+    scheduler::start(bg.tasks, deps)
 }
 
 impl Running {
@@ -332,48 +340,5 @@ impl Running {
         self.meta.shutdown();
         let _ = std::fs::remove_file(&self.pid_file);
         log::info("server", format_args!("node{} 退出", self.node_id));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn meta_role_names_follow_7_1() {
-        let r = |role, ready| RoleInfo { role, term: 2, leader_id: 1, ready };
-        assert_eq!(role_name(&r(StateRole::Leader, true), false), "leader");
-        assert_eq!(
-            role_name(&r(StateRole::Leader, false), false),
-            "candidate",
-            "已当选、还没就绪的 leader 不算 leader"
-        );
-        assert_eq!(role_name(&r(StateRole::Candidate, false), false), "candidate");
-        assert_eq!(role_name(&r(StateRole::PreCandidate, false), false), "candidate");
-        assert_eq!(role_name(&r(StateRole::Follower, false), false), "follower");
-        assert_eq!(role_name(&r(StateRole::Follower, false), true), "learner");
-    }
-
-    #[test]
-    fn leader_hint_is_the_leaders_control_scheme_address() {
-        let node = |id: u32, port: u16| NodeAddrs {
-            node_id: id,
-            addrs: vec![("mem".into(), format!("mem-{id}")), ("tcp".into(), format!("127.0.0.1:{port}"))],
-            mgmt_addr: String::new(),
-        };
-        let me = node(1, 19100);
-        let others = |id: u32| (id == 2).then(|| node(2, 19200));
-        let hint = |leader_id| hint_of(leader_addrs(leader_id, &me, &others), "tcp");
-        assert_eq!(hint(0), None, "不知道 leader");
-        assert_eq!(hint(1), Some("127.0.0.1:19100".into()), "leader 是自己：本节点实际监听的地址");
-        assert_eq!(
-            hint(2),
-            Some("127.0.0.1:19200".into()),
-            "leader 是别人：已应用的 NodeRecV1 里 control_scheme 的那一项"
-        );
-        assert_eq!(hint(3), None, "集群图里查不到这个节点");
-        assert_eq!(hint_of(leader_addrs(2, &me, &others), "mem"), Some("mem-2".into()), "按 control_scheme 挑地址");
-        assert_eq!(hint_of(leader_addrs(2, &me, &others), "udp"), None, "leader 没有这种传输");
-        assert_eq!(leader_addrs(1, &me, &others), Some(me.clone()), "health 里的 leader 地址");
     }
 }

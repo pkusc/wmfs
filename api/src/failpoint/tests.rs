@@ -76,6 +76,21 @@ fn values_can_be_negative_or_large() {
 }
 
 #[test]
+fn durations_fall_back_to_the_default() {
+    assert_eq!(fail_point_ms("test.ms.none", 3_600_000), 3_600_000, "没有配置：默认值");
+    set("test.ms.short", "return(500)").unwrap();
+    assert_eq!(fail_point_ms("test.ms.short", 3_600_000), 500);
+    set("test.ms.neg", "return(-7)").unwrap();
+    assert_eq!(fail_point_ms("test.ms.neg", 10), 0, "负数当 0");
+    set("test.ms.once", "times(1,return(20))").unwrap();
+    assert_eq!(
+        (fail_point_ms("test.ms.once", 99), fail_point_ms("test.ms.once", 99)),
+        (20, 99),
+        "没触发的那次用默认值"
+    );
+}
+
+#[test]
 #[should_panic(expected = "test.panic 触发")]
 fn panic_action() {
     set("test.panic", "panic").unwrap();

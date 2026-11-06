@@ -36,7 +36,6 @@ pub fn new_layout(
     if k == 0 {
         return Err(ErrCode::ENOSPC);
     }
-    let no_inline = eff.encrypt_key != 0 || eff.consistency == CONSISTENCY_STRONG;
     Ok(LayoutV1 {
         epoch,
         chunk_size: eff.chunk,
@@ -49,8 +48,14 @@ pub fn new_layout(
         compress_level: eff.compress_level,
         encrypt: if eff.encrypt_key != 0 { ENC_AES256GCM } else { ENC_NONE },
         encrypt_key: eff.encrypt_key,
-        inline_max: if no_inline { 0 } else { eff.inline_max },
+        inline_max: inline_of(eff),
     })
+}
+
+/// 新文件实际的 inline 阈值（实现注记（M11）：`wmfs status` 也按它比较）：`encrypt` 生效或 `consistency=strong` 时为 0（内容不能留在
+/// 元数据里），否则就是声明的 `inline`。
+pub fn inline_of(eff: &EffectiveAttrs) -> u32 {
+    if eff.encrypt_key != 0 || eff.consistency == CONSISTENCY_STRONG { 0 } else { eff.inline_max }
 }
 
 /// 给普通文件 `n` 装上新 layout（epoch = max_epoch + 1）、存储类与 F_INLINE（inline_max > 0 才 inline）。

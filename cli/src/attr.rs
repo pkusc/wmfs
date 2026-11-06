@@ -244,14 +244,37 @@ pub fn status(a: StatusArgs) -> i32 {
         for w in &r.warnings {
             s += &format!("警告：{w}\n");
         }
-        s += &format!("{} 的声明 vs 实际（实际 = 这里的新文件此刻得到的值）：", r.path);
+        s += &format!("{} 的声明 vs 实际（实际 = 这里的新文件此刻得到的值；另有已有文件的逐个统计）：", r.path);
         for x in &r.attrs {
             let ok = if x.mismatched { "✗ 不一致" } else { "✓" };
             let from =
                 if x.source == DEFAULT_SOURCE { "默认值".to_string() } else { format!("来源 {}", x.source) };
-            let short =
-                x.actual.short_files.map_or(String::new(), |n| format!("；已有文件里实际副本少于声明的 {n} 个"));
-            s += &format!("\n  {:<12} 声明 {}（{from}），实际 {}{short}  {ok}", x.key, x.declared, x.actual.new_files);
+            let a = &x.actual;
+            let short = match (x.key.as_str(), a.short_files) {
+                ("stripe", Some(n)) => format!("；条带数少于声明的 {n} 个"),
+                (_, Some(n)) => format!("；已有文件里实际副本少于声明的 {n} 个"),
+                _ => String::new(),
+            };
+            let files = match (a.files, a.mismatched_files) {
+                (Some(f), Some(m)) if a.migrates == Some(false) => format!("；{f} 个已有文件里 {m} 个不同（不迁移）"),
+                (Some(f), Some(m)) => {
+                    format!("；{f} 个已有文件里 {m} 个还没转换（写打开着、被跳过的 {} 个）", a.open_files.unwrap_or(0))
+                }
+                _ => String::new(),
+            };
+            s += &format!("\n  {:<12} 声明 {}（{from}），实际 {}{short}{files}  {ok}", x.key, x.declared, a.new_files);
+            for q in a.quotas.iter().flatten() {
+                s += &quota_line(q); // M11：quota 的实际（用量与上限）
+            }
+        }
+        if r.degraded_files > 0 {
+            s += &format!("\n位于降级链上的文件：{} 个，{} 字节", r.degraded_files, r.degraded_bytes);
+        }
+        if let Some(t) = &r.reconciler {
+            s += &format!(
+                "\n协调器：{}，已处理 {}、积压 {} 个目录（wmfs task list 看速率）",
+                t.state, t.done, t.backlog
+            );
         }
         s
     };

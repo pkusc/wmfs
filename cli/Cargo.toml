@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 # 每个插件一个 feature（design.md 2.1、3.7.5），默认启用全部首发插件；mem 是独立 crate 的示例传输，默认不编进来。
-default = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc", "cache-memory"]
+default = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc", "cache-memory", "xxh3", "blake3", "lz4", "zstd", "aes-gcm", "reconciler", "scrub"]
 tcp = ["wmfs-plugins/tcp"]
 shared-key = ["wmfs-plugins/shared-key"]
 posix-mode = ["wmfs-plugins/posix-mode"]
@@ -27,6 +27,13 @@ replica = ["wmfs-plugins/replica"]
 fifo = ["wmfs-plugins/fifo"]
 gc = ["wmfs-plugins/gc"]
 cache-memory = ["wmfs-plugins/cache-memory"]
+xxh3 = ["wmfs-plugins/xxh3"]
+blake3 = ["wmfs-plugins/blake3"]
+lz4 = ["wmfs-plugins/lz4"]
+zstd = ["wmfs-plugins/zstd"]
+aes-gcm = ["wmfs-plugins/aes-gcm"]
+reconciler = ["wmfs-plugins/reconciler"]
+scrub = ["wmfs-plugins/scrub"]
 mem = ["dep:plugin-mem-transport"]
 
 [dependencies]

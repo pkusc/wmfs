@@ -20,6 +20,8 @@
 //! 拿到集群图、自我隔离着：多半刚起来还没被确认）——它很快就能收：chain-timer 约 0.5 s 后就重发、upstream 留着；本节点的视图更旧、
 //! 或本节点自己也自我隔离着（多半与 leader 分区）→ 照第 8 步回 RETRY，3 s 一次（换上新图时规则 4 会重发）。
 //! fail point `chain.ack.drop`：丢掉一个转发的回复（pending 留着，chain-timer 3 s 后重新驱动，后继回重复的 `Ack{committed}`）。
+//! 实现注记（M11，ADR-0041 第 18 条最后一句）：本节点的 target 只读（运行中连续提交失败，或超级块的 ro_compat 位）时，收到的转发、同步与删除
+//! 的传播一律回可重试的 `NOT_SERVING`、不写盘；链管理器按"变成只读"两步把它移出写路径之后，写照常进行。
 
 use std::sync::Arc;
 
@@ -31,7 +33,7 @@ use super::packed;
 use super::service::DataService;
 use super::state::{PendingWrite, Upstream};
 use super::write::{self, WriteJob};
-use super::{DataNode, chain, forward, read, redrive, sync};
+use super::{DataNode, chain, forward, read, redrive, repair, sync};
 use crate::base::types::ChunkId;
 use crate::base::{ErrCode, clock, log};
 use crate::buf::{Buf, FrozenBuf};
@@ -56,7 +58,7 @@ pub struct PeerService {
     data: Arc<DataService>,
 }
 
-/// 起 repl 线程、chain-timer 与同步线程，交出 PeerCall 服务（服务端装配时；`rpc` = 服务端之间的 RPC 客户端，key 0）。
+/// 起 repl 线程、chain-timer、同步线程与 repair 线程，交出 PeerCall 服务（服务端装配时；`rpc` = 服务端之间的 RPC 客户端，key 0）。
 pub fn start(node: &Arc<DataNode>, rpc: Arc<RpcClient>, data: Arc<DataService>) -> Result<Arc<PeerService>, String> {
     let (tx, rx) = bounded(REPL_QUEUE);
     let _ = (node.peer.set(rpc), node.repl.set(tx));
@@ -73,6 +75,7 @@ pub fn start(node: &Arc<DataNode>, rpc: Arc<RpcClient>, data: Arc<DataService>) 
     }
     redrive::start(node)?;
     sync::start(node)?;
+    repair::start(node)?; // 写路径要的修复（M11，3.2.5 R5）
     Ok(Arc::new(PeerService { node: node.clone(), data }))
 }
 
@@ -127,6 +130,9 @@ fn check(node: &DataNode, chain_id: u32, ver: u64, from: u32) -> Result<Here, ch
         return Err(chain::Fail(ErrCode::STALE_CHAIN, c.ver)); // I4：只接受当前前驱的转发
     }
     chain::check_i5(node, &map, target)?;
+    if node.targets.get(&target).is_some_and(|t| t.read_only()) {
+        return Err(ErrCode::NOT_SERVING.into()); // 只读的 target 当后继、Syncing 成员时不写盘（M11）：前驱稍后重发，等它被移出链
+    }
     Ok(Here { target, chain_ver: c.ver, succ: chain::successor(c, pos), syncing: !chain::serving_at(c, pos) })
 }
 
@@ -249,8 +255,8 @@ fn write_pending(
     let tg = node.targets.get(&t).ok_or(ErrCode::NOT_SERVING)?;
     let id = &fw.chunk;
     let (h, head, mut writes, copies) = if fw.full {
-        let (h, w) = packed::unpack(bulk)?;
-        (h, vec![], w, vec![])
+        let u = packed::unpack(bulk)?;
+        (u.header, vec![], u.writes, vec![])
     } else {
         let a = packed::incremental(base, &fw.header, &fw.blocks, bulk)?;
         (a.header, a.head, a.blocks, a.copies)

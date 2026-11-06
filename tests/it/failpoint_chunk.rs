@@ -3,7 +3,8 @@
 //! `chunk.read.corrupt`（读出的字节被翻转一个比特 → 校验和不符 → 单副本 EIO，chunk 标为 Corrupt，整块覆盖写之后恢复）、
 //! `chunk.sync.eio`（另有服务端 Uninline 的 SyncChunks 失败 → Uninline 报错、文件仍是 inline、内容不变：清掉 INLINE 之前数据必须
 //! 已持久，ADR-0034 第 3 条），以及钩子包装自动拥有的 `plugin.local-fs.chunk_store`、`plugin.crc32c.transform`、`plugin.fifo.qos`、
-//! `plugin.replica.codec`（hb 线程的 statfs 也经 chunk_store 的包装，所以这几个用"一直触发、用完清掉"，而不是只触发一次）。
+//! `plugin.replica.codec`（hb 线程的 statfs 也经 chunk_store 的包装，所以这几个用"一直触发、用完清掉"，而不是只触发一次）；M11 的
+//! 变换插件 `plugin.{xxh3,blake3,lz4,zstd,aes-gcm}.transform`（在设了对应属性的目录里写）。
 //! fail point 是进程级的：单独一个测试程序，各段按顺序在同一个测试里跑。
 
 use std::time::Duration;
@@ -14,6 +15,7 @@ use wmfs_core::buf::Lane;
 use wmfs_core::meta::schema::keys::ROOT_INO;
 use wmfs_core::meta::schema::records::F_INLINE;
 use wmfs_core::proto::meta::{MetaOp, MetaReply, O_RDONLY, O_RDWR, OpenOut};
+use wmfs_testkit::harness::bg::{api, datakey, mkdir, set};
 use wmfs_testkit::harness::node::{Client, chunk_of, client, init, opened, put, start, target_dir, who, write_chunks};
 
 fn read0(c: &Client, o: &OpenOut) -> Result<Vec<u8>, ErrCode> {
@@ -85,6 +87,25 @@ fn data_path_fail_points() {
         failpoint::clear(fp);
         assert!(hook_errors(hook, plugin) > before, "{fp}：钩子包装把它计为插件错误");
         assert!(write_chunks(&c, &o, 0, &[6; 10]).is_ok(), "{fp}：清掉之后照常");
+    }
+    let a = api(&d, &run.mgmt_addr);
+    datakey(&a, "fp");
+    let m11 = [
+        ("xxh3", "checksum=xxh3"),
+        ("blake3", "checksum=blake3"),
+        ("lz4", "compress=lz4"),
+        ("zstd", "compress=zstd"),
+        ("aes-gcm", "encrypt=tenant:fp"),
+    ];
+    for (plugin, spec) in m11 {
+        let dir = mkdir(&c, ROOT_INO, plugin);
+        set(&a, &format!("/{plugin}"), spec).unwrap();
+        let (fp, before) = (format!("plugin.{plugin}.transform"), hook_errors("transform", plugin));
+        failpoint::set(&fp, "return(EPERM)").unwrap();
+        assert_eq!(put(&c, &me, dir, "f", &[7; 100_000]).err(), Some(ErrCode::EPERM), "{fp}：以注入的码失败");
+        failpoint::clear(&fp);
+        assert!(hook_errors("transform", plugin) > before, "{fp}：钩子包装把它计为插件错误");
+        assert!(put(&c, &me, dir, "f", &[7; 100_000]).is_ok(), "{fp}：清掉之后照常");
     }
     c.meta.close();
     run.stop();

@@ -54,7 +54,7 @@ pub fn chunks(chain_dir: &Path, chain: u32) -> Result<Vec<ChunkId>, ErrCode> {
     Ok(out)
 }
 
-/// `c/` 下的全部 (chain, ino, epoch, 目录 mtime ms)（不保证顺序）。
+/// `c/` 下的全部 (chain, ino, epoch, 目录 mtime ms)（不保证顺序；列的时候刚被删掉的目录跳过）。
 pub fn epochs(c_dir: &Path) -> Result<Vec<(u32, u64, u32, u64)>, ErrCode> {
     let mut out = Vec::new();
     for cd in entries(c_dir)? {
@@ -62,7 +62,11 @@ pub fn epochs(c_dir: &Path) -> Result<Vec<(u32, u64, u32, u64)>, ErrCode> {
         for bucket in entries(&cd.path())? {
             for ed in entries(&bucket.path())? {
                 let Some((ino, epoch)) = ed.file_name().to_str().and_then(parse_epoch_dir) else { continue };
-                let mtime = ed.metadata()?.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
+                let m = match ed.metadata() {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // DeleteEpoch 刚删掉它
+                    r => r?,
+                };
+                let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
                 out.push((chain, ino, epoch, mtime.map_or(0, |d| d.as_millis() as u64)));
             }
         }

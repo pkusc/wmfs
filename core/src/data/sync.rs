@@ -25,17 +25,16 @@ use std::time::Duration;
 
 use wmfs_api::failpoint::fail_point;
 
-use super::{DataNode, Target, chain, packed, read};
+use super::forward::peer_call;
+use super::{DataNode, Target, chain, packed, read, write};
 use crate::base::types::ChunkId;
 use crate::base::{ErrCode, clock, lock, log};
 use crate::buf::Buf;
-use crate::net::client::{Endpoint, Family, RpcClient, check_reply};
+use crate::proto::encode_body;
 use crate::proto::peer::{PeerOp, PeerReply};
-use crate::proto::{decode_body, encode_body};
 
 const THREADS: usize = 2;
 const PAGE: u32 = 1000;
-const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// 一轮做完之后等集群图里这条链的版本变（SyncDone 生效）最多多久，再重跑。
 const SETTLE_MS: u64 = 3000;
 
@@ -125,19 +124,16 @@ fn run(node: &Arc<DataNode>, j: Job) {
     }
 }
 
-fn call(rpc: &RpcClient, ep: &Endpoint, op: &PeerOp) -> Result<(PeerReply, Option<Buf>), ErrCode> {
-    let f = check_reply(rpc.call(ep, Family::Data, super::forward::peer_frame(op, vec![]), RPC_TIMEOUT)?)?;
-    Ok((decode_body(&f.body)?, f.bulk))
-}
-
 /// 第 1–3 步；返回取回了几个 chunk。
 fn copy(node: &Arc<DataNode>, j: Job) -> Result<u64, ErrCode> {
-    let rpc = node.peer.get().ok_or(ErrCode::NOT_READY)?;
     let ep = node.map.get().and_then(|m| chain::endpoint(&m, j.src)).ok_or(ErrCode::NOT_SERVING)?;
     let t = node.targets.get(&j.target).ok_or(ErrCode::NOT_SERVING)?;
+    if t.read_only() {
+        return Err(ErrCode::EROFS); // 只读的 target 不再同步（M11）：它要被移出链
+    }
     let (mut items, mut after) = (Vec::new(), None);
     loop {
-        match call(rpc, &ep, &PeerOp::ListChunks { chain: j.chain, after, limit: PAGE })? {
+        match peer_call(node, &ep, &PeerOp::ListChunks { chain: j.chain, after, limit: PAGE })? {
             (PeerReply::Chunks { items: page, more }, _) => {
                 after = page.last().map(|(id, _)| *id);
                 items.extend(page);
@@ -153,7 +149,7 @@ fn copy(node: &Arc<DataNode>, j: Job) -> Result<u64, ErrCode> {
         if touched(node, j, id) || read::committed_version(node, t, id) == Some(*v) {
             continue;
         }
-        let (rep, bulk) = match call(rpc, &ep, &PeerOp::FetchChunk { chunk: *id }) {
+        let (rep, bulk) = match peer_call(node, &ep, &PeerOp::FetchChunk { chunk: *id }) {
             Err(ErrCode::CHUNK_NOT_FOUND) => continue, // 源端只有 pending（还在路上的写会转发过来）或刚被 DeleteEpoch 删掉
             r => r?,
         };
@@ -174,7 +170,7 @@ fn copy(node: &Arc<DataNode>, j: Job) -> Result<u64, ErrCode> {
                 {
                     log::warn("sync", format_args!("链 {} 的 target {}：删除 {id:?} 失败：{e}", j.chain, j.target));
                 }
-                node.chunks.finish(id);
+                write::drain(node, node.chunks.finish(id)); // 占着它时排进来的写（客户端的集群图旧了才会有）照常做
             }
         }
         if page.len() < PAGE as usize {
@@ -197,20 +193,21 @@ pub fn touch(node: &DataNode, id: &ChunkId, target: u32) {
 }
 
 /// 装上取回的 packed 版本（第 2 步）：本轮收到过转发 → 丢掉；chunk 正忙 → `BUSY`（这一轮作废重跑，见文件头）。
-fn install(node: &DataNode, t: &Target, j: Job, id: &ChunkId, packed: &[u8]) -> Result<(), ErrCode> {
-    let (h, writes) = packed::unpack(packed)?;
+fn install(node: &Arc<DataNode>, t: &Target, j: Job, id: &ChunkId, packed: &[u8]) -> Result<(), ErrCode> {
+    let u = packed::unpack(packed)?;
+    let h = &u.header;
     if (h.ino, h.epoch, h.chunk_idx, h.chain_id) != (id.ino, id.epoch, id.idx, id.chain) {
         return Err(ErrCode::EINVAL);
     }
     if !node.chunks.claim(id) {
         return Err(ErrCode::BUSY);
     }
-    let r = if touched(node, j, id) { Ok(()) } else { node.store(|| t.store.install(id, &writes)) };
+    let r = if touched(node, j, id) { Ok(()) } else { node.store(|| t.store.install(id, &u.writes)) };
     if r.is_ok() {
         node.chunks.clear_corrupt(id);
         node.craq.resync_bytes.add(packed.len() as u64);
     }
-    node.chunks.finish(id);
+    write::drain(node, node.chunks.finish(id));
     r
 }
 

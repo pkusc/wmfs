@@ -61,11 +61,11 @@ fn an_unknown_ro_compat_bit_makes_the_target_read_only() {
     let d = dir("ro");
     superblock(&d, CLUSTER, 0);
     let t = open(&d, "0").unwrap();
-    assert!(!t.read_only);
+    assert!(!t.read_only());
     write_at(&node_with(t, 1), CS, 0, &[(0, 100)], &[5; 100]).unwrap();
     superblock(&d, CLUSTER, 1); // ro_compat bit0：首发不认识任何 ro_compat 位
     let t = open(&d, "0").unwrap();
-    assert!(t.read_only, "不认识的 ro_compat 位：只读服务");
+    assert!(t.read_only(), "不认识的 ro_compat 位：只读服务");
     let node = node_with(t, 1);
     assert_eq!(write_at(&node, CS, 0, &[(0, 10)], &[1; 10]), Err(ErrCode::EROFS));
     assert_eq!(truncate(&node, CS, 0, 0), Err(ErrCode::EROFS));

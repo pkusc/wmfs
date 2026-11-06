@@ -11,7 +11,8 @@
 //! - [`fail_point`]：`return(c)` → `Err(c)`（c 不在 1..=65535 里时按 `INTERNAL`：0 在去重表与 changelog 里表示成功，
 //!   不能当错误码返回）；panic / abort / sleep 在函数内部执行；corrupt 不做事；
 //! - [`fail_point_hit`]：`return(..)` 与 `corrupt` 返回 true（drop、corrupt 这类动作由调用方自己做）；
-//! - [`fail_point_value`]：`return(<整数>)` 的整数值（可以为负、可以大于 u16），给时钟注入偏移与速率用。
+//! - [`fail_point_value`]：`return(<整数>)` 的整数值（可以为负、可以大于 u16），给时钟注入偏移与速率用；
+//! - [`fail_point_ms`]：`return(<毫秒>)` 的毫秒数（负数当 0），没有配置就是给的默认值——测试里缩短后台任务的 24 h、1 h 之类（M11）。
 //!
 //! 名字按完整字符串匹配（例如 `plugin.quota.quota_admission`、`net.drop.to.2`），只能由字母、数字和 `.` `_` `-` 组成。
 
@@ -129,6 +130,11 @@ pub fn fail_point_value(name: &str) -> Option<i64> {
         Outcome::Return(v) => Some(v),
         _ => None,
     }
+}
+
+/// 测试里缩短的时长：`return(<毫秒>)` 配置的值（负数当 0），没有配置就是 `default`（实现注记（M11）：后台任务的几个 24 h、1 h 之类）。
+pub fn fail_point_ms(name: &str, default: u64) -> u64 {
+    fail_point_value(name).map_or(default, |v| v.max(0) as u64)
 }
 
 /// 设置（或用 `off` 删除）一个 fail point。名字或动作写错时返回中文原因，不改变已有配置。

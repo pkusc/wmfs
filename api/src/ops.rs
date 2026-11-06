@@ -7,7 +7,7 @@
 //! 不写 changelog 的修改：SessionHeartbeat、SetAtime、SetLock、DebugPut、消费者游标提交、fail point。
 //! 旧版 mgr 遇到不认识的数时显示 `op#<数>`，不报错。
 
-/// 全部操作码：(数值, 名字)，按数值升序。1–14 命名空间与会话，100–107 属性与系统事件，200–215 管理操作。
+/// 全部操作码：(数值, 名字)，按数值升序。1–14 命名空间与会话，100–108 属性与系统事件，200–215 管理操作。
 pub const CHANGE_OPS: &[(u16, &str)] = &[
     (1, "SessionOpen"),
     (2, "SessionClose"),
@@ -31,6 +31,7 @@ pub const CHANGE_OPS: &[(u16, &str)] = &[
     (105, "ChecksumRepaired"),
     (106, "DataLossDetected"),
     (107, "TrashExpire"),
+    (108, "RStatDrift"), // 实现注记（M11）：协调器的在线自检修正了一个目录的递归计数（3.9；extra 写 bytes/files/dirs 的差值）
     (200, "ClassCreate"),
     (201, "ClassUpdate"),
     (202, "ClassDelete"),
@@ -46,7 +47,7 @@ pub const CHANGE_OPS: &[(u16, &str)] = &[
     (212, "PluginListChange"),
     (213, "PluginListReset"),
     (214, "FeatureEnable"),
-    (215, "TaskControl"), // extra 写 action=<动作>
+    (215, "TaskControl"), // extra 写 kind=<任务>、action=<动作>（set 另有 bw/items；实现注记（M11），ADR-0042 第 2 条）
 ];
 
 /// 数值 → 名字；不认识的数（含 0）返回 None。
@@ -104,6 +105,6 @@ mod tests {
         assert_eq!(op_code("TrashExpire"), Some(107));
         assert_eq!(op_code("ClassCreate"), Some(200));
         assert_eq!(op_code("TaskControl"), Some(215));
-        assert_eq!(CHANGE_OPS.len(), 14 + 8 + 16);
+        assert_eq!(CHANGE_OPS.len(), 14 + 9 + 16);
     }
 }

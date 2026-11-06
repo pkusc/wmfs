@@ -6,11 +6,13 @@
 //!   decompress → 校验 checksum；读不全或校验不符 → `CHECKSUM_MISMATCH`——宁可报错，也不返回错误的数据。
 //! - **读**（[`read`]）：chunk 不存在 → `CHUNK_NOT_FOUND`（客户端先 GetAttr 确认 epoch 没变，再当空洞读 0，C5）；被标为 Corrupt →
 //!   `CORRUPT`；否则逐块解码、复制所需区间：洞 = 0，`[plain_len, block_size)` = 0；回复的长度截到 `logical_len`（之后的部分由
-//!   客户端补 0）。头或任一块校验不符 → 标 Corrupt、回 `CHECKSUM_MISMATCH`。
+//!   客户端补 0）。头或任一块校验不符 → 标 Corrupt、回 `CHECKSUM_MISMATCH`。实现注记（M11，ADR-0042 第 7 条）：读到坏块（或已标为
+//!   Corrupt 的）时马上交给 repair 线程从别的副本修（与写路径同一个线程，`repair::want_repair`；修好或修不了照 `ReportCorrupt` 上报），
+//!   不等 scrub 的下一轮；客户端照旧换下一个副本读。已判定丢失的不再排队。
 
 use super::format::{BLK_COMPRESSED, BLK_ENCRYPTED, BlockEntry, CHUNK_HEADER_LEN, ChunkHeader};
 use super::format::{block_aad, decode_table, table_len_of};
-use super::{DataNode, Target};
+use super::{DataNode, Target, repair};
 use crate::base::ErrCode;
 use crate::base::types::ChunkId;
 use crate::buf::{Buf, Lane, POOL_WAIT};
@@ -79,17 +81,29 @@ impl Committed {
     }
 }
 
+/// 读到坏块（`found` = 这次才发现：标 Corrupt、计数）：交给 repair 线程马上修（见文件头），回原来的错误。
+fn bad(node: &DataNode, t: &Target, id: &ChunkId, e: ErrCode, found: bool) -> ErrCode {
+    if found {
+        node.report_corrupt(t, id, e);
+    }
+    if !node.chunks.is_lost(id) {
+        repair::want_repair(node, t.id, id);
+    }
+    e
+}
+
 /// 解码一块：decrypt → decompress → 校验 checksum（只做块表标明用过的那几步，3.2.4 的读顺序）。
-fn decode(node: &DataNode, h: &ChunkHeader, id: &ChunkId, i: u32, e: &BlockEntry, b: Buf) -> Result<Buf, ErrCode> {
+pub fn decode(node: &DataNode, h: &ChunkHeader, id: &ChunkId, i: u32, e: &BlockEntry, b: Buf) -> Result<Buf, ErrCode> {
     let meta =
         BlockMeta { checksum: e.checksum, flags: e.flags, nonce: e.nonce, tag: e.gcm_tag, plain_len: e.plain_len };
     let aad = block_aad(&h.cluster_id, id.ino, id.epoch, id.idx, i);
+    let key = if e.flags & BLK_ENCRYPTED != 0 { node.keys.get(node, h.encrypt_key_id) } else { None }; // M11：数据密钥
     let ctx = TransformCtx {
         chunk: id,
         block_idx: i,
         level: h.compress_level,
         key_id: h.encrypt_key_id,
-        key: None,
+        key: key.as_ref(),
         aad: &aad,
     };
     let pool = &node.pool;
@@ -110,17 +124,13 @@ fn decode(node: &DataNode, h: &ChunkHeader, id: &ChunkId, i: u32, e: &BlockEntry
 /// 读 `[off, off + len)`：返回 (缓冲, 实际长度, 已提交版本号)。
 pub fn read(node: &DataNode, t: &Target, id: &ChunkId, off: u32, len: u32) -> Result<(Buf, u32, u64), ErrCode> {
     if node.chunks.is_corrupt(id) {
-        return Err(ErrCode::CORRUPT);
+        return Err(bad(node, t, id, ErrCode::CORRUPT, false));
     }
     let mut c = match open(node, &*t.store, id) {
         Ok(Some(c)) => c,
         Ok(None) => return Err(ErrCode::CHUNK_NOT_FOUND),
-        Err(e) => {
-            if e == ErrCode::CORRUPT {
-                node.report_corrupt(t, id, e);
-            }
-            return Err(e);
-        }
+        Err(ErrCode::CORRUPT) => return Err(bad(node, t, id, ErrCode::CORRUPT, true)),
+        Err(e) => return Err(e),
     };
     let h = c.header;
     let end_req = off.checked_add(len).filter(|e| *e <= h.chunk_size).ok_or(ErrCode::EINVAL)?;
@@ -142,12 +152,8 @@ pub fn read(node: &DataNode, t: &Target, id: &ChunkId, off: u32, len: u32) -> Re
                 dst[..e - s].copy_from_slice(&p[s..e]);
             }
             Ok(None) => {} // 洞：读为 0
-            Err(e) => {
-                if e == ErrCode::CHECKSUM_MISMATCH {
-                    node.report_corrupt(t, id, e);
-                }
-                return Err(e);
-            }
+            Err(ErrCode::CHECKSUM_MISMATCH) => return Err(bad(node, t, id, ErrCode::CHECKSUM_MISMATCH, true)),
+            Err(e) => return Err(e),
         }
         pos = z;
     }

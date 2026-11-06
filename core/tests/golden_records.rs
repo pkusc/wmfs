@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use common::*;
 use wmfs_core::base::ErrCode;
+use wmfs_core::bg::progress::LocalTaskV1;
 use wmfs_core::meta::schema::raft_state::{Applied, MetaFormatV1, SnapMeta};
 use wmfs_core::meta::schema::{keys, records::*};
 
@@ -86,21 +87,21 @@ fn golden_records() {
     g.rec("ChainRecV1", &chain_rec());
     g.rec("StorageClassV1", &storage_class());
     g.rec("ClassIdV1", &ClassIdV1 { id: 2 });
-    g.rec(
-        "TaskRecV1",
-        &TaskRecV1 {
-            state: 1,
-            cursor: vec![1, 2, 3],
-            pass: 4,
-            done: 600,
-            total_hint: 1000,
-            backlog: 400,
-            bytes_per_sec: 50 << 20,
-            items_per_sec: 100,
-            updated_ms: 1_792_454_400_005,
-            last_error: "无".into(),
-        },
-    );
+    let task = TaskRecV1 {
+        state: 1,
+        cursor: vec![1, 2, 3],
+        pass: 4,
+        done: 600,
+        total_hint: 1000,
+        backlog: 400,
+        bytes_per_sec: 50 << 20,
+        items_per_sec: 100,
+        updated_ms: 1_792_454_400_005,
+        last_error: "无".into(),
+    };
+    g.rec("TaskRecV1", &task);
+    // 实现注记（M11）：节点任务的本地游标文件 `<data_dir>/run/task-<kind>.cursor`（bg/progress.rs），同样是版本字节 + postcard
+    g.rec("LocalTaskV1", &LocalTaskV1 { rec: task, run_seen: 7 });
     g.rec("KeyMetaV1", &key_meta());
     g.rec("DataKeyV1", &data_key());
     g.rec("DataKeyIdV1", &DataKeyIdV1 { id: 3 });

@@ -31,9 +31,9 @@ crossbeam-channel = "0.5"
 crc32c = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 blake3 = "1"
-lz4_flex = "0.14"
-zstd = "0.14"
-aes-gcm = "0.11"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }   # 只用 block 格式（不要 frame）
+zstd = { version = "0.14", default-features = false }   # 不要旧格式解码器与字典训练（legacy、zdict_builder）
+aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }   # nonce 来自 core::base::rand（不要 getrandom/OsRng）
 hmac = "0.13"
 sha2 = "0.11"
 tiny_http = "0.12"

@@ -88,9 +88,19 @@ LIMIT=38000
 # 约 60）。上限放宽到 38,000（ADR-0041 第 2 条，plugins 下调到 5,100 主管已确认），Σ max ≈ 34,985。
 # M10 链成员变更的修正（ADR-0041 第 13–17 条，design.md 2.2 的注记）：再新增约 85 行。重估一个已达 90% 的：core/meta/cluster
 # 1260 → 1340（已约 1,247：两步移出约 +76；余下 M13 的存储类 CRUD 与 QoS 表随集群图下发、按用量放置约 90）。Σ max ≈ 35,065。
-MODULES="wmfs-api:1150 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1270 core/hooks:1120
-core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2000 core/meta:2600 core/meta/cluster:1340
-core/data:3000 core/client:2430 core/bg:850 core/mgmt:1250 core:930 plugins:5100 cli:5200 dashboard:880
+# M11（design.md 2.2 的 M11 注记）：连同审查修复新增约 3,200 行（预算约 2,100；审查修复约 +420，ADR-0042）。已超出或已达 90%、后面还要加
+# 代码的都按剩余工作重估，共八个：wmfs-api 1150 → 1170（已约 1,061；余下存储类、qos、trace、feature、node 的结构约 110）、core/data 3000 → 3120
+# （已约 3,033：repair.rs、datakey.rs；余下 M13 的 QoS 表与保底欠额上报、M14 的 trace span 与 target 用量约 90）、core/bg 850 → 1170（已约 1,106：
+# 调度器的节点任务与本地游标、进度与控制、遍历器、迁移原语、status 的逐文件统计；余下 M13 的 tiering/rebalance 对迁移原语与 declared() 的
+# 小改约 55、M14 的 declared_mismatch_files 约 10）、core/meta 2600 → 2850（已约 2,532：data_reports、在线自检、gc 的元数据清理、compress/encrypt/
+# 数据密钥的属性；余下 M12 的 locks.rs、回收站与审计约 285，status 里 trash、qos、audit 的实际约 35）、core/mgmt 1250 → 1340（已约 1,143：tasks.rs；
+# 余下存储类、qos、trace、feature、node 的端点约 200）、core 930 → 965（已约 914：server.rs 拆出 server/roles.rs——module_of 以前把
+# core/src/server/ 算成了不存在的模块"core/server"，现在算进 core；余下 M14 的 mgr 装配约 50）、cli 5200 → 5500（已约 4,954；按 7.2 的命令
+# 清单重估 M12–M14 余下约 540，含 roadmap 没排进里程碑的 feature list|enable 约 30）、plugins 5100 → 5270（已约 4,117；按 design 2.2 的表余下
+# 约 1,150，含 M10 下调时漏算的 label-match 完整版约 140）。Σ max ≈ 36,370（上限 38,000；超过 37,000 要上报）。
+MODULES="wmfs-api:1170 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1270 core/hooks:1120
+core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2000 core/meta:2850 core/meta/cluster:1340
+core/data:3120 core/client:2430 core/bg:1170 core/mgmt:1340 core:965 plugins:5270 cli:5500 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。
@@ -103,7 +113,7 @@ module_of() {
             echo "core/meta/${r%%/*}"
             ;;
         core/src/meta/*) echo "core/meta" ;;
-        core/src/init/*) echo "core" ;; # init.rs 的子模块（init/initial_kv.rs）与 init.rs、server.rs 同属"core"（design.md 2.2）
+        core/src/init/* | core/src/server/*) echo "core" ;; # init.rs、server.rs 的子模块（init/initial_kv.rs、server/roles.rs）同属"core"（design.md 2.2）
         core/src/*/*)
             local r="${1#core/src/}"
             echo "core/${r%%/*}"

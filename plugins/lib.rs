@@ -58,3 +58,31 @@ pub mod gc;
 #[cfg(feature = "cache-memory")]
 #[path = "cache-memory/mod.rs"]
 pub mod cache_memory;
+
+#[cfg(feature = "xxh3")]
+#[path = "xxh3/mod.rs"]
+pub mod xxh3;
+
+#[cfg(feature = "blake3")]
+#[path = "blake3/mod.rs"]
+pub mod blake3;
+
+#[cfg(feature = "lz4")]
+#[path = "lz4/mod.rs"]
+pub mod lz4;
+
+#[cfg(feature = "zstd")]
+#[path = "zstd/mod.rs"]
+pub mod zstd;
+
+#[cfg(feature = "aes-gcm")]
+#[path = "aes-gcm/mod.rs"]
+pub mod aes_gcm;
+
+#[cfg(feature = "reconciler")]
+#[path = "reconciler/mod.rs"]
+pub mod reconciler;
+
+#[cfg(feature = "scrub")]
+#[path = "scrub/mod.rs"]
+pub mod scrub;

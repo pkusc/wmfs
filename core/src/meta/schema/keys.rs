@@ -15,7 +15,7 @@ pub const T_QUOTA_STATE: u8 = 0x07; // 07 dir:u64 class:u16 → QuotaStateV1（c
 pub const T_LOCKS: u8 = 0x0A; // 0A ino:u64 → LockTableV1
 pub const T_SESSION: u8 = 0x0B; // 0B session:u64 → SessionRecV1
 pub const T_DEDUP: u8 = 0x0C; // 0C session:u64 seq:u64 → DedupV1（编码后的回复，3.5.2）
-pub const T_GC: u8 = 0x0D; // 0D kind:u8 ino:u64 epoch:u32 → GcRecV1；kind 1 = 孤儿 inode（epoch 写 0），kind 2 = 废弃 epoch
+pub const T_GC: u8 = 0x0D; // 0D kind:u8 ino:u64 epoch:u32 → GcRecV1；kind 1 = 孤儿 inode（epoch 写 0），2 = 废弃 epoch，3 = 迁移换下的
 pub const T_CHANGELOG: u8 = 0x0E; // 0E seq:u64 → ChangeRecV1
 pub const T_TRASH_INDEX: u8 = 0x0F; // 0F expire_ms:u64 ino:u64 → 空（回收站到期索引）
 pub const T_NODE: u8 = 0x10; // 10 node:u32 → NodeRecV1
@@ -36,9 +36,11 @@ pub const T_DEBUG: u8 = 0x2F; // 2F key → 原始字节；只有 wmfs debug kv�
 
 /// QUOTA_STATE 的 class = 0xFFFF 表示总量配额。
 pub const QUOTA_CLASS_TOTAL: u16 = 0xFFFF;
-/// GC 记录的 kind。
+/// GC 记录的 kind。实现注记（M11，ADR-0042 第 5 条）：kind 3 只增——迁移原语切换布局时换下来的旧 epoch（内容与新布局相同），gc 要等
+/// 没人打开着这个文件才删；kind 2 是截断到 0、覆盖写换下来的与作废的 uninline/迁移意图，只等宽限期。
 pub const GC_ORPHAN: u8 = 1;
 pub const GC_EPOCH: u8 = 2;
+pub const GC_MOVED: u8 = 3;
 
 // ---- GLOBAL 的 name（utf8）；计数器的 value 也是"版本字节 + postcard(u64/u32/u16)" ----
 pub const G_NEXT_INO: &str = "next_ino"; // u64
@@ -84,6 +86,10 @@ pub fn dentry(parent: u64, name: &[u8]) -> Vec<u8> {
 /// readdir 的前缀：`02 parent`。
 pub fn dentry_prefix(parent: u64) -> Vec<u8> {
     make_key(T_DENTRY, &[&parent.to_be_bytes()])
+}
+/// 一个目录的全部目录项的扫描区间 `[02 dir, 02 dir+1)`（实现注记（M11））。
+pub fn dentry_range(dir: u64) -> (Vec<u8>, Vec<u8>) {
+    (dentry_prefix(dir), dentry_prefix(dir + 1))
 }
 pub fn xattr(ino: u64) -> Vec<u8> {
     make_key(T_XATTR, &[&ino.to_be_bytes()])
@@ -178,6 +184,11 @@ pub fn debug(key: &[u8]) -> Vec<u8> {
 /// 某个键空间的范围扫描区间 `[tag, tag + 1)`。
 pub fn tag_range(tag: u8) -> (Vec<u8>, Vec<u8>) {
     (vec![tag], vec![tag + 1])
+}
+
+/// 紧跟在 `k` 之后的第一个 key（`k ‖ 00`）：从游标 `k`（已经处理过）接着扫（实现注记（M11））。
+pub fn after(k: &[u8]) -> Vec<u8> {
+    [k, &[0]].concat()
 }
 
 #[cfg(test)]

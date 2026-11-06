@@ -20,10 +20,11 @@ use raft::StateRole;
 
 use super::auth::{self, Caller};
 use super::http::{MgmtCtx, Reply, err, json};
-use crate::api::types::{AttrSetReq, NotLeaderReply, SemanticsReply};
+use crate::api::types::{AttrSetReq, NotLeaderReply, SemanticsReply, StatusReply};
 use crate::api::url::param;
 use crate::base::types::{Principal, ReqCtx};
 use crate::base::{ErrCode, Failed, clock};
+use crate::bg::status as bg_status;
 use crate::hooks::traits::ConnIdentity;
 use crate::meta::attr_registry::split;
 use crate::meta::cluster::settings;
@@ -40,6 +41,7 @@ pub fn handles(path: &str) -> bool {
     ) || path.starts_with("/api/v1/changelog")
         || super::cluster::handles(path)
         || super::keys::handles(path)
+        || super::tasks::handles(path)
 }
 
 /// 签名校验 → 有元数据引擎 → 本节点是就绪的 leader → 按 (方法, 路径) 分派（见文件头）。
@@ -63,6 +65,9 @@ pub(super) fn serve(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&st
     }
     if super::keys::handles(path) {
         return super::keys::serve(ctx, eng, &req, method, path, body); // M10：认证 key 与会话
+    }
+    if super::tasks::handles(path) {
+        return super::tasks::serve(ctx, eng, &req, method, path, body); // M11：后台任务、数据密钥
     }
     if super::cluster::handles(path) {
         let usage = ctx.usage.as_deref();
@@ -89,13 +94,23 @@ pub(super) fn serve(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&st
         }
         ("GET", "/api/v1/status") => {
             let p = q("path").unwrap_or_else(|| "/".into());
-            read(eng, &req, |v, c| attr_ops::status(v, c, &p)).map(|x| json(200, &x))
+            status(ctx, eng, &req, &p).map(|x| json(200, &x))
         }
         ("GET", "/api/v1/semantics") => read(eng, &req, |_v, c| Ok(semantics(c))).map(|x| json(200, &x)),
         ("POST", "/api/v1/cluster/settings") => cluster_set(eng, &req, body),
         _ => Err(Failed::new(ErrCode::EINVAL, format!("{path} 不支持 {method}"))),
     };
     r.unwrap_or_else(|f| failed_at(eng, f))
+}
+
+/// `GET /api/v1/status`：每个键的声明与新文件的实际（一个线性一致读），再加上逐文件的统计（`bg::status`：受限速地扫子树，3.10）与协调器的
+/// 进度（leader 上的进度板）。
+fn status(ctx: &MgmtCtx, eng: &EmbeddedEngine, req: &ReqCtx, p: &str) -> Result<StatusReply, Failed> {
+    let (mut r, root) = read(eng, req, |v, c| attr_ops::status(v, c, p))?;
+    let (map, live) = (eng.cluster_map()?, ctx.live.clone().unwrap_or_default());
+    bg_status::fill(&mut r, &bg_status::scan(eng, &root, &map, &live)?);
+    r.reconciler = ctx.board.as_ref().and_then(|b| b.get("reconciler"));
+    Ok(r)
 }
 
 fn attr_set(eng: &EmbeddedEngine, req: &ReqCtx, a: AttrSetReq) -> Result<Reply, Failed> {

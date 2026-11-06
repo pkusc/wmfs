@@ -23,7 +23,7 @@ use wmfs_api::failpoint::fail_point;
 
 use super::{DataNode, redrive};
 use crate::base::{ErrCode, clock, lock, log};
-use crate::net::client::{Endpoint, Family, RpcClient};
+use crate::net::client::{Endpoint, Family, RpcClient, check_reply};
 use crate::proto::frame::{FrameHeader, FrameKind, MSG_NODE_CALL, OutFrame};
 use crate::proto::peer::{ClusterMap, NodeHeartbeat, NodeOp, NodeReply, TargetReport};
 use crate::proto::{decode_body, encode_body};
@@ -32,6 +32,7 @@ use crate::proto::{decode_body, encode_body};
 const PERIOD: Duration = Duration::from_secs(1);
 const START_PERIOD: Duration = Duration::from_millis(100);
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const BG_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 本节点的集群图视图（数据服务按它核对链版本、找本节点是不是 head；hb 线程更新它）。
 pub struct MapHolder {
@@ -135,15 +136,30 @@ impl Finder {
     }
 }
 
+fn node_frame(op: &NodeOp) -> OutFrame {
+    let hdr = FrameHeader::new(FrameKind::Request, MSG_NODE_CALL, 0, 0);
+    OutFrame { hdr, body: encode_body(op), bulk: vec![], recv_into: None }
+}
+
 /// 一次 NodeCall；回 ERROR 帧时把 `leader_hint` 交给 `hint`（`NOT_LEADER` 时 core 自动填：leader 在 control_scheme 上的地址）。
 fn call(rpc: &RpcClient, ep: &Endpoint, op: &NodeOp, hint: &mut Option<String>) -> Result<NodeReply, ErrCode> {
-    let hdr = FrameHeader::new(FrameKind::Request, MSG_NODE_CALL, 0, 0);
-    let f = OutFrame { hdr, body: encode_body(op), bulk: vec![], recv_into: None };
-    let f = rpc.call(ep, Family::Control, f, RPC_TIMEOUT)?;
+    let f = rpc.call(ep, Family::Control, node_frame(op), RPC_TIMEOUT)?;
     if let Some(e) = f.error() {
         *hint = e.leader_hint;
         return Err(ErrCode(e.code));
     }
+    decode_body(&f.body)
+}
+
+/// 后台任务发给元数据 leader 的一次 NodeCall（本节点的集群图里记着谁是 leader；实现注记（M11）：本地孤儿扫描的 `CheckEpochs`、修复结果的
+/// `ReportCorrupt`）。leader 那边是一个线性一致读或一个批次，期限给 10 s；失败由任务下一步重试。
+pub fn leader_call(node: &DataNode, op: &NodeOp) -> Result<NodeReply, ErrCode> {
+    let map = node.map.get().ok_or(ErrCode::NOT_READY)?;
+    let leader = map.leader.ok_or(ErrCode::NOT_LEADER)?;
+    let addrs = map.nodes.iter().find(|(id, _)| *id == leader).map(|(_, n)| n.addrs.clone());
+    let ep = Endpoint { node: leader, addrs: addrs.ok_or(ErrCode::NOT_LEADER)? };
+    let rpc = node.peer.get().ok_or(ErrCode::NOT_READY)?;
+    let f = check_reply(rpc.call(&ep, Family::Control, node_frame(op), BG_TIMEOUT)?)?;
     decode_body(&f.body)
 }
 
@@ -164,7 +180,7 @@ fn beat_to(hb: &HbDeps, ep: &Endpoint, poked: bool, hint: &mut Option<String>) -
     let mut targets = Vec::new();
     for t in hb.data.targets.values() {
         let st = hb.data.store(|| t.stat())?;
-        let (target, phys_devs, read_only) = (t.id, t.phys_devs.clone(), t.read_only);
+        let (target, phys_devs, read_only) = (t.id, t.phys_devs.clone(), t.read_only());
         targets.push(TargetReport { target, used: st.used, capacity: st.capacity, phys_devs, read_only });
     }
     let (map, d) = (&hb.data.map, &hb.data);

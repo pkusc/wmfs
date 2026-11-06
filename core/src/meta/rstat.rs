@@ -7,19 +7,24 @@
 //! 最后一个链接被删时就扣掉，之后再写它也不改计数。各操作的增量（3.9 的表）由命名空间代码调这里的函数：create/mknod/symlink/
 //! mkdir → [`apply`]（新目录先 [`init_dir`]）；unlink/rmdir/被覆盖的 rename 目标 → [`apply`] 负的增量，删的是主链接但还有别的链接 →
 //! [`transfer`] 到新的主父目录；rename → [`transfer`]（到最近公共祖先为止）；改了长度或存储类 → [`changed`]。
-//! 自检：离线工具 `wmfs debug rstat-check <data_dir>`（[`check_data_dir`]：从全部 inode 重新算一遍，与 RSTAT 逐个比较）。
+//! 自检：离线工具 `wmfs debug rstat-check <data_dir>`（[`check_data_dir`]：从全部 inode 重新算一遍，与 RSTAT 逐个比较）；实现注记（M11）：
+//! 在线自检（[`drift`] / [`fix`]，协调器的全量扫描对每个目录做一次）查的是局部的不变式"目录的计数 = 它的直接子项的计数之和"，发现偏差就
+//! 用一个批次修正、写 changelog `RStatDrift`（3.9；正常情况下永远不会发生）。
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::base::ErrCode;
+use crate::base::types::ReqCtx;
 use crate::meta::attrs::MAX_DEPTH;
-use crate::meta::engine::txn::{KvRead, KvScan, KvTxn, OpCtx};
+use crate::meta::changelog::{self, Change};
+use crate::meta::engine::txn::{KvRead, KvScan, KvTxn, MetaEngine, OpCtx, txn_value};
 use crate::meta::engine::view::ReadView;
 use crate::meta::ns::common::Node;
 use crate::meta::schema::keys::{self, ROOT_INO, T_INODE, T_RSTAT};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::{InodeV1, KIND_DIR, KIND_FILE, RStatV1, decode_v1};
+use crate::meta::schema::records::{DentryV1, InodeV1, KIND_DIR, KIND_FILE, RStatV1, decode_v1};
+use crate::proto::meta::MetaReply;
 
 /// 一份计数的增量（可正可负）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -37,13 +42,18 @@ impl Delta {
         Ok(match n.rec.kind {
             _ if n.rec.nlink == 0 => Delta::default(),
             KIND_DIR => {
-                let r = get(v, n.ino)?;
-                let per_class = r.per_class.iter().map(|(c, b, f)| (*c, *b as i64, *f as i64)).collect();
-                Delta { bytes: r.bytes as i64, files: r.files as i64, dirs: r.dirs as i64 + 1, per_class }
+                let d = Delta::from_rstat(&get(v, n.ino)?);
+                Delta { dirs: d.dirs + 1, ..d }
             }
             KIND_FILE => file_delta(n.rec.class_id, n.rec.size),
             _ => Delta { files: 1, ..Delta::default() },
         })
+    }
+
+    /// 一份计数原样当作增量。
+    pub fn from_rstat(r: &RStatV1) -> Delta {
+        let per_class = r.per_class.iter().map(|(c, b, f)| (*c, *b as i64, *f as i64)).collect();
+        Delta { bytes: r.bytes as i64, files: r.files as i64, dirs: r.dirs as i64, per_class }
     }
 
     pub fn neg(&self) -> Delta {
@@ -143,6 +153,60 @@ pub fn transfer(v: &mut dyn KvTxn, c: &OpCtx, from: u64, to: u64, d: &Delta) -> 
 pub fn changed(v: &mut dyn KvTxn, c: &OpCtx, before: &Delta, after: &Node) -> Result<(), ErrCode> {
     let d = Delta::of(v, after)?.minus(before);
     apply(v, c, after.rec.parent, &d)
+}
+
+/// 在线自检（3.9，实现注记（M11）：协调器每次全量扫描时对每个目录做一次）最多看多少个子项：更大的目录不查（一个读里要读完它的全部
+/// 目录项）。
+pub const SELF_CHECK_MAX: usize = 10_000;
+
+/// `dir` 的 RSTAT 应等于它每个直接子项的那一份之和（子目录 = 它的 RSTAT + 1 个目录；文件只在主链接所在的目录计，[`Delta::of`]）：
+/// 一致、或子项太多不查 → None；否则 (库里的, 应有的)。这是一个局部的不变式——每个目录都满足它，整棵树的计数就都对。
+pub fn drift(v: &dyn KvScan, dir: u64) -> Result<Option<(RStatV1, RStatV1)>, ErrCode> {
+    let (prefix, end) = keys::dentry_range(dir);
+    let rows = v.scan(&prefix, &end, SELF_CHECK_MAX + 1)?;
+    if rows.len() > SELF_CHECK_MAX {
+        return Ok(None);
+    }
+    let mut want = RStatV1::default();
+    for (k, b) in rows {
+        let d: DentryV1 = decode_v1(&b)?;
+        let Some(rec) = kv::get::<InodeV1>(v, &keys::inode(d.ino))? else { continue };
+        let primary = rec.kind == KIND_DIR || (rec.parent == dir && rec.name == k[prefix.len()..]);
+        if primary {
+            add(&mut want, &Delta::of(v, &Node { ino: d.ino, rec })?);
+        }
+    }
+    let have = get(v, dir)?;
+    Ok((have != want).then_some((have, want)))
+}
+
+/// 修正一个自检发现的偏差：库里的还是 `seen`（期间没人改过这棵子树）→ 把差值加到 `dir` 与它的每个祖先上（祖先的计数是按同样的增量
+/// 一路加上来的，偏差相同），changelog `RStatDrift`（`extra` = 各项的差值）；回 true。库里的变了 → 什么也不做（下一次全量扫描再查）。
+pub fn fix(v: &mut dyn KvTxn, c: &OpCtx, dir: u64, seen: &RStatV1, want: &RStatV1) -> Result<bool, ErrCode> {
+    if get(v, dir)? != *seen {
+        return Ok(false);
+    }
+    let d = Delta::from_rstat(want).minus(&Delta::from_rstat(seen));
+    apply(v, c, dir, &d)?;
+    let extra = vec![
+        ("bytes".into(), d.bytes.to_string()),
+        ("files".into(), d.files.to_string()),
+        ("dirs".into(), d.dirs.to_string()),
+    ];
+    changelog::append(v, c, Change { op: "RStatDrift", ino: dir, extra, ..Default::default() })?;
+    Ok(true)
+}
+
+/// 协调器用：对 `dir` 做一次在线自检，有偏差就修正（[`drift`]，再一个批次 [`fix`]）；回 true = 修正过。
+pub fn selfcheck(eng: &dyn MetaEngine, dir: u64) -> Result<bool, ErrCode> {
+    let mut found = None;
+    // 这个闭包只用来在 ReadIndex 之后的视图上算出偏差，它的返回值丢弃
+    eng.read(&ReqCtx::internal(), &mut |v, _c| {
+        found = drift(v, dir)?;
+        Ok(MetaReply::Ok)
+    })?;
+    let Some((seen, want)) = found else { return Ok(false) };
+    txn_value(eng, ReqCtx::internal(), move |v, c| fix(v, c, dir, &seen, &want))
 }
 
 /// 离线自检的结果。

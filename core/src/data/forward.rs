@@ -22,20 +22,28 @@ use super::write::{self, Prepared, WriteJob};
 use super::{DataNode, chain, read, sync};
 use crate::base::types::ChunkId;
 use crate::base::{ErrCode, clock, lock, log};
-use crate::buf::BufSlice;
-use crate::net::client::{Family, check_reply};
+use crate::buf::{Buf, BufSlice};
+use crate::net::client::{Endpoint, Family, check_reply};
 use crate::net::server::Responder;
-use crate::proto::encode_body;
 use crate::proto::frame::{FrameHeader, FrameKind, InFrame, MSG_PEER_CALL, OutFrame};
-use crate::proto::peer::{ForwardWrite, PeerOp};
+use crate::proto::peer::{ForwardWrite, PeerOp, PeerReply};
+use crate::proto::{decode_body, encode_body};
 
-/// 单次转发的期限（3.4.2.3 第 8 步的"3 s 无确认"）；同步与删除的传播一路到尾要 fsync，给 10 s。
+/// 单次转发的期限（3.4.2.3 第 8 步的"3 s 无确认"）；同步与删除的传播一路到尾要 fsync，给 10 s；同步与修复向别的成员要列表、取 chunk
+/// 也给 10 s。
 pub const FWD_TIMEOUT: Duration = Duration::from_secs(3);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn peer_frame(op: &PeerOp, bulk: Vec<BufSlice>) -> OutFrame {
     let hdr = FrameHeader::new(FrameKind::Request, MSG_PEER_CALL, 0, 0);
     OutFrame { hdr, body: encode_body(op), bulk, recv_into: None }
+}
+
+/// 同步与修复向别的成员发的一次 PeerCall（ListChunks、FetchChunk；等着回复）：回复与 bulk。
+pub(super) fn peer_call(node: &DataNode, ep: &Endpoint, op: &PeerOp) -> Result<(PeerReply, Option<Buf>), ErrCode> {
+    let rpc = node.peer.get().ok_or(ErrCode::NOT_READY)?;
+    let f = check_reply(rpc.call(ep, Family::Data, peer_frame(op, vec![]), RELAY_TIMEOUT)?)?;
+    Ok((decode_body(&f.body)?, f.bulk))
 }
 
 /// head 写完 pending 之后（write.rs）：登记 pending（客户端的回复句柄交给它），第一次转发（增量）给后继。

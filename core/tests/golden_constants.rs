@@ -6,9 +6,11 @@ mod common;
 
 use common::Golden;
 use wmfs_core::base::types::Role;
+use wmfs_core::bg::progress::{DONE, PAUSED, RUNNING};
 use wmfs_core::data::format::*;
 use wmfs_core::data::superblock::{TARGET_FORMAT_VERSION, TARGET_INCOMPAT_KNOWN, TARGET_MAGIC, TARGET_SB_LEN};
 use wmfs_core::meta::cluster::chains::{SERVING, SYNCING, TARGET_OFFLINE, TARGET_UP};
+use wmfs_core::meta::data_reports::CHECK_EPOCHS_MAX;
 use wmfs_core::meta::ns::acl;
 use wmfs_core::meta::ns::xattr::{ACL_ACCESS, ACL_DEFAULT};
 use wmfs_core::meta::schema::keys::*;
@@ -51,6 +53,7 @@ fn golden_constants() {
         ("KIND_BLK", KIND_BLK),
         ("GC_ORPHAN", GC_ORPHAN),
         ("GC_EPOCH", GC_EPOCH),
+        ("GC_MOVED", GC_MOVED), // M11 追加（ADR-0042 第 5 条）
         ("BLK_COMPRESSED", BLK_COMPRESSED),
         ("BLK_ENCRYPTED", BLK_ENCRYPTED),
         ("CK_CRC32C", CK_CRC32C),
@@ -232,5 +235,10 @@ fn golden_constants() {
     g.add("CODEC_REPLICA", vec![wmfs_core::hooks::traits::CODEC_REPLICA]);
     // M6 追加：一次 SetAtime 最多几项
     g.add("SET_ATIME_MAX_ITEMS", (SET_ATIME_MAX_ITEMS as u32).to_le_bytes().to_vec());
+    // M11 追加（M11 审查）：TaskRecV1.state 的取值（3.2.8 写了数值；节点任务的本地游标文件里也是它）、一次 CheckEpochs 最多几项
+    for (n, v) in [("task_state.RUNNING", RUNNING), ("task_state.PAUSED", PAUSED), ("task_state.DONE", DONE)] {
+        g.add(n, vec![v]);
+    }
+    g.add("CHECK_EPOCHS_MAX", (CHECK_EPOCHS_MAX as u32).to_le_bytes().to_vec());
     g.check();
 }

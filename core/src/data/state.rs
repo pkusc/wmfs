@@ -6,7 +6,8 @@
 //!   放弃。head 上 `busy` 或有 `pending` 时，后到的客户端写进等待队列（≤ 8 个，满了 `BUSY`）；pending 解决之后由解决它的线程
 //!   （repl 线程、hb 线程或 chain-timer）接着做队首（[`ChunkTable::finish`]）。
 //! - Corrupt 标记**只在内存**：读到头 CRC 或块校验和不符时标上；之后读一律 `CORRUPT`；成功提交一个没有从旧版本原样复制任何块的
-//!   新版本之后清除（write.rs）。重启后由下一次读重新发现。
+//!   新版本之后清除（write.rs）。重启后由下一次读重新发现。实现注记（M11）：修复判定"别的 Serving 成员也没有好副本"之后另记一个
+//!   "丢失"（[`ChunkTable::mark_lost`]，随 Corrupt 一起清除）：写路径不再为它等修复（write.rs、3.2.5 R5）。
 //! - 条目在"不忙、没有 pending、没有排队、没有 Corrupt 标记"时删除。
 //!
 //! 实现注记（M9）：pending 的 `upstream` 是回复句柄（head 上是客户端，后继上是前驱）；重新驱动时可被替换，回复过 RETRY 后置 None。
@@ -74,6 +75,7 @@ struct Entry {
     pending: Option<PendingWrite>,
     waiters: VecDeque<Box<WriteJob>>,
     corrupt: bool,
+    lost: bool, // 修不了（别的 Serving 成员也没有好副本）；只在 corrupt 时有意义
 }
 
 impl Entry {
@@ -206,15 +208,31 @@ impl ChunkTable {
         self.shard(id).entry(*id).or_default().corrupt = true;
     }
 
-    /// 提交了一个不含任何旧块的新版本之后（write.rs、后继收到完整转发、同步安装）：去掉 Corrupt 标记。
+    /// 提交了一个不含任何旧块的新版本之后（write.rs、后继收到完整转发、同步安装）：去掉 Corrupt 标记（与"丢失"）。
     pub fn clear_corrupt(&self, id: &ChunkId) {
         if let Some(e) = self.shard(id).get_mut(id) {
-            e.corrupt = false;
+            (e.corrupt, e.lost) = (false, false);
         }
     }
 
     pub fn is_corrupt(&self, id: &ChunkId) -> bool {
         self.shard(id).get(id).is_some_and(|e| e.corrupt)
+    }
+
+    /// 修复判定修不了（见文件头）。
+    pub fn mark_lost(&self, id: &ChunkId) {
+        let mut m = self.shard(id);
+        let e = m.entry(*id).or_default();
+        (e.corrupt, e.lost) = (true, true);
+    }
+
+    pub fn is_lost(&self, id: &ChunkId) -> bool {
+        self.shard(id).get(id).is_some_and(|e| e.lost)
+    }
+
+    /// 有 pending 吗（含规则 2 已在本地提交、还在等确认的）：修复装上取回的版本之前核对（repair.rs）。
+    pub fn has_pending(&self, id: &ChunkId) -> bool {
+        self.shard(id).get(id).is_some_and(|e| e.pending.is_some())
     }
 }
 

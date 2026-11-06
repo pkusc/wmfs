@@ -6,7 +6,8 @@
 //! - `acl.default`：父目录没有默认 ACL 时新文件按它得到访问 ACL、不用 umask；
 //! - path-caps：子树里放行、上级目录只能查名字与取属性（core 判定的路径遍历）、子树外 `EACCES`、只读的根上写 `EROFS`；
 //! - M10 审查：同一目录上的总量与按类的软限各自计时；设配额时重判软限、unset/删目录时删掉起点；rename 覆盖与对调按扣掉之后的用量查；
-//!   link 的源文件也受路径限制；ADR-0041：硬链接不跨配额范围（`EXDEV`）、重放同一份配额配置不推后正在计时的宽限期。
+//!   link 的源文件也受路径限制；ADR-0041：硬链接不跨配额范围（`EXDEV`）、重放同一份配额配置不推后正在计时的宽限期；
+//! - `wmfs status` 的 quota 一行（M11，ADR-0042 第 13 条）：实际是管着这个目录的配额的用量与上限，超了软限算不一致。
 
 use wmfs_core::base::{ErrCode, Failed};
 use wmfs_core::meta::attr_ops;
@@ -135,6 +136,33 @@ fn soft_limits_start_a_grace_period_and_bind_after_it() {
     resize(&mut ns, f, 3 * M).unwrap();
     resize(&mut ns, f, 5 * M).unwrap();
     assert_eq!(soft_events(&ns), 2, "回到软限以内之后再越过：重新计时");
+}
+
+/// `wmfs status` 的 quota 一行（ADR-0042 第 13 条）：实际 = 管着这个目录的各个配额此刻的用量与上限；写超了软限 → 不一致，回到软限以下
+/// → 一致。没有按类的配额时 `quota.*` 一行没有实际。
+#[test]
+fn status_shows_the_quotas_in_force_and_flags_a_soft_limit_overrun() {
+    let mut ns = Ns::new();
+    let q = quota_dir(&mut ns, "quota=10M,soft=4M,grace=1m");
+    let (f, _) = create(&mut ns, q, "f").unwrap();
+    let row = |ns: &mut Ns, key: &str| {
+        let s = ns.view(&ROOT, |v, c| attr_ops::status(v, c, "/q")).unwrap().0;
+        s.attrs.into_iter().find(|a| a.key == key).unwrap()
+    };
+    resize(&mut ns, f, 3 * M).unwrap();
+    let r = row(&mut ns, "quota");
+    let used = |r: &wmfs_core::api::types::StatusAttr| {
+        r.actual.quotas.as_ref().map(|qs| qs.iter().map(|x| (x.dir.clone(), x.used_bytes, x.soft, x.hard)).collect())
+    };
+    assert_eq!(used(&r), Some(vec![("/q".to_string(), 3 * M, 4 * M, 10 * M)]), "实际：用量与上限");
+    assert!(!r.mismatched, "软限以内：一致");
+    resize(&mut ns, f, 5 * M).unwrap();
+    let r = row(&mut ns, "quota");
+    assert!(r.mismatched && used(&r).is_some_and(|v: Vec<_>| v[0].1 == 5 * M), "超了软限：不一致");
+    resize(&mut ns, f, 3 * M).unwrap();
+    assert!(!row(&mut ns, "quota").mismatched, "回到软限以下：一致");
+    let per_class = row(&mut ns, "quota.*");
+    assert_eq!((per_class.actual.quotas, per_class.mismatched), (None, false), "没有按类的配额");
 }
 
 #[test]

@@ -5,7 +5,9 @@
 //! 同时最多 2 个长轮询，第 3 个起立即回）→ 隔 1 s 再问（[`pause_ms`]），不忙等。每个事件一行：`#seq 时间(UTC) 操作 ino=…`，再带上
 //! 非零的字段与 extra；`--json` 每页一行 `{"events": [...], "next", "last_seq"}`（一条事件也没有时输出一行空页，带着 last_seq）。
 //! 实现注记（M8 审查）：`-f` 碰上换 leader（旧 leader 连不上、还在选举的节点回 503、409 指向刚被杀的 leader——ApiClient 都报成连不上或
-//! 503）不退出：保留读到的位置，隔 1 s 再问，连续失败最多 60 s（[`leader_changing`]）。
+//! 503）不退出：保留读到的位置，隔 1 s 再问，连续失败最多 60 s（[`leader_changing`]）。实现注记（M11）：gc 会修剪消费者都读过的事件，
+//! `最新 − N` 之前的一段可能已经没了（`410`）：从还在的最早一条读起（二分找到它，[`first_kept`]），标准错误上提示一句；`-f` 等着的时候
+//! 还没读到的一段被修剪了（别的消费者的游标越过了它）也一样处理，接着等，不退出（[`follow_once`]）。
 
 use std::time::Duration;
 
@@ -58,6 +60,41 @@ fn page(c: &ApiClient, after: u64, wait_ms: u64) -> Result<ChangelogPage, ApiErr
     c.get(&format!("/api/v1/changelog?after={after}&limit={PAGE_MAX}&wait_ms={wait_ms}"))
 }
 
+/// 读一页：(after, wait_ms) → 页（单元测试里换成假的）。
+type Get<'a> = &'a dyn Fn(u64, u64) -> Result<ChangelogPage, ApiError>;
+
+/// 从 `lo` 之后读回 410（那一段已修剪）、从 `hi` 之后读得到：最小的读得到的位置（二分，几次请求）。
+fn first_kept(get: Get, mut lo: u64, mut hi: u64) -> u64 {
+    while hi > lo + 1 {
+        let mid = lo + (hi - lo) / 2;
+        match get(mid, 0) {
+            Err(e) if e.status == 410 => lo = mid,
+            _ => hi = mid,
+        }
+    }
+    hi
+}
+
+/// 从 `after` 之后读回了 410（见文件头）：问一次最新的 seq，回还在的最早一条之前的位置，标准错误上提示一句。
+fn after_trimmed(get: Get, after: u64) -> Result<u64, ApiError> {
+    let last = get(u64::MAX - 1, 0)?.last_seq; // after 很大：不取事件，只要最新的 seq
+    let next = first_kept(get, after, last.max(after + 1));
+    crate::fail(format!("（seq {next} 及更早的事件已被修剪）"));
+    Ok(next)
+}
+
+/// `-f` 的一次长轮询：(这一页, 下一次从哪里接着读)；还没读到的一段已被修剪（410）→ 这一次没有页，从还在的最早一条接着等。
+fn follow_once(get: Get, next: u64) -> Result<(Option<ChangelogPage>, u64), ApiError> {
+    match get(next, WAIT_MS) {
+        Ok(p) => {
+            let at = p.next;
+            Ok((Some(p), at))
+        }
+        Err(e) if e.status == 410 => Ok((None, after_trimmed(get, next)?)),
+        Err(e) => Err(e),
+    }
+}
+
 /// 这个错误像是 leader 正在换（见文件头）：连不上（status 0）或 503。
 fn leader_changing(e: &ApiError) -> bool {
     e.status == 0 || e.status == 503
@@ -82,7 +119,8 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
             out(p.events.iter().map(line).collect::<Vec<_>>().join("\n"))
         }
     };
-    let last = match page(&c, u64::MAX - 1, 0) {
+    let get = |after, wait_ms| page(&c, after, wait_ms);
+    let last = match get(u64::MAX - 1, 0) {
         Ok(p) => p.last_seq, // after 很大：不取事件，只要最新的 seq
         Err(e) => return failed(api.json, &e),
     };
@@ -90,8 +128,15 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
     let mut next = last.saturating_sub(n);
     let mut printed = false;
     while next < last {
-        let p = match page(&c, next, 0) {
+        let p = match get(next, 0) {
             Ok(p) => p,
+            Err(e) if e.status == 410 => match after_trimmed(&get, next) {
+                Ok(at) => {
+                    next = at;
+                    continue;
+                }
+                Err(e) => return failed(api.json, &e),
+            },
             Err(e) => return failed(api.json, &e),
         };
         if p.events.is_empty() {
@@ -113,8 +158,8 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
     let mut failing_since = None;
     loop {
         let t0 = clock::mono_ms();
-        let p = match page(&c, next, WAIT_MS) {
-            Ok(p) => p,
+        let (p, at) = match follow_once(&get, next) {
+            Ok(x) => x,
             Err(e) if leader_changing(&e) && t0 - *failing_since.get_or_insert(t0) < FOLLOW_RETRY_MS => {
                 std::thread::sleep(Duration::from_secs(1)); // 换 leader：保留 next，隔 1 s 再问
                 continue;
@@ -122,7 +167,8 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
             Err(e) => return failed(api.json, &e),
         };
         failing_since = None;
-        next = p.next;
+        next = at;
+        let Some(p) = p else { continue }; // 跳过了被修剪的一段：从那里接着等
         if !p.events.is_empty() && print(&p) != 0 {
             return 1;
         }
@@ -132,7 +178,31 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::pause_ms;
+    use super::*;
+
+    /// 假的服务端：seq ≤ 98 的已被修剪（after < 98 → 410），最新的是 500。
+    fn fake(after: u64, _wait: u64) -> Result<ChangelogPage, ApiError> {
+        match after {
+            a if a < 98 => Err(ApiError { status: 410, code: "gone".into(), message: "已修剪".into() }),
+            a if a >= 500 => Ok(ChangelogPage { events: vec![], next: 500, last_seq: 500 }),
+            a => Ok(ChangelogPage { events: vec![], next: a + 1, last_seq: 500 }),
+        }
+    }
+
+    /// `-f` 等着的时候还没读到的一段被修剪了：不报错退出，跳到还在的最早一条之前接着等（同 tail 开头那段）。
+    #[test]
+    fn follow_skips_a_trimmed_gap_instead_of_failing() {
+        assert_eq!(follow_once(&fake, 10).map(|(p, at)| (p.is_none(), at)), Ok((true, 98)), "从 98 之后接着读");
+        assert_eq!(follow_once(&fake, 200).map(|(p, at)| (p.is_some(), at)), Ok((true, 201)));
+        let down = |_: u64, _: u64| -> Result<ChangelogPage, ApiError> {
+            Err(ApiError { status: 0, code: "unavailable".into(), message: "连不上".into() })
+        };
+        assert_eq!(
+            follow_once(&down, 10).err().map(|e| e.status),
+            Some(0),
+            "别的错误照旧交给调用者（换 leader 的重试）"
+        );
+    }
 
     #[test]
     fn follow_does_not_busy_loop_when_the_server_does_not_hold_the_poll() {

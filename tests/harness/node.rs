@@ -29,7 +29,8 @@ use wmfs_core::net::client::{Endpoint, RpcClient};
 use wmfs_core::proto::meta::{MetaOp, MetaReply, O_RDONLY, OpenOut, SetAttrIn};
 use wmfs_core::server::{self, Running};
 use wmfs_plugins::{
-    crc32c, fifo, gc, label_match, local_fs, path_caps, posix_acl, posix_mode, quota, replica, shared_key, tcp,
+    aes_gcm, blake3, crc32c, fifo, gc, label_match, local_fs, lz4, path_caps, posix_acl, posix_mode, quota, reconciler,
+    replica, scrub, shared_key, tcp, xxh3, zstd,
 };
 
 use super::meta::admin_ctx;
@@ -46,7 +47,8 @@ pub fn free_port() -> u16 {
     }
 }
 
-/// 与 `cli/src/registry.rs` 默认装的同一组插件。
+/// 与 `cli/src/registry.rs` 默认装的同一组插件。实现注记（M11）：变换插件都装（它们只在用到时才起作用）；协调器、scrub 与 gc 的本地
+/// 孤儿扫描只在 [`set_full_bg`] 打开之后装进来（老的用例不希望后台悄悄迁移、修复它们的数据）——同一个测试进程里 init 与 start 用同一个开关。
 pub fn plugins(cfg: &NodeConfig) -> PluginSet {
     let mut s = PluginSet::new(&cfg.plugins.disable);
     s.transport(Arc::new(tcp::TcpTransport::new(&cfg.plugin_cfg("tcp"), cfg.net.write_timeout_ms).unwrap()));
@@ -58,12 +60,29 @@ pub fn plugins(cfg: &NodeConfig) -> PluginSet {
     s.placement(Arc::new(label_match::LabelMatch::new()));
     s.chunk_store(Arc::new(local_fs::LocalFs::new()));
     s.transform(Arc::new(crc32c::Crc32c::new()));
+    s.transform(Arc::new(xxh3::Xxh3::new()));
+    s.transform(Arc::new(blake3::Blake3::new()));
+    s.transform(Arc::new(lz4::Lz4::new()));
+    s.transform(Arc::new(zstd::Zstd::new()));
+    s.transform(Arc::new(aes_gcm::AesGcm::new()));
     s.codec(Arc::new(replica::Replica::new()));
     s.qos(Arc::new(fifo::Fifo::new()));
     s.bg_task(Box::new(gc::Gc::new()));
+    if FULL_BG.load(std::sync::atomic::Ordering::Relaxed) {
+        s.bg_task(Box::new(gc::GcLocal::new()));
+        s.bg_task(Box::new(reconciler::Reconciler::new()));
+        s.bg_task(Box::new(scrub::Scrub::new()));
+    }
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST);
     s.validate(&cfg.plugin).unwrap();
     s
+}
+
+static FULL_BG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 这个测试进程里之后 init / start 的节点都装上协调器、scrub 与 gc 的本地孤儿扫描（M11 的用例）。
+pub fn set_full_bg() {
+    FULL_BG.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 测试用的临时目录 `<tmp>/wmfs-<名字>-<pid>`：丢弃时（包括测试失败 panic 时）删掉，不在 /tmp 留下垃圾。

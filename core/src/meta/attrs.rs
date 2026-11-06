@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use wmfs_api::metrics::{self, Counter};
 
 use crate::base::{ErrCode, lock};
-use crate::data::format::{CK_BLAKE3, CK_CRC32C, CK_XXH3, CMP_NONE};
+use crate::data::format::{CK_BLAKE3, CK_CRC32C, CK_XXH3, CMP_LZ4, CMP_NONE, CMP_ZSTD};
 use crate::meta::attr_registry::{self, AttrKind, attr_ttl_ms};
 use crate::meta::engine::txn::{KvRead, KvTxn};
 use crate::meta::ns::acl;
@@ -263,6 +263,9 @@ fn set_typed_field(eff: &mut EffectiveAttrs, key: &str, v: &str) -> Option<()> {
         "stripe" => eff.stripe = v.parse().ok()?,
         "inline" => eff.inline_max = v.parse().ok()?,
         "checksum" => eff.checksum = checksum_id(v)?,
+        "compress" => (eff.compress, eff.compress_level) = compress_id(v)?,
+        "encrypt" if v == "none" => eff.encrypt_key = 0,
+        "encrypt" => eff.encrypt_key = v.parse().ok()?, // 存的是数据密钥的数字 id（attr_ops::set 换好的）
         "acl.default" => eff.acl_default = Some(acl::encode(&acl::parse_text(v).ok()?)),
         "consistency" => {
             eff.consistency = CONSISTENCY_CTO; // strong 在 M12
@@ -271,6 +274,16 @@ fn set_typed_field(eff: &mut EffectiveAttrs, key: &str, v: &str) -> Option<()> {
         _ => return None,
     }
     Some(())
+}
+
+/// 规范化的压缩写法（`none`、`lz4`、`zstd:<级别>`）→ (算法编号, 级别)。
+pub fn compress_id(v: &str) -> Option<(u8, i8)> {
+    match v.split_once(':') {
+        None if v == "none" => Some((CMP_NONE, 0)),
+        None if v == "lz4" => Some((CMP_LZ4, 0)),
+        Some(("zstd", n)) => Some((CMP_ZSTD, n.parse().ok()?)),
+        _ => None,
+    }
 }
 
 /// 校验算法名 → 编号（3.2.4）。

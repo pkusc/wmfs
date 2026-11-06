@@ -10,7 +10,8 @@
 //! 是这条链的 head（写类）或一个 Serving 成员（读），然后才按 cap 的权限位与 chunk 身份放行。
 //!
 //! 实现注记（M5）：QosSpec 先只带存储类的低优先级标记（mclock 的份额在 M13）；后台请求 = cap 带管理权限位（`proto/cap.rs` 的注记）；
-//! 只读的 target（3.2.3）上写、截断与 DeleteEpoch 一律 `EROFS`。
+//! 只读的 target（3.2.3）上写、截断与 DeleteEpoch 回 `EROFS`。实现注记（M11）：运行中坏了的 target（连续提交失败，`Target::broken`）
+//! 上的写与截断改回可重试的 `NOT_SERVING`（write.rs：等链管理器把它移出写路径）；DeleteEpoch 照旧 `EROFS`（gc 下一轮再试）。
 //! 实现注记（M9）：校验多了 I5（租约、boot_id、集群图不旧，不满足 → `FENCED`，`chain.rs`）；读到有未提交版本的 chunk、本成员又不是
 //! last serving → `CHUNK_DIRTY{extra = L}`（3.4.2.5；实现注记（M10）：本成员刚从 Syncing 被提升为 last serving、还在一个 target 租约之内
 //! → `BUSY`，ADR-0040 第 11 条，`chain::note_promotions`；M10 审查：刚从排在 L 前面的 Serving 成为 last serving 时只对被占着的 chunk 回
@@ -256,8 +257,8 @@ fn exec(node: &Arc<DataNode>, call: DataCall, bulk: Option<Buf>) -> Result<Done,
             if cap.ino != ino || cap.epoch != epoch || !cap.chains.contains(&chain) {
                 return Err(ErrCode::BAD_CAP.into());
             }
-            if t.read_only {
-                return Err(ErrCode::EROFS.into()); // 与写、截断一样（3.2.3：只读的 target 不进写路径）
+            if t.read_only() {
+                return Err(ErrCode::EROFS.into()); // 只读的 target 不写盘（启动时就只读的与运行中坏了的都是，见文件头）
             }
             replica::drop_epoch(node, chain, ino, epoch);
             let files = node.store(|| t.store.delete_epoch(chain, ino, epoch))?;

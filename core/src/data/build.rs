@@ -26,12 +26,13 @@ use crate::proto::cap::CapV1;
 fn encode(node: &DataNode, cap: &CapV1, id: &ChunkId, i: u32, b: Buf) -> Result<(Buf, BlockEntry), ErrCode> {
     let mut meta = BlockMeta { plain_len: b.len() as u32, ..Default::default() };
     let aad = block_aad(&node.cluster_id, id.ino, id.epoch, id.idx, i);
+    let key = if cap.encrypt != ENC_NONE { node.keys.get(node, cap.encrypt_key) } else { None }; // M11：数据密钥
     let ctx = TransformCtx {
         chunk: id,
         block_idx: i,
         level: cap.compress_level,
         key_id: cap.encrypt_key,
-        key: None,
+        key: key.as_ref(),
         aad: &aad,
     };
     let pool = &node.pool;

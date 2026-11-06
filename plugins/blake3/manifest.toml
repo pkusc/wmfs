@@ -1,0 +1,13 @@
+# blake3 transform 插件的 manifest（design.md 3.7.1、4.8）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "blake3"
+version = "0.1.0"
+hooks = ["transform"]
+altitude = 703
+hot_path = true
+abi_version = 1
+attrs = ["checksum"]
+budget_ns = 60000
+fail_points = ["plugin.blake3.transform"]
+
+[config_schema]
+# 没有部署参数：用哪种校验和是目录属性 checksum（wmfs set <目录> checksum=blake3）

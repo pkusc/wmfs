@@ -11,7 +11,7 @@ path = "lib.rs"
 
 [dependencies]
 wmfs-core.workspace = true
-wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc"] }
+wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc", "xxh3", "blake3", "lz4", "zstd", "aes-gcm", "reconciler", "scrub"] }
 plugin-mem-transport.workspace = true
 crc32c.workspace = true
 redb.workspace = true
@@ -269,3 +269,25 @@ path = "it/jepsen_register.rs"
 name = "replica_check"
 path = "it/replica_check.rs"
 
+
+# M11：后台任务（协调器、迁移原语、scrub、gc 的完整版）。用到 fail point 的单独一个测试程序。
+[[test]]
+name = "bg_reconcile"
+path = "it/bg_reconcile.rs"
+
+[[test]]
+name = "failpoint_migrate"
+path = "it/failpoint_migrate.rs"
+
+[[test]]
+name = "scrub_repair"
+path = "it/scrub_repair.rs"
+
+[[test]]
+name = "gc_full"
+path = "it/gc_full.rs"
+
+# M11 审查：多节点上的后台任务（换 leader 后从持久化的游标续走、scrub 的第 2 段、读路径马上修复、只做数据的节点不受控制）。
+[[test]]
+name = "bg_cluster"
+path = "it/bg_cluster.rs"

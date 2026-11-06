@@ -45,7 +45,7 @@ accept_m4() {
     check "MetaClient 跟随 NOT_LEADER 的 leader_hint，没有 hint 时换下一个认识的节点" \
         one_test --release -p wmfs-testkit --test meta_ns_engine client_follows_the_leader_hint_and_rotates_without_one
     check "leader_hint = leader 在 control_scheme 上的地址（leader 是自己、是别人、未知；与 health 共用一套逻辑）" \
-        one_test --release -p wmfs-core --lib server::tests::leader_hint_is_the_leaders_control_scheme_address
+        one_test --release -p wmfs-core --lib server::roles::tests::leader_hint_is_the_leaders_control_scheme_address
     check "集群图按角色过滤：client 与 admin 拿到的不含 keys、datakeys，server 角色的有" \
         one_test --release -p wmfs-testkit --test meta_ns_engine only_servers_get_the_keys_in_the_cluster_map
     check "fail point meta.reply.drop：回复被吞 → 一个 RPC 超时后用同一个 seq 重试 → 去重命中、结果成功（不是 EEXIST）；它开着时关闭与打开会话照常；一个请求卡在重试里时同一会话的 300 个新修改挤不掉它的去重记录（在途窗口按 seq 计）" \

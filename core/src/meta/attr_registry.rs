@@ -3,7 +3,8 @@
 //! 知道注册表）：按逗号切成片段；`k=v` 且 k 是顶层属性名 → 开始一个新属性；k 是当前属性的子键 → 归到当前属性；其他 → "未知属性 k"。
 //!
 //! M7 的键：class、replicas、chunk、stripe、inline、checksum、consistency（`cto` 与子键 `attr_ttl`；`strong` 在 M12 之前回
-//! `EOPNOTSUPP`）、inherit。后面里程碑才实现的键（[`LATER`]）与二期功能（ec、snapshot）设置时回 `EOPNOTSUPP`；`wasm:` 开头的值回
+//! `EOPNOTSUPP`）、inherit；M10 的 quota、`quota.<类>`、acl.default；M11 的 compress、encrypt（存成数据密钥的数字 id）。
+//! 后面里程碑才实现的键（[`LATER`]）与二期功能（ec、snapshot）设置时回 `EOPNOTSUPP`；`wasm:` 开头的值回
 //! `FEATURE_UNSUPPORTED`（"二期功能"，3.7.7）——都不静默接受。
 //!
 //! 规范化（存进 DIRATTR 的值，3.2.7）：尺寸存字节数（`1M` → `1048576`）、名字原样；显示时换回来（[`AttrSpec::show`]）。实现注记
@@ -82,8 +83,9 @@ const fn spec(
 /// 配额的子键（3.8 的切分：跟在 `quota=…` 后面）。
 const QUOTA_SUBKEYS: &[&str] = &["soft", "grace", "files", "quantum"];
 
-/// 全部键（顺序就是 `wmfs get` 的显示顺序）：M7 的 8 个，M10 的 quota、`quota.<类>`（注册表里写成 `quota.*`，按前缀匹配）、acl.default。
-pub static REGISTRY: [AttrSpec; 11] = [
+/// 全部键（顺序就是 `wmfs get` 的显示顺序）：M7 的 8 个，M10 的 quota、`quota.<类>`（注册表里写成 `quota.*`，按前缀匹配）、acl.default，
+/// M11 的 compress、encrypt（加在最后：前面的键的位置不变）。
+pub static REGISTRY: [AttrSpec; 13] = [
     spec(
         "class",
         parse_class,
@@ -115,19 +117,13 @@ pub static REGISTRY: [AttrSpec; 11] = [
         takes_rest: true,
         ..spec("acl.default", parse_acl, show_as_is, Effect::NewFiles, &["core", "posix-acl"])
     },
+    spec("compress", parse_compress, show_as_is, Effect::NewDataAndReconcile, &["lz4", "zstd", "reconciler"]),
+    spec("encrypt", parse_encrypt, show_encrypt, Effect::NewDataAndReconcile, &["aes-gcm", "reconciler"]),
 ];
 
 /// 后面的里程碑才实现的键：设置 → `EOPNOTSUPP`（`quota.<类>` 按前缀 `quota.` 匹配）。
-pub const LATER: &[(&str, &str)] = &[
-    ("compress", "M11"),
-    ("encrypt", "M11"),
-    ("trash", "M12"),
-    ("ttl", "M12"),
-    ("audit", "M12"),
-    ("qos", "M13"),
-    ("tier", "M13"),
-    ("locality", "M13"),
-];
+pub const LATER: &[(&str, &str)] =
+    &[("trash", "M12"), ("ttl", "M12"), ("audit", "M12"), ("qos", "M13"), ("tier", "M13"), ("locality", "M13")];
 /// 二期功能的键（第 5 章）：设置 → `EOPNOTSUPP`"二期功能"。
 const PHASE2: &[&str] = &["ec", "snapshot"];
 
@@ -308,6 +304,37 @@ fn parse_consistency(v: &str, subs: &[(String, String)]) -> Result<String, Strin
 fn parse_acl(v: &str, subs: &[(String, String)]) -> Result<String, String> {
     no_subkeys(subs)?;
     acl::parse_text(v).map(|a| acl::to_text(&a))
+}
+
+/// `none` / `lz4` / `zstd` / `zstd:1..=19` → `none`、`lz4`、`zstd:<级别>`（只写 zstd = 级别 3，zstd 自己的默认值）。
+fn parse_compress(v: &str, subs: &[(String, String)]) -> Result<String, String> {
+    no_subkeys(subs)?;
+    match v.split_once(':') {
+        None if v == "none" || v == "lz4" => Ok(v.to_string()),
+        None if v == "zstd" => Ok("zstd:3".into()),
+        Some(("zstd", n)) => int_in(n, 1, 19).map(|n| format!("zstd:{n}")),
+        _ => Err("应是 none、lz4、zstd 或 zstd:1…19".into()),
+    }
+}
+
+/// 数据密钥的名字：1–64 个字母、数字或 `.` `_` `-`（`wmfs datakey create` 与 `encrypt=tenant:<名字>` 共用）。
+pub fn datakey_name_ok(name: &str) -> bool {
+    (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// `none` / `tenant:<名字>`：先原样留着名字；设置时（执行器闭包里，`attr_ops::set`）点查 DATAKEY_NAME 换成数据密钥的数字 id 再存（3.8）。
+fn parse_encrypt(v: &str, subs: &[(String, String)]) -> Result<String, String> {
+    no_subkeys(subs)?;
+    match v.strip_prefix("tenant:") {
+        _ if v == "none" => Ok(v.into()),
+        Some(name) if datakey_name_ok(name) => Ok(v.into()),
+        _ => Err("应是 none 或 tenant:<数据密钥的名字>（名字 1–64 个字母、数字或 . _ -）".into()),
+    }
+}
+
+/// DIRATTR 里存的是数据密钥的 id（不知道名字时的显示；`attr_ops` 有集群图，显示成 `tenant:<名字>`）。
+fn show_encrypt(s: &str) -> String {
+    if s == "none" || s.starts_with("tenant:") { s.to_string() } else { format!("tenant:#{s}") }
 }
 
 fn parse_inherit(v: &str, subs: &[(String, String)]) -> Result<String, String> {

@@ -25,20 +25,21 @@
 //! 规范化的存储形式：`off`，或 `<hard 字节>[,soft=<字节>][,grace=<毫秒>][,files=<n>][,quantum=<字节>]`（只存写了的子键；没写 grace 时
 //! 宽限 7 天、没写 quantum 时 64 MiB——缺省值只在这里，不在插件配置里）。指标 `wmfs_quota_grants_total`（授予了有限额度的次数，7.3）。
 
+mod usage;
+pub use usage::{over, quotas_of, semantics, usage};
+
 use std::time::Duration;
 
 use wmfs_api::metrics;
 
-use crate::api::types::{ClassUsage, QuotaUsage, UsageReply};
 use crate::base::units::{fmt_duration, fmt_size, parse_duration, parse_size};
-use crate::base::{ErrCode, Failed, log};
+use crate::base::{ErrCode, log};
 use crate::hooks::traits::{QuotaDecision, QuotaInput, QuotaScope};
 use crate::meta::attr_registry::Parsed;
 use crate::meta::attrs::QuotaDecl;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
 use crate::meta::ns::common::{Node, is_file};
-use crate::meta::ns::read_ops::{node_at, path_of};
 use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys::{self, QUOTA_CLASS_TOTAL};
 use crate::meta::schema::kv;
@@ -291,8 +292,8 @@ pub fn commit_growth(v: &mut dyn KvTxn, c: &OpCtx, n: &Node, grow: u64, want_quo
     }
     for s in &ss {
         let after = used_of(s.class, &s.used).0.saturating_add(grow);
-        let over = after > s.hard_bytes.saturating_add(GUARD_QUANTA * s.quantum);
-        if want_quota || over || (grow > s.quantum && after > s.hard_bytes) {
+        let past_guard = after > s.hard_bytes.saturating_add(GUARD_QUANTA * s.quantum);
+        if want_quota || past_guard || (grow > s.quantum && after > s.hard_bytes) {
             return Err(ErrCode::EDQUOT); // 专门来要额度（见文件头）、不守协议的客户端，或单次增长超过 quantum 且超了硬限
         }
     }
@@ -321,9 +322,10 @@ pub fn note_set(v: &mut dyn KvTxn, c: &OpCtx, dir: u64, items: &[Parsed]) -> Res
     for p in items.iter().filter(|p| matches!(p.spec.key, "quota" | "quota.*")) {
         let class = key_class(v, &p.key)?; // 类的存在已由 attr_ops 检查过
         let (used, key) = (rstat::get(v, dir)?, state_key(dir, class));
-        let over = |norm: &str| decl(norm, class).filter(|q| q.soft > 0 && used_of(class, &used).0 > q.soft);
-        let timing = before.get(&p.key).and_then(|o| over(o)).is_some() && kv::get::<QuotaStateV1>(v, &key)?.is_some();
-        match over(&p.norm) {
+        let over_soft = |norm: &str| decl(norm, class).filter(|q| q.soft > 0 && used_of(class, &used).0 > q.soft);
+        let timing =
+            before.get(&p.key).and_then(|o| over_soft(o)).is_some() && kv::get::<QuotaStateV1>(v, &key)?.is_some();
+        match over_soft(&p.norm) {
             Some(_) if timing => {} // 重放同一份配置不把宽限期一再推后（ADR-0041 第 8 条 ②）
             Some(q) => soft_warn(v, c, &scope(dir, &q, used, 0))?,
             None => v.delete(&key),
@@ -358,43 +360,4 @@ pub fn decl_text(q: &QuotaDecl, class: Option<&str>) -> String {
     }
     s += &format!(",grace={},quantum={}", fmt_duration(Duration::from_millis(q.grace_ms)), fmt_size(q.quantum));
     class.map_or(s.clone(), |k| format!("{k}:{s}"))
-}
-
-/// `GET /api/v1/usage`（3.9，M7）：目录的递归用量（RSTAT，常量时间）；实现注记（M10）：另给它与它上面的每个配额（`UsageReply.quotas`，
-/// 只增：用量、上限、软限的计时与宽限剩余）。
-pub fn usage(v: &dyn KvRead, c: &OpCtx, path: &str) -> Result<UsageReply, Failed> {
-    let n = node_at(v, c, path)?;
-    if !n.is_dir() {
-        return Err(Failed::new(ErrCode::ENOTDIR, format!("递归用量只对目录：{path} 不是目录")));
-    }
-    let r = rstat::get(v, n.ino)?;
-    let per_class =
-        r.per_class.iter().map(|(k, b, f)| ClassUsage { class: c.map.class_name(*k), bytes: *b, files: *f });
-    let per_class = per_class.collect();
-    let mut quotas = Vec::new();
-    for s in scopes(v, c, n.ino, None)? {
-        let (used_bytes, used_files) = used_of(s.class, &s.used);
-        let left = (s.soft_since_ms > 0).then(|| (s.soft_since_ms + s.grace_ms).saturating_sub(c.req.now_ms));
-        quotas.push(QuotaUsage {
-            dir: path_of(v, s.dir)?,
-            class: s.class.map(|k| c.map.class_name(k)),
-            hard: s.hard_bytes,
-            soft: s.soft_bytes,
-            grace_ms: s.grace_ms,
-            files: s.hard_files,
-            quantum: s.quantum,
-            used_bytes,
-            used_files,
-            soft_since_ms: s.soft_since_ms,
-            grace_left_ms: left,
-        });
-    }
-    Ok(UsageReply { path: path.into(), bytes: r.bytes, files: r.files, dirs: r.dirs, per_class, quotas })
-}
-
-/// `wmfs get` 的 semantics 行里配额的那一段（3.1.5）：最近的那个配额的 quantum 与超限上界、来源；没有配额 → `quota=none`。
-pub fn semantics(v: &dyn KvRead, quotas: &[(u64, QuotaDecl)]) -> Result<String, ErrCode> {
-    let Some((d, q)) = quotas.first() else { return Ok("quota=none".into()) };
-    let qs = fmt_size(q.quantum);
-    Ok(format!("quota=quantum:{qs} overshoot<={qs}*writers (来源 {})", path_of(v, *d)?))
 }

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use wmfs_core::api::types::{ChangelogPage, Health, KeyFile, PluginsReply};
 use wmfs_core::base::config::NodeConfig;
 use wmfs_mgr::api::ApiClient;
-use wmfs_testkit::harness::node::{TempDir, free_port, init, node_dir};
+use wmfs_testkit::harness::node::{TempDir, free_port, init, node_dir, set_full_bg};
 
 /// 一个 `wmfs server` 子进程（stdout/stderr 追加到 `<节点>/stdout.log`；它自己的日志在 `<节点>/logs/server.log`）：丢弃时结束它。
 struct Server(Child);
@@ -60,6 +60,7 @@ fn wmfs(nd: &Path, mgmt: &str, args: &[&str]) -> Output {
 
 #[test]
 fn a_changed_plugin_list_stops_the_node_with_exit_code_3_until_it_adopts_its_local_plugins() {
+    set_full_bg(); // 真的 wmfs server 装着全部插件（含 M11 的后台任务）：init 写的集群清单要与它一致
     let dir = TempDir::new("plugin-list");
     init(&dir.0);
     let nd = node_dir(&dir.0);
@@ -112,6 +113,7 @@ struct Three {
 }
 
 fn three(name: &str) -> (Three, Vec<Server>) {
+    set_full_bg(); // 同上
     let dir = TempDir::new(name);
     init(&dir.0);
     let n1 = node_dir(&dir.0);

@@ -132,9 +132,13 @@ impl PluginSet {
         }
     }
 
+    /// 一个插件可以带几个后台任务（实现注记（M11）：gc 的 leader 部分与数据节点上的本地孤儿扫描是两个任务、一个插件）：同一个 manifest
+    /// 只登记一次。
     pub fn bg_task(&mut self, t: Box<dyn BgTask>) {
         if self.enabled(t.manifest()) {
-            self.bg_manifests.push(t.manifest());
+            if !self.bg_manifests.iter().any(|m| std::ptr::eq(*m, t.manifest())) {
+                self.bg_manifests.push(t.manifest());
+            }
             lock(&self.bg_tasks).push(t);
         }
     }
