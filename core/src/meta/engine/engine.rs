@@ -29,6 +29,7 @@ use crate::hooks::pipeline::{HookCall, Pipeline};
 use crate::hooks::traits::KeyLookup;
 use crate::meta::attrs::AttrResolver;
 use crate::meta::cluster::map::MapCache;
+use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::raft::driver::{Driver, DriverOpts, ProposeOutcome, Published, RaftInput};
 use crate::meta::raft::peers::RaftNet;
 use crate::meta::raft::redb_eio;
@@ -81,11 +82,13 @@ pub struct OpEnv {
     pub attrs: AttrResolver,
     pub maps: MapCache,
     pub cap_key: [u8; 32],
+    pub usage: Arc<TargetUsage>, // leader 内存里的 target 心跳情况（与 MetaService 共用一份，M13）
 }
 
 impl OpEnv {
     pub fn new(pipeline: Arc<Pipeline>, cap_key: [u8; 32]) -> OpEnv {
-        OpEnv { pipeline, attrs: AttrResolver::default(), maps: MapCache::default(), cap_key }
+        let (attrs, maps, usage) = (AttrResolver::default(), MapCache::default(), Arc::default());
+        OpEnv { pipeline, attrs, maps, cap_key, usage }
     }
 
     /// 一个操作的上下文：`map` 是这个批次（或这个只读请求）的集群图快照，集群参数取自它。
@@ -97,6 +100,7 @@ impl OpEnv {
             map,
             settings: &map.settings,
             cap_key: &self.cap_key,
+            usage: &self.usage,
         }
     }
 }
@@ -192,6 +196,11 @@ impl EmbeddedEngine {
         let raft = Mutex::new(Some(raft));
         let (node_id, plugins) = (o.node_id, o.plugins);
         Ok(Arc::new(EmbeddedEngine { shared, exec_tx, hook, gate_secs, raft, node_id, plugins, net }))
+    }
+
+    /// leader 内存里的 target 心跳情况（MetaService 记心跳、闭包里按用量放置，M13）。
+    pub fn target_usage(&self) -> Arc<TargetUsage> {
+        self.shared.env.usage.clone()
     }
 
     /// 元数据网络（服务端装配时把 RaftMsg 与 SnapshotFetch 登记到 RpcServer；没有 RPC 客户端的组件测试是 None）。

@@ -257,6 +257,7 @@ pub fn status(a: StatusArgs) -> i32 {
             };
             let files = match (x.key.as_str(), a.files, a.mismatched_files) {
                 ("ttl", Some(f), Some(m)) => format!("；{f} 个已有文件里 {m} 个已经过期、还没被删"), // M12
+                ("tier", Some(f), Some(m)) => format!("；{f} 个已有文件里 {m} 个该分层、还没迁过去"), // M13
                 ("trash", Some(f), _) => format!("；回收站里 {f} 个文件、{}", human(a.bytes.unwrap_or(0))),
                 (_, Some(f), Some(m)) if a.migrates == Some(false) => {
                     format!("；{f} 个已有文件里 {m} 个不同（不迁移）")
@@ -266,9 +267,10 @@ pub fn status(a: StatusArgs) -> i32 {
                 }
                 _ => String::new(),
             };
-            let lag = a.lag.map_or(String::new(), |n| format!("；审计消费者落后 {n} 条")); // M12：audit-log 游标
+            let mut extra = a.lag.map_or(String::new(), |n| format!("；审计消费者落后 {n} 条")); // M12：audit-log 游标
+            extra += &a.deficit.map_or(String::new(), |n| format!("；保底欠额 {n} 成本单位/秒")); // M13：qos
             s += &format!(
-                "\n  {:<12} 声明 {}（{from}），实际 {}{short}{files}{lag}  {ok}",
+                "\n  {:<12} 声明 {}（{from}），实际 {}{short}{files}{extra}  {ok}",
                 x.key, x.declared, a.new_files
             );
             for q in a.quotas.iter().flatten() {

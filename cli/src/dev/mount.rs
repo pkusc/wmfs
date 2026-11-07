@@ -6,7 +6,8 @@
 //!   退出或 30 s 超时 → 还挂着就 lazy 卸载、打印日志路径与最后一行、非 0 退出；实现注记（M7，ADR-0037 第 14 条）：这时只删记录里的
 //!   pid 与挂载点，mount.log 留着给人看——`dev down` 时随记录目录一起删），然后把它打印的集群警告与"已挂载"转出来。
 //!   记录目录的名字 = 挂载点的最后一段（重名时加 `-2`、`-3`……）；按挂载点找记录时扫一遍 `mounts/`，比对各自的 `mountpoint`
-//!   文件。实现注记（M6）：7.2 的 `--node n`（客户端冒充那个节点所在的"主机"）随 M13 的 locality。
+//!   文件。实现注记（M13）：`--node n` = 客户端冒充第 n 个节点所在的"主机"（给 wmfs mount 传 `--host-id host-<n>`：开发节点的 host_id
+//!   是 `host-<n>`），给 locality 演示。
 //! - `dev umount <挂载点>`：`fusermount3 -u`，等挂载进程退出（它写出全部脏数据后自己退出），删掉记录。
 //! - `dev client-pid <挂载点>`：打印挂载进程的 pid（M10 用 `kill -STOP` 冻住它演示驱逐）；[`session_of`]：挂载日志里它现在的会话号。
 //! - `dev down` 先清理挂载、再停节点（否则节点停了以后挂载点上的命令会卡到 `--op-timeout`）：对每个开发挂载进程依次 SIGCONT
@@ -73,7 +74,13 @@ fn write_file(p: &Path, text: &str) -> Result<(), String> {
     sys::atomic_write(p, text.as_bytes()).map_err(|e| format!("写 {} 失败：{e}", p.display()))
 }
 
-pub fn mount(d: &Path, mp: &Path, key_file: &Option<PathBuf>, cache: &Option<String>) -> Result<Vec<String>, String> {
+pub fn mount(
+    d: &Path,
+    mp: &Path,
+    key_file: &Option<PathBuf>,
+    cache: &Option<String>,
+    node: Option<u32>,
+) -> Result<Vec<String>, String> {
     let mp = canon(mp)?;
     if mounted(&mp) {
         return Err(format!("{} 上已经挂着 wmfs（先 wmfs dev umount）", mp.display()));
@@ -86,6 +93,10 @@ pub fn mount(d: &Path, mp: &Path, key_file: &Option<PathBuf>, cache: &Option<Str
     if addrs.is_empty() {
         return Err(format!("{} 里还没有开发集群：先 wmfs dev up", d.display()));
     }
+    if let Some(n) = node.filter(|n| !nodes(d).contains(n)) {
+        return Err(format!("--node {n}：开发集群里没有这个节点"));
+    }
+    let host = node.map(|n| format!("host-{n}")); // 开发节点 n 的 host_id（`dev up` 写进它的 node.toml，1.1）
     for (rec, _) in records(d).into_iter().filter(|(_, m)| *m == mp) {
         if let Some(pid) = mount_pid(&rec, &mp) {
             return Err(format!("{} 的挂载进程 {pid} 还在（先 wmfs dev umount）", mp.display()));
@@ -100,6 +111,9 @@ pub fn mount(d: &Path, mp: &Path, key_file: &Option<PathBuf>, cache: &Option<Str
         vec![OsStr::new("mount"), OsStr::new(&joined), mp.as_os_str(), OsStr::new("--key-file"), key.as_os_str()];
     if let Some(c) = cache {
         args.extend([OsStr::new("--cache"), OsStr::new(c)]);
+    }
+    if let Some(h) = &host {
+        args.extend([OsStr::new("--host-id"), OsStr::new(h)]);
     }
     let mut child = spawn_logged(&args, &log_path)?;
     write_file(&rec.join("mountpoint"), &mp.display().to_string())?;

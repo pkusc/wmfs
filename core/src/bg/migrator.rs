@@ -1,4 +1,4 @@
-//! 迁移原语 `Migrator::migrate(ino, declared)`（design.md 3.10 的六步，ADR-0027；实现注记（M11））：协调器、以后的 tiering、rebalance
+//! 迁移原语 `Migrator::migrate(ino, declared)`（design.md 3.10 的六步，ADR-0027；实现注记（M11））：协调器、tiering、rebalance
 //! 共用。把一个已有文件换到 `declared`（它的生效属性）描述的布局：新 epoch、按声明的存储类、副本数选的新链、按声明的压缩与加密编码。
 //!
 //! 1. 线性一致地读出 inode（layout L、change_id c、size s）。与声明没有差别（`status::differs`）→ `Same`；不是有链的普通文件、孤儿 →
@@ -11,7 +11,8 @@
 //! 2. **意图**（一个内部批次，CAS：c 与 L.epoch 都没变）：别人留下的 `pending_epoch` 记为垃圾；`max_epoch += 1`、
 //!    `pending_epoch = 新 epoch`；同一个闭包里按声明生成 L′（`ns::layout::new_layout`，`size_hint = s`；必要时生成新链）。
 //!    **不迁移**的参数沿用 L 的：chunk 大小、条带数、校验算法（第 5 章）；inline 阈值用声明的（经 `ns::layout::inline_of`：加密或
-//!    strong 时为 0），不沿用 L 的——不然加密之后再改回不加密，文件永远是 `inline_max = 0`（ADR-0042 第 11 条）。顺便签两张后台用的
+//!    strong 时为 0），不沿用 L 的——不然加密之后再改回不加密，文件永远是 `inline_max = 0`（ADR-0042 第 11 条）。rebalance（带 exclude）
+//!    排除之后剩下的链不够 L 的条带数 → 不搬（回 `Same`：不能让迁移原语把一个与声明一致的文件弄成条带数不足，M13 审查）。顺便签两张后台用的
 //!    cap（管理权限位、session 0）：读 L、写 L′。只与这一个文件有关的错（候选 target 都满了的 `ENOSPC`、存储类没了、`EOVERFLOW`）→
 //!    写日志、回 `Retry`（协调器把这一项留着、计入积压），不挡住遍历；集群层面可重试的错（失去 leader 等）才让这一步失败。
 //! 3. inline 文件：声明仍允许 inline → 只换元数据，直接到第 5 步；不允许（加密生效）→ 把 INLINE 内容按 L′ 写进 chunk 0
@@ -28,35 +29,34 @@
 //!    `pending_epoch`，回 `Retry`（协调器下一轮重做）。已经切换成这个 epoch 了（切换的回复丢了）就什么也不做。正在写的客户端随后的
 //!    `CommitWrite` 得到 `STALE_LAYOUT`，把缓冲重写到新布局——数据不会丢。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use wmfs_api::failpoint::{fail_point, fail_point_ms};
+use wmfs_api::failpoint::fail_point;
 use wmfs_api::metrics::{self, Counter, Gauge};
 
 use super::status::differs;
 use super::task::TaskCtx;
 use crate::base::types::{ChunkId, ReqCtx};
-use crate::base::{ErrCode, clock, lock, log};
+use crate::base::{ErrCode, clock, log};
 use crate::buf::{Lane, POOL_WAIT};
 use crate::client::data_client::{DataClient, chunk_id};
 use crate::meta::attrs::EffectiveAttrs;
 use crate::meta::changelog::{self, Change};
-use crate::meta::engine::txn::{KvRead, MetaEngine, OpCtx, TxnOp, txn_blocking, txn_value};
+use crate::meta::engine::txn::{KvRead, MetaEngine, OpCtx, txn_value};
 use crate::meta::ns::common::{Node, get, save, sign_cap};
 use crate::meta::ns::file_ops::{gc_epoch, gc_record};
-use crate::meta::ns::layout::new_layout;
+use crate::meta::ns::layout::{Hint, new_layout};
 use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys::{self, GC_MOVED};
 use crate::meta::schema::records::{F_INLINE, KIND_FILE, LayoutV1};
-use crate::meta::sessions::Live;
 use crate::meta::uninline::write_inline;
 use crate::net::retry::retryable;
 use crate::proto::cap::{RIGHT_ADMIN, RIGHT_READ, RIGHT_WRITE};
 use crate::proto::meta::MetaReply;
 
-/// 跳过多久之后告警（3.10："某个文件被跳过超过 24 h"）。
-const OPEN_ALERT_MS: u64 = 24 * 3600 * 1000;
+mod skip;
+use skip::Skipped;
 
 /// 一次迁移的结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,20 +79,6 @@ struct Caps {
     read: Vec<u8>,
     write: Vec<u8>,
     renew_at: u64,
-}
-
-/// 本任期里因写打开被跳过的文件（换 leader 后重新计时）；`shown` 是已经加进指标的个数（[`Migrator::show`]）。
-#[derive(Default)]
-struct Skipped {
-    term: u64,
-    files: HashMap<u64, SkipInfo>,
-    shown: usize,
-}
-
-#[derive(Clone, Copy)]
-struct SkipInfo {
-    since_ms: u64, // 第一次被跳过的时刻（mono_ms）
-    alerted: bool, // 告警过了吗
 }
 
 pub struct Migrator {
@@ -126,6 +112,18 @@ impl Migrator {
 
     /// 把 `ino` 迁到 `declared` 描述的布局（见文件头）。
     pub fn migrate(&self, ctx: &TaskCtx, ino: u64, declared: &EffectiveAttrs) -> Result<Migrated, ErrCode> {
+        self.migrate_away(ctx, ino, declared, &[])
+    }
+
+    /// 同 [`Migrator::migrate`]；`exclude` 不空时是 rebalance（实现注记（M13））：用着 `exclude` 里某条链的文件按 `declared` 换到别的链上
+    /// （新布局不用这些链；与声明一致也搬，inline 文件没有链、不搬）。
+    pub fn migrate_away(
+        &self,
+        ctx: &TaskCtx,
+        ino: u64,
+        declared: &EffectiveAttrs,
+        exclude: &[u32],
+    ) -> Result<Migrated, ErrCode> {
         let mut seen = None;
         ctx.meta.read(&ReqCtx::internal(), &mut |v, _c| {
             let n = get(v, ino)?;
@@ -136,7 +134,13 @@ impl Migrator {
         })?;
         let (n, content) = seen.ok_or(ErrCode::INTERNAL)?;
         let movable = n.rec.kind == KIND_FILE && n.rec.nlink > 0 && n.rec.layout.is_some();
-        if !movable || !differs(&n.rec, declared) {
+        let on = |l: &LayoutV1| l.chains.iter().any(|c| exclude.contains(c));
+        let want = if exclude.is_empty() {
+            differs(&n.rec, declared)
+        } else {
+            n.rec.flags & F_INLINE == 0 && n.rec.layout.as_ref().is_some_and(on) // rebalance：用着要搬走的链
+        };
+        if !movable || !want {
             self.forget(ino);
             let stale = movable && n.rec.pending_epoch != 0 && n.rec.flags & F_INLINE == 0;
             if stale
@@ -151,9 +155,10 @@ impl Migrator {
             self.note_skip(ctx.meta, ino);
             return Ok(Migrated::SkippedOpen);
         }
-        let mut it = match intent(ctx.meta, &n, declared) {
+        let mut it = match intent(ctx.meta, &n, declared, exclude) {
             Ok(it) => it,
             Err(ErrCode::STALE_LAYOUT) => return Ok(Migrated::Retry), // 读完之后有人改了它
+            Err(ErrCode::ENOSPC) if !exclude.is_empty() => return Ok(Migrated::Same), // rebalance：别的链放不下它（见文件头第 2 步）
             Err(e) if stop(e) => return Err(e),
             Err(e) => {
                 log::warn("bg", format_args!("迁移 inode {ino} 现在做不了：{e}（这一项留着，稍后再试）"));
@@ -181,62 +186,6 @@ impl Migrator {
             }
         }
     }
-
-    /// 已经不再写打开着的（关了、删了）跳过记录清掉（协调器每一轮开头调用，见文件头第 1 步）。
-    pub fn prune(&self, live: &Live) {
-        let mut s = lock(&self.skipped);
-        s.files.retain(|ino, _| live.is_write_open(*ino));
-        self.show(&mut s);
-    }
-
-    /// 不再是 leader：跳过记录全部清掉（指标归 0；新 leader 自己重新计）。
-    pub fn forget_all(&self) {
-        let mut s = lock(&self.skipped);
-        (s.term, s.files) = (0, HashMap::new());
-        self.show(&mut s);
-    }
-
-    fn forget(&self, ino: u64) {
-        let mut s = lock(&self.skipped);
-        if s.files.remove(&ino).is_some() {
-            self.show(&mut s);
-        }
-    }
-
-    /// 把跳过的个数报进指标。指标是进程级的：一个进程里跑着几个节点时（测试），各自 `set` 会互相盖掉（谁最后写算谁的），所以
-    /// 只加减自己的变化量，指标是本进程各节点之和（生产上一个进程一个节点：就是它自己的个数）。
-    fn show(&self, s: &mut Skipped) {
-        self.skipped_gauge.add(s.files.len() as f64 - s.shown as f64);
-        s.shown = s.files.len();
-    }
-
-    /// 记下"因写打开被跳过"（见文件头第 1 步）；到了告警的时候写一次 `PolicyViolation`。
-    fn note_skip(&self, eng: &dyn MetaEngine, ino: u64) {
-        let (term, now) = (eng.role().term, clock::mono_ms());
-        let alert = fail_point_ms("bg.migrate.open_alert_ms", OPEN_ALERT_MS);
-        let mut s = lock(&self.skipped);
-        if s.term != term {
-            (s.term, s.files) = (term, HashMap::new()); // 换了 leader：重新计时
-        }
-        let e = s.files.entry(ino).or_insert(SkipInfo { since_ms: now, alerted: false });
-        let (since, due) = (e.since_ms, !e.alerted && now.saturating_sub(e.since_ms) >= alert);
-        e.alerted |= due;
-        self.show(&mut s);
-        drop(s);
-        if due {
-            let extra = vec![
-                ("kind".into(), "migration_blocked_by_open".into()),
-                ("skipped_ms".into(), now.saturating_sub(since).to_string()),
-            ];
-            let op: TxnOp = Box::new(move |v, c| {
-                changelog::append(v, c, Change { op: "PolicyViolation", ino, extra, ..Default::default() })?;
-                Ok(MetaReply::Ok)
-            });
-            if let Err(e) = txn_blocking(eng, ReqCtx::internal(), op) {
-                log::warn("bg", format_args!("inode {ino} 一直写打开、迁移被跳过：告警事件没写成（{e}）"));
-            }
-        }
-    }
 }
 
 /// 第 1 步读到的样子还在吗（CAS）：change_id 与 epoch 都没变；返回 (inode, 它的 layout)。
@@ -252,16 +201,16 @@ fn unchanged(v: &dyn KvRead, n: &Node) -> Result<(Node, LayoutV1), ErrCode> {
 
 /// 两张后台用的 cap（管理权限位、session 0）：读当前的 L、写 L′（见文件头第 2、4 步）。
 fn caps(c: &OpCtx, cur: &Node, new: &LayoutV1, class: u16) -> Caps {
-    let read = sign_cap(c, cur, RIGHT_READ | RIGHT_ADMIN, 0);
+    let read = sign_cap(c, cur, RIGHT_READ | RIGHT_ADMIN, 0, 0); // 管理权限位 = 后台请求：进 QoS 的后台队列，qos_id 用不上
     let mut to = cur.clone();
     (to.rec.layout, to.rec.class_id) = (Some(new.clone()), class);
-    let write = sign_cap(c, &to, RIGHT_READ | RIGHT_WRITE | RIGHT_ADMIN, 0);
+    let write = sign_cap(c, &to, RIGHT_READ | RIGHT_WRITE | RIGHT_ADMIN, 0, 0);
     Caps { read, write, renew_at: c.req.now_ms.saturating_add(c.settings.cap_ttl_ms / 2) }
 }
 
 /// 第 2 步（见文件头）。
-fn intent(eng: &dyn MetaEngine, n: &Node, declared: &EffectiveAttrs) -> Result<Intent, ErrCode> {
-    let (n, mut eff) = (n.clone(), declared.clone());
+fn intent(eng: &dyn MetaEngine, n: &Node, declared: &EffectiveAttrs, exclude: &[u32]) -> Result<Intent, ErrCode> {
+    let (n, mut eff, exclude) = (n.clone(), declared.clone(), exclude.to_vec());
     txn_value(eng, ReqCtx::internal(), move |v, c| {
         let (mut cur, l) = unchanged(v, &n)?;
         if cur.rec.pending_epoch != 0 {
@@ -272,7 +221,11 @@ fn intent(eng: &dyn MetaEngine, n: &Node, declared: &EffectiveAttrs) -> Result<I
         eff.chunk = l.chunk_size;
         eff.stripe = l.chains.len() as u16;
         eff.checksum = l.checksum;
-        let new = new_layout(v, c, &eff, cur.ino, epoch, cur.rec.size)?;
+        let new =
+            new_layout(v, c, &eff, cur.ino, epoch, &Hint { size: cur.rec.size, client_node: None, exclude: &exclude })?;
+        if !exclude.is_empty() && new.chains.len() < l.chains.len() {
+            return Err(ErrCode::ENOSPC); // rebalance：排除之后的链不够它的条带数（见文件头第 2 步）
+        }
         (cur.rec.max_epoch, cur.rec.pending_epoch) = (epoch, epoch);
         save(v, &cur);
         let caps = caps(c, &cur, &new, eff.class_id);

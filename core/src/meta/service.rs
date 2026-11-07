@@ -106,14 +106,19 @@ pub struct MetaService {
 }
 
 impl MetaService {
-    /// 建服务并起 8 个 meta-read 线程（随进程一直运行）。`debug_ops` = node.toml 的同名开关。
-    pub fn start(eng: Arc<dyn MetaEngine>, debug_ops: bool) -> Result<Arc<MetaService>, String> {
+    /// 建服务并起 8 个 meta-read 线程（随进程一直运行）。`debug_ops` = node.toml 的同名开关；`usage` = leader 内存里的 target 心跳情况
+    /// （与元数据引擎的闭包共用一份：按用量放置，M13）。
+    pub fn start(
+        eng: Arc<dyn MetaEngine>,
+        debug_ops: bool,
+        usage: Arc<TargetUsage>,
+    ) -> Result<Arc<MetaService>, String> {
         let (tx, rx) = bounded::<ReadJob>(READ_QUEUE);
         let stats = Arc::new(OpStats::default());
         let live = Arc::new(Live::default());
         let uninlining = InFlight::new(READ_THREADS / 2);
         let (data, lost) = (OnceLock::new(), Default::default());
-        let shared = Arc::new(Shared { eng: eng.clone(), live, usage: Arc::default(), data, uninlining, lost });
+        let shared = Arc::new(Shared { eng: eng.clone(), live, usage, data, uninlining, lost });
         for i in 0..READ_THREADS {
             let (rx, stats, shared) = (rx.clone(), stats.clone(), shared.clone());
             std::thread::Builder::new()

@@ -37,7 +37,7 @@ fn server(debug_ops: bool) -> (Arc<RpcServer>, Endpoint, Arc<EmbeddedEngine>) {
     let keys = Arc::new(eng.keys(MASTER));
     let rpc =
         RpcServer::new(ServerId { cluster_id: CLUSTER, node_id: 1 }, pipeline.clone(), keys, &NetConfig::default());
-    rpc.add_service(MSG_META_CALL, MetaService::start(eng.clone(), debug_ops).unwrap());
+    rpc.add_service(MSG_META_CALL, MetaService::start(eng.clone(), debug_ops, eng.target_usage()).unwrap());
     let p = pool();
     let t = &pipeline.transports()[0];
     t.register_region(&p.region()).unwrap();

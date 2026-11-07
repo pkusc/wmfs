@@ -5,12 +5,14 @@
 //!   那时还当自己是尾，本地提交的写不会转发过来）；
 //! - 3.4.2.6 规则 2 之后前驱重新驱动同一个版本：新 L 要等后面的 Syncing 成员确认了才回（I3、附录 C 的 C-9）；
 //! - I5：租约没续上、过期、本地集群图比心跳回复里的旧、boot_id 不符 → 读与转发都回 `FENCED`；后继回 `FENCED` 时前驱约 0.5 s 后就重发；
+//! - "转发不到后继"的记录（3.4.2.10）：后继连不上时记下，后继回了话（哪怕是 `FENCED`）就清掉（M13 验证）；
 //! - head 本地提交失败（后继已提交）：pending 留着、版本号不让出（I6）；
 //! - DeleteEpoch 沿链传播到每个成员（3.4.2.9）；
 //! - 多块 chunk：部分覆盖（没改动的块从已提交版本复制）、截断到块中间（变成洞的块随增量转发一次就成，不等 3 s 的重新驱动）、再写。
 //!
 //! 不用 fail point（进程级），所以这些用例可以在同一个进程里并行跑；计数器是全进程共用的，只按时间与内容断言。
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wmfs_core::base::{ErrCode, clock, lock};
@@ -155,6 +157,41 @@ fn a_failed_local_commit_on_the_head_keeps_its_version() {
     c.write(0, 0, b"third").unwrap();
     assert_eq!(&c.read(0, 5).unwrap(), b"third");
     c.check(Duration::from_secs(5)); // 各成员同版本同内容
+}
+
+/// "持续 10 s 无法把转发送达后继"（3.4.2.10）只算真的送不到（连接断开、超时）的那段：后继回了话——哪怕回的是错误，例如刚重启、还没
+/// 被确认的 `FENCED`——就是送到了，前驱的记录清掉（M13 验证：以前只有确认才清，死掉又在租约内重启的后继回错误的那几秒也被算进去，
+/// 链管理器把它当成成员之间分区移出链，30 min 回不来）。
+#[test]
+fn an_answering_successor_clears_the_forward_failure_record() {
+    let c = Craq::start(3, &[(1, S), (2, S), (3, S)]);
+    c.write(0, 0, b"warm").unwrap();
+    let (n2, n3) = (&c.members[1].node, &c.members[2].node);
+    let chains = [(1, chain(&[(1, S), (2, S), (3, S)], 1, 1))];
+    let mut dead = (*c.new_map(&chains)).clone();
+    dead.nodes[2].1.addrs = vec![("mem".into(), "craq-nowhere".into())]; // node2 眼里 node3 连不上（死了）
+    c.deliver(&Arc::new(dead), &[2]);
+    let failing = || lock(&n2.fwd_fail).contains_key(&(1, 3));
+    let wait = |what: &str, cond: &dyn Fn() -> bool| {
+        let t0 = Instant::now();
+        while !cond() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "10 s 内没等到：{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    std::thread::scope(|sc| {
+        let w = sc.spawn(|| c.write(0, 0, b"next"));
+        wait("node2 记下转发不到 node3", &failing);
+        n3.lease.enforce(9); // node3 "重启"了：集群图里还没有它的 boot_id，自我隔离、回 FENCED
+        n3.lease.renew(clock::mono_ms(), 60_000, 0);
+        c.deliver(&c.new_map(&chains), &[2]); // node2 又连得上它了（链没变）
+        wait("node3 回了 FENCED：送到了，记录清掉", &|| !failing());
+        c.set_boot(3, 9);
+        c.set_chains(&chains); // 确认了它：之后照常确认
+        assert!(w.join().unwrap().is_ok());
+    });
+    assert_eq!(&c.read(0, 4).unwrap(), b"next");
+    c.check(Duration::from_secs(5));
 }
 
 /// 后继还没被确认（I5：集群图里还没有它的 boot_id——刚起来的节点）时回 `FENCED`：它很快就能收，前驱约 0.5 s 后就重发，不等满 3 s

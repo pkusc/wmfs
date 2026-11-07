@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wmfs_core::api::types::{
-    AttrGetReply, AttrSetReply, AttrSetReq, AttrUnsetReply, ChangelogPage, ClusterSettingsReply, CursorReply,
-    CursorReq, KeyFile, SemanticsReply, StatusReply, UsageReply,
+    AttrGetReply, AttrSetReply, AttrSetReq, AttrUnsetReply, ChangelogPage, ClassReply, ClusterSettingsReply,
+    CursorReply, CursorReq, KeyFile, SemanticsReply, StatusReply, UsageReply,
 };
 use wmfs_core::api::url::encode;
 use wmfs_core::meta::schema::keys::ROOT_INO;
@@ -34,6 +34,12 @@ fn get(a: &ApiClient, path: &str) -> AttrGetReply {
 fn value(g: &AttrGetReply, key: &str) -> (String, String) {
     let e = g.attrs.iter().find(|e| e.key == key).unwrap();
     (e.value.clone(), e.source.clone())
+}
+
+/// 根目录 status 的 qos 一行的"实际"。
+fn st_qos_text(a: &ApiClient) -> String {
+    let st: StatusReply = a.get("/api/v1/status?path=/").unwrap();
+    st.attrs.iter().find(|x| x.key == "qos").map(|x| x.actual.new_files.clone()).unwrap_or_default()
 }
 
 fn changelog(a: &ApiClient, after: u64, wait_ms: u64) -> ChangelogPage {
@@ -69,12 +75,23 @@ fn attributes_usage_status_semantics_and_settings_over_http() {
     assert!(g.semantics.starts_with("consistency=cto attr_ttl=1s"), "{}", g.semantics);
     let e = set(&a, "/proj", "chunck=4M").unwrap_err();
     assert_eq!((e.status, e.code.as_str(), e.message.as_str()), (400, "einval", "未知属性 chunck"));
+    let e = set(&a, "/proj", "snapshot=on").unwrap_err();
+    assert_eq!((e.status, e.code.as_str()), (400, "eopnotsupp"), "二期功能的键");
     let e = set(&a, "/proj", "qos=r=100,w=10").unwrap_err();
-    assert_eq!(
-        (e.status, e.code.as_str()),
-        (400, "eopnotsupp"),
-        "M13 才实现的键（consistency=strong 在 M12 可以设了）"
+    assert!(
+        e.code == "einval" && e.message.contains("没有已启用的插件消费"),
+        "这个节点的 qos 是 fifo（M13 起 qos 要 mclock 消费）：{e:?}"
     );
+    // M13 审查：qos 插件是 fifo 时，存储类的 [qos] 份额也没人执行——像 qos 属性一样拒绝；承诺与 get 的 semantics 行一致
+    let e = a.send_raw::<ClassReply>(
+        "POST",
+        "/api/v1/classes?name=g1",
+        b"[redundancy]\nreplica = 1\n[qos]\niops_max = 300\n",
+    );
+    assert_eq!(e.unwrap_err().code, "einval", "fifo：[qos] 的上限没人执行");
+    let k = a.send_raw::<ClassReply>("POST", "/api/v1/classes?name=g2", b"[redundancy]\nreplica = 1\n").unwrap().class;
+    assert_eq!((k.isolation.as_str(), k.promise.as_str()), ("shared", "先进先出，不承诺份额与尾延迟"));
+    assert!(st_qos_text(&a).contains("不执行份额（qos 插件是 fifo）"), "{}", st_qos_text(&a));
     assert_eq!(set(&a, "/nope", "chunk=1M").unwrap_err().status, 404);
     let e = set(&api(&d.0, &run.mgmt_addr, "client"), "/proj", "chunk=2M").unwrap_err();
     assert_eq!(e.status, 403, "写要 admin key");

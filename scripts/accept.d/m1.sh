@@ -52,7 +52,7 @@ accept_m1() {
     check "演示：WMFS_FAILPOINTS='plugin.tcp.transport=pct(30,return(EIO))' 的 ping 靠重连重试 100/100 ok" m1_fp_demo
     check_json "wmfs failpoint list 1：空列表（走带签名的管理 API）" '.failpoints == []' wmfs failpoint list 1 --json
     check "不带签名的写请求被拒（HTTP 401，auth_failed）" m1_unsigned_rejected
-    check "wmfs failpoint set 经签名的管理 API 生效：服务端下一次发送失败 → 客户端重连重试成功、命中计数 +1，clear 后清空" \
+    check "wmfs failpoint set 经签名的管理 API 生效：命中计数到 1（服务端下一次发送失败）、ping 3 次全成功，clear 后清空" \
         m1_fp_api
     check "/metrics（免认证）有 wmfs_rpc_requests_total；连接层计数器一启动就在（值可以是 0）" m1_metrics
     check "wmfs dev down 停掉全部开发节点" wmfs dev down
@@ -93,12 +93,18 @@ m1_unsigned_rejected() {
     [ "$code" = "401" ] && printf '%s\n' "$out" | head -1 | jq -e '.error == "auth_failed"'
 }
 
+# 经 API 设的 fail point 在服务端生效 = 它的命中计数到了 1。times(1,…) 这一次可能先被节点给自己的 target 心跳用掉
+# （ADR-0044 第 10 条），所以不要求 ping 有重试：按条件等命中计数，ping 3 次照样全成功（用掉它的是 ping 时，客户端重连重试）。
+m1_fp_hit() {
+    curl --noproxy '*' -s "$M1_HTTP/metrics" | grep -E '^wmfs_failpoint_hits_total\{name="plugin\.tcp\.transport"\} [1-9]'
+}
+
 m1_fp_api() {
     wmfs failpoint set 1 plugin.tcp.transport 'times(1,return(EIO))' || return 1
     wmfs failpoint list 1 --json |
         jq -e '.failpoints == [{"name": "plugin.tcp.transport", "action": "times(1,return(EIO))"}]' || return 1
-    json_expect '.ok == 3 and .failed == 0 and .retries >= 1' wmfs ping "$M1_RPC" --count 3 --json || return 1
-    curl --noproxy '*' -s "$M1_HTTP/metrics" | grep -E '^wmfs_failpoint_hits_total\{name="plugin\.tcp\.transport"\} [1-9]' || return 1
+    json_expect '.ok == 3 and .failed == 0' wmfs ping "$M1_RPC" --count 3 --json || return 1
+    poll 50 0.2 m1_fp_hit || return 1
     wmfs failpoint clear 1 plugin.tcp.transport || return 1
     wmfs failpoint list 1 --json | jq -e '.failpoints == []'
 }

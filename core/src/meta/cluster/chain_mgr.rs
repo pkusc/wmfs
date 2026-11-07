@@ -11,7 +11,7 @@
 //! - 指标：`wmfs_chains_degraded`（Serving 成员少于期望的链）、`wmfs_chains_unavailable`（没有 Serving 成员的链）、
 //!   `wmfs_chain_members{chain,state}`（7.3）。只有就绪的 leader 报；不是（或不再是）就绪的 leader → 全部归零（换了 leader 旧值不留着）。
 //! - 转发失败的报告（3.4.2.10）只认报告者最近 FRESH_MS 内的心跳里的（它停了心跳，最后一次报告不能一直当作"持续"的证据），时长按
-//!   同一台机器的钟算（`chain_plan::FwdFailure`）。
+//!   同一台机器的钟算（`chain_plan::FwdFailure`），并且只算下游这次启动以来、本 leader 一直看到它活着的那一段（[`since_up`]）。
 //! - 两步移出活着的成员（ADR-0041 第 13 条，`chain_plan::part`）：本 leader 第一次看到每个 Syncing 成员时的 (map_epoch, 时刻) 记在
 //!   这里，成员不再是 Syncing 就删；因转发失败已降级、等第二步的成员记在 `TargetUsage::parting`（[`sync_done`] 也要看）。换任期都清空。
 
@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use wmfs_api::metrics::{self, Gauge};
 
-use super::chain_plan::{self, FRESH_MS, Facts, Plan, sole};
+use super::chain_plan::{self, FRESH_MS, Facts, FwdFailure, Plan, Seen, sole};
 use super::chains::{SERVING, SYNCING, serving_count};
 use super::settings::{self, max_each, target_lease_shrinking};
 use super::targets::TargetUsage;
@@ -44,6 +44,7 @@ pub struct ChainMgr {
     gauges: HashMap<(u32, u8), Arc<Gauge>>,
     changed: HashMap<u32, u64>, // 链 → 本 leader 最近一次改它的时刻：这之前（再加一个心跳周期）报上来的转发失败已经过时
     syncing: HashMap<(u32, u32), (u64, u64)>, // (链, target) → 本 leader 第一次看到它是 Syncing 时的 (map_epoch, mono_ms)
+    up: HashMap<u32, (u64, u64)>, // target → (boot_id, 本 leader 从这一刻起一直看到它以这个 boot_id 活着)，见 [`since_up`]
 }
 
 /// 链改过之后多久之内收到的"转发不到后继"不算（数据节点拿到新集群图、清掉旧记录之后，下一次心跳才不再报它）。
@@ -64,6 +65,7 @@ impl ChainMgr {
             (self.term, self.ready_since, self.prev_since) = (role.term, now, None);
             self.changed.clear();
             self.syncing.clear();
+            self.up.clear();
             usage.parting(|_| false, &[]);
         }
         let Ok(map) = eng.cluster_map() else { return };
@@ -99,6 +101,7 @@ impl ChainMgr {
         for x in &mut failures {
             x.lasted_ms += now.saturating_sub(x.heard_ms); // 加上 leader 收到之后过去的时间（同一台机器的 mono_ms）
         }
+        since_up(&mut self.up, &alive, &mut failures, now);
         let shrinking = prev.as_ref().is_some_and(|(_, p)| target_lease_shrinking(p, &map.settings));
         // 两步移出的第二步（见文件头）：第一次看到它是 Syncing 的 (map_epoch, 时刻)；记着要移出的只留还是 Syncing 的
         let syncing: BTreeSet<(u32, u32)> = (map.chains.iter())
@@ -172,6 +175,19 @@ fn degraded_gauge() -> Arc<Gauge> {
 }
 fn unavailable_gauge() -> Arc<Gauge> {
     metrics::gauge("wmfs_chains_unavailable", "没有 Serving 成员（不可用）的链（只有就绪的 leader 报）", &[])
+}
+
+/// 转发失败只算下游这次启动以来、本 leader 一直看到它活着的那一段（3.4.2.10 的"各自心跳正常"，M13 验证注记）：之前那段是下游自己
+/// 没在运行（死着、正在重启），归离线与重启的规则管，不是成员之间分区。`up` = target → (boot_id, 从这一刻起一直活着)，按这一轮的
+/// `alive` 更新：不在租约内了（离线过）、换了 boot_id（重启过）就从这一轮重新算。
+fn since_up(up: &mut HashMap<u32, (u64, u64)>, alive: &HashMap<u32, Seen>, failures: &mut [FwdFailure], now: u64) {
+    up.retain(|t, (boot, _)| alive.get(t).is_some_and(|s| s.boot == *boot));
+    for (t, s) in alive {
+        up.entry(*t).or_insert((s.boot, now));
+    }
+    for x in failures {
+        x.lasted_ms = x.lasted_ms.min(up.get(&x.down).map_or(0, |(_, at)| now.saturating_sub(*at)));
+    }
 }
 
 /// 一条记录还是 `old` 那样吗（CAS）。
@@ -274,4 +290,40 @@ pub fn force_serving(v: &mut dyn KvTxn, c: &OpCtx, chain: u32, target: u32) -> R
     let extra = vec![("chain".into(), chain.to_string()), ("target".into(), target.to_string())];
     changelog::append(v, c, Change { op: "ChainForceServing", extra, ..Default::default() })?;
     Ok(rec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::cluster::chain_plan::FWD_FAIL_MS;
+
+    fn alive(t: u32, boot: u64) -> HashMap<u32, Seen> {
+        HashMap::from([(t, Seen { boot, fresh: true })])
+    }
+
+    /// M13 验证：下游死掉又在租约内重启（新 boot_id）、或离线过又回来，之前的"转发不到"不算——只算本 leader 一直看到它活着的那一段。
+    #[test]
+    fn a_forward_failure_counts_only_while_the_downstream_has_been_up() {
+        let mut up = HashMap::new();
+        let fail = |lasted_ms| vec![FwdFailure { node: 3, chain: 2, down: 1, lasted_ms, heard_ms: 0 }];
+        let mut f = fail(12_000);
+        since_up(&mut up, &alive(1, 7), &mut f, 1_000);
+        assert_eq!(f[0].lasted_ms, 0, "刚看到它活着");
+        let mut f = fail(20_000);
+        since_up(&mut up, &alive(1, 7), &mut f, 1_000 + FWD_FAIL_MS);
+        assert_eq!(f[0].lasted_ms, FWD_FAIL_MS, "一直活着、一直转发不到：成员之间分区");
+        let mut f = fail(5_000);
+        since_up(&mut up, &alive(1, 7), &mut f, 30_000);
+        assert_eq!(f[0].lasted_ms, 5_000, "报的比它活着的短：照报的算");
+        let mut f = fail(40_000);
+        since_up(&mut up, &alive(1, 8), &mut f, 32_000);
+        assert_eq!(f[0].lasted_ms, 0, "重启过（新 boot_id）：从头算");
+        since_up(&mut up, &HashMap::new(), &mut [], 33_000); // 不在租约内了（离线）
+        let mut f = fail(50_000);
+        since_up(&mut up, &alive(1, 8), &mut f, 40_000);
+        assert_eq!(f[0].lasted_ms, 0, "离线过又回来（同一个 boot_id）：从头算");
+        let mut f = vec![FwdFailure { down: 9, ..fail(50_000)[0] }];
+        since_up(&mut up, &alive(1, 8), &mut f, 41_000);
+        assert_eq!(f[0].lasted_ms, 0, "下游没在心跳：不算（它归离线的规则管）");
+    }
 }

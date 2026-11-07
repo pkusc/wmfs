@@ -13,8 +13,15 @@
 //! 先出现新 boot_id、重启过的成员却还是 Serving，它就会带着丢掉的 pending 服务读（R6）。
 //! 实现注记（M10 审查）：链管理器"因转发失败已降级、等第二步移出"的成员（ADR-0041 第 13 条）也记在这里（[`TargetUsage::parting`]）：
 //! 链管理器在 cluster-mgr 线程上写，`SyncDone` 在 meta-read 线程上看（不再提升它们）；这个结构本来就是两边共用的 leader 内存。
+//! 实现注记（M13）：各节点心跳报的保底欠额（`qos_deficit`）也记在这里：`wmfs status` 的 qos 一行取 5 s 之内的心跳之和
+//! （[`TargetUsage::deficit`]）；某个 qos_id 的欠额连续 10 s 都大于 0（数据节点报的已经是"上一个 10 s 窗口大半时间有积压"的），
+//! cluster-mgr 写一次 `PolicyViolation{kind=qos_reservation_unmet}`（[`TargetUsage::unmet`]，3.11、6.2 第 4 层；回到 0 之后再出现再写）。
+//! 实现注记（M13 收尾，ADR-0044 第 5 条）：心跳报的各类 p99 延迟（`class_p99`）同样记下：某个节点上某个类的 p99 连续 10 s 超过它的
+//! `latency_target`，cluster-mgr 写一次 `PolicyViolation{kind=latency_target_exceeded}`（[`TargetUsage::slow`]；与保底欠额共用
+//! [`episodes`]）。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::Hash;
 use std::sync::Mutex;
 
 use crate::base::types::ReqCtx;
@@ -43,12 +50,26 @@ struct Beat {
     map_epoch_seen: u64,
 }
 
+/// 一个节点最近一次心跳报的 QoS 量：保底欠额与各类的 p99 延迟。
+struct QosBeat {
+    heard_ms: u64,              // 收到时的 mono_ms
+    per_qos: Vec<(u64, u32)>,   // (qos_id, 成本单位/秒)
+    class_p99: Vec<(u16, u32)>, // (类 id, 微秒)
+}
+
+/// 心跳报的欠额与 p99 多久之内算数；欠额大于 0、p99 超过目标连续多久才写一次 PolicyViolation（见文件头）。
+const DEFICIT_FRESH_MS: u64 = 5_000;
+const UNMET_AFTER_MS: u64 = 10_000;
+
 /// leader 内存里的心跳情况（见文件头）。
 #[derive(Default)]
 pub struct TargetUsage {
     m: Mutex<HashMap<u32, Beat>>,
     fails: Mutex<HashMap<u32, Vec<FwdFailure>>>, // 节点 → 它最近一次心跳里报的持续转发失败
     parting: Mutex<BTreeSet<(u32, u32)>>,        // 链管理器记着要移出的 (链, target)（见文件头）
+    qos: Mutex<HashMap<u32, QosBeat>>,           // 实现注记（M13）：节点 → 它最近一次心跳报的保底欠额与 p99
+    unmet: Mutex<HashMap<u64, (u64, bool)>>, // qos_id → (欠额从这个时刻起一直大于 0, 这一段报过 PolicyViolation 没有)
+    slow: Mutex<HashMap<(u16, u32), (u64, bool)>>, // (类, 节点) → (p99 从这个时刻起一直超过目标, 报过没有)
 }
 
 impl TargetUsage {
@@ -67,6 +88,52 @@ impl TargetUsage {
             heard_ms: at_ms,
         };
         lock(&self.fails).insert(hb.node, hb.forward_failures.iter().map(f).collect());
+        let (per_qos, class_p99) = (hb.qos_deficit.clone(), hb.class_p99.clone());
+        lock(&self.qos).insert(hb.node, QosBeat { heard_ms: at_ms, per_qos, class_p99 });
+    }
+
+    /// target `t` 最近一次心跳报的容量与已用（按用量放置与 rebalance 用，M13；没听到过 → None）。
+    pub fn stat(&self, t: u32) -> Option<StoreStat> {
+        lock(&self.m).get(&t).map(|b| b.stat)
+    }
+
+    /// 各节点 [`DEFICIT_FRESH_MS`] 之内的心跳报的保底欠额，按 qos_id 加起来（成本单位/秒）。
+    fn deficits(&self, now_ms: u64) -> BTreeMap<u64, u64> {
+        let mut out = BTreeMap::new();
+        for d in lock(&self.qos).values().filter(|d| now_ms.saturating_sub(d.heard_ms) <= DEFICIT_FRESH_MS) {
+            for (q, x) in &d.per_qos {
+                *out.entry(*q).or_default() += *x as u64;
+            }
+        }
+        out
+    }
+
+    /// 各节点 [`DEFICIT_FRESH_MS`] 之内的心跳报的、超过了目标的类 p99：(类, 节点) → p99（微秒）。`targets` = (类, latency_target 微秒)。
+    fn over_target(&self, now_ms: u64, targets: &[(u16, u32)]) -> BTreeMap<(u16, u32), u64> {
+        let mut out = BTreeMap::new();
+        for (node, b) in lock(&self.qos).iter().filter(|(_, b)| now_ms.saturating_sub(b.heard_ms) <= DEFICIT_FRESH_MS) {
+            for &(class, p99) in &b.class_p99 {
+                if targets.iter().any(|&(k, t)| k == class && p99 > t) {
+                    out.insert((class, *node), p99 as u64);
+                }
+            }
+        }
+        out
+    }
+
+    /// p99 已经连续 [`UNMET_AFTER_MS`] 超过目标、这一段还没报过的 ((类, 节点), 此刻的 p99)（cluster-mgr 写 PolicyViolation，见文件头）。
+    pub fn slow(&self, now_ms: u64, targets: &[(u16, u32)]) -> Vec<((u16, u32), u64)> {
+        episodes(&mut lock(&self.slow), self.over_target(now_ms, targets), now_ms)
+    }
+
+    /// `qos_id` 的保底欠额（各节点之和，3.10 的 qos 一行，M13）。
+    pub fn deficit(&self, qos_id: u64, now_ms: u64) -> u64 {
+        self.deficits(now_ms).get(&qos_id).copied().unwrap_or(0)
+    }
+
+    /// 欠额已经连续 [`UNMET_AFTER_MS`] 大于 0、这一段还没报过的 (qos_id, 此刻的欠额)（cluster-mgr 写 PolicyViolation，见文件头）。
+    pub fn unmet(&self, now_ms: u64) -> Vec<(u64, u64)> {
+        episodes(&mut lock(&self.unmet), self.deficits(now_ms), now_ms)
     }
 
     /// 这些 target 的 (容量, 已用) 之和。
@@ -117,6 +184,25 @@ impl TargetUsage {
         p.extend(add.iter().copied());
         p.clone()
     }
+}
+
+/// [`TargetUsage::unmet`] 与 [`TargetUsage::slow`] 的记账："一段"连续 [`UNMET_AFTER_MS`] 才报、每段只报一次。`seen` = 键（qos_id，或
+/// (类, 节点)）→ (这一段从这个时刻起, 报过没有)，`now` = 此刻在"段"里的键与它的量（欠额、p99）。
+fn episodes<K: Copy + Ord + Hash>(
+    seen: &mut HashMap<K, (u64, bool)>,
+    now: BTreeMap<K, u64>,
+    now_ms: u64,
+) -> Vec<(K, u64)> {
+    seen.retain(|q, _| now.contains_key(q)); // 回到 0（回落到目标以下）了：这一段结束，下次再出现再报
+    let mut out = vec![];
+    for (q, d) in now {
+        let (since, reported) = seen.entry(q).or_insert((now_ms, false));
+        if !*reported && now_ms.saturating_sub(*since) >= UNMET_AFTER_MS {
+            *reported = true;
+            out.push((q, d));
+        }
+    }
+    out
 }
 
 /// 心跳里的一项与已提交的记录不同（需要改 TargetRecV1）吗（boot_id 归链管理器，见文件头）。
@@ -178,4 +264,80 @@ pub fn statfs(eng: &dyn MetaEngine, ctx: &ReqCtx, usage: &TargetUsage) -> Result
     let (cap, used) = usage.sum(&ids);
     let (blocks, bfree) = (cap / BSIZE, cap.saturating_sub(used) / BSIZE);
     Ok(MetaReply::StatFs { bsize: BSIZE as u32, blocks, bfree, files: FILES, ffree: FILES, namelen: NAMELEN })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn beat(node: u32, qos_deficit: Vec<(u64, u32)>) -> NodeHeartbeat {
+        let (host_id, machine_id, targets, forward_failures, features) =
+            (String::new(), String::new(), vec![], vec![], vec![]);
+        let (boot_id, map_epoch_seen, wall_ms, class_p99) = (1, 0, 0, vec![]);
+        NodeHeartbeat {
+            node,
+            boot_id,
+            host_id,
+            machine_id,
+            map_epoch_seen,
+            targets,
+            forward_failures,
+            features,
+            wall_ms,
+            qos_deficit,
+            class_p99,
+        }
+    }
+
+    #[test]
+    fn deficits_are_summed_over_fresh_heartbeats() {
+        let u = TargetUsage::default();
+        u.record(&beat(1, vec![(7, 30)]), 1, &[]);
+        u.record(&beat(2, vec![(7, 20), (8, 5)]), 1, &[]);
+        let t = clock::mono_ms();
+        assert_eq!((u.deficit(7, t), u.deficit(8, t), u.deficit(9, t)), (50, 5, 0), "各节点之和");
+        assert_eq!(u.deficit(7, t + DEFICIT_FRESH_MS + 1), 0, "5 s 之前的心跳不算");
+    }
+
+    #[test]
+    fn a_sustained_deficit_is_reported_once_per_episode() {
+        let mut seen = HashMap::new();
+        let d = |v: &[(u64, u64)]| v.iter().copied().collect::<BTreeMap<u64, u64>>();
+        assert!(episodes(&mut seen, d(&[(7, 50), (8, 5)]), 1000).is_empty(), "刚出现：还没持续 10 s");
+        assert!(episodes(&mut seen, d(&[(7, 50), (8, 5)]), 10_999).is_empty());
+        assert_eq!(episodes(&mut seen, d(&[(7, 40), (8, 5)]), 11_000), vec![(7, 40), (8, 5)], "持续 10 s：各报一次");
+        assert!(episodes(&mut seen, d(&[(7, 40)]), 30_000).is_empty(), "这一段只报一次；8 回到 0 了");
+        assert!(episodes(&mut seen, d(&[(7, 1), (8, 2)]), 31_000).is_empty());
+        assert_eq!(episodes(&mut seen, d(&[(8, 2)]), 41_000), vec![(8, 2)], "回到 0 之后再出现：再报");
+    }
+
+    /// ADR-0044 第 5 条：某个节点上某个类的 p99 超过了它的 latency_target 才算（5 s 之内的心跳）；连续 10 s 才报、每段只报一次、
+    /// 回落之后再超再报（与保底欠额同一个 `episodes`，键是 (类, 节点)）。
+    #[test]
+    fn a_class_p99_over_its_target_is_reported_once_per_episode() {
+        let u = TargetUsage::default();
+        let p99 =
+            |node: u32, v: Vec<(u16, u32)>| u.record(&NodeHeartbeat { class_p99: v, ..beat(node, vec![]) }, 1, &[]);
+        p99(1, vec![(3, 900), (4, 50)]);
+        p99(2, vec![(3, 400), (5, 9_000)]);
+        let (t, targets) = (clock::mono_ms(), [(3, 500), (4, 100)]);
+        let over: Vec<_> = u.over_target(t, &targets).into_iter().collect();
+        assert_eq!(over, vec![((3, 1), 900)], "节点 2 的没超；类 4 没超；类 5 没设目标（不在 targets 里）");
+        assert!(u.over_target(t + DEFICIT_FRESH_MS + 1, &targets).is_empty(), "5 s 之前的心跳不算");
+        assert!(u.slow(t, &targets).is_empty(), "刚超：还没持续 10 s");
+        let mut seen = HashMap::new();
+        let d = |v: &[((u16, u32), u64)]| v.iter().copied().collect::<BTreeMap<(u16, u32), u64>>();
+        assert!(episodes(&mut seen, d(&[((3, 1), 900)]), 1000).is_empty());
+        assert_eq!(episodes(&mut seen, d(&[((3, 1), 990)]), 11_000), vec![((3, 1), 990)], "持续 10 s：报此刻的 p99");
+        assert!(episodes(&mut seen, d(&[((3, 1), 990), ((3, 2), 600)]), 20_000).is_empty(), "这一段只报一次");
+        assert!(episodes(&mut seen, d(&[((3, 2), 600)]), 21_000).is_empty(), "节点 1 回落了：它的这一段结束");
+        let both = d(&[((3, 1), 800), ((3, 2), 600)]);
+        assert!(episodes(&mut seen, both.clone(), 22_000).is_empty(), "节点 1 回落之后又超了：重新起算");
+        assert_eq!(episodes(&mut seen, both, 30_000), vec![((3, 2), 600)], "节点 2 持续满 10 s：各节点分开算");
+        assert_eq!(
+            episodes(&mut seen, d(&[((3, 1), 800)]), 32_000),
+            vec![((3, 1), 800)],
+            "回落之后再超、又持续 10 s：再报"
+        );
+    }
 }

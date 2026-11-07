@@ -4,9 +4,8 @@
 //!
 //! M7 的键：class、replicas、chunk、stripe、inline、checksum、consistency（`cto` 与子键 `attr_ttl`；`strong` 在 M12 之前回
 //! `EOPNOTSUPP`）、inherit；M10 的 quota、`quota.<类>`、acl.default；M11 的 compress、encrypt（存成数据密钥的数字 id）；M12 的 trash、ttl、
-//! audit（`attr_registry/trash_ttl_audit.rs`）与 `consistency=strong`。
-//! 后面里程碑才实现的键（[`LATER`]）与二期功能（ec、snapshot）设置时回 `EOPNOTSUPP`；`wasm:` 开头的值回
-//! `FEATURE_UNSUPPORTED`（"二期功能"，3.7.7）——都不静默接受。
+//! audit（`attr_registry/trash_ttl_audit.rs`）与 `consistency=strong`；M13 的 qos、tier、locality（`attr_registry/qos_tier.rs`）。
+//! 二期功能的键（ec、snapshot）设置时回 `EOPNOTSUPP`；`wasm:` 开头的值回 `FEATURE_UNSUPPORTED`（"二期功能"，3.7.7）——都不静默接受。
 //!
 //! 规范化（存进 DIRATTR 的值，3.2.7）：尺寸存字节数（`1M` → `1048576`）、名字原样；显示时换回来（[`AttrSpec::show`]）。实现注记
 //! （M7）：`consistency` 连同子键存成**一个**值——`cto` 或 `cto,attr_ttl=<毫秒>`（子键只能跟在主键后面，所以随主键一起继承；没写
@@ -23,7 +22,9 @@ use crate::data::format::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::meta::ns::acl;
 use crate::meta::quota;
 
+pub mod qos_tier;
 pub mod trash_ttl_audit;
+use qos_tier::{QOS_SUBKEYS, class_name_ok, parse_locality, parse_qos, parse_tier, show_qos};
 use trash_ttl_audit::{parse_audit, parse_trash, parse_ttl, show_ms};
 
 /// Inherit：取最近的祖先值；Stacked：所有祖先同时生效（配额，M10）；Local：只作用于设置它的目录（inherit）。
@@ -88,8 +89,8 @@ const fn spec(
 const QUOTA_SUBKEYS: &[&str] = &["soft", "grace", "files", "quantum"];
 
 /// 全部键（顺序就是 `wmfs get` 的显示顺序）：M7 的 8 个，M10 的 quota、`quota.<类>`（注册表里写成 `quota.*`，按前缀匹配）、acl.default，
-/// M11 的 compress、encrypt，M12 的 trash、ttl、audit（加在最后：前面的键的位置不变）。
-pub static REGISTRY: [AttrSpec; 16] = [
+/// M11 的 compress、encrypt，M12 的 trash、ttl、audit，M13 的 qos、tier、locality（加在最后：前面的键的位置不变）。
+pub static REGISTRY: [AttrSpec; 19] = [
     spec(
         "class",
         parse_class,
@@ -126,10 +127,11 @@ pub static REGISTRY: [AttrSpec; 16] = [
     spec("trash", parse_trash, show_ms, Effect::Immediate, &["trash-expire"]), // 移进回收站是 core 做的，到期真删要有它
     spec("ttl", parse_ttl, show_ms, Effect::Reconciler, &["ttl"]),
     AttrSpec { subkeys: &["ops", "uids"], ..spec("audit", parse_audit, show_as_is, Effect::Immediate, &["core"]) },
+    AttrSpec { subkeys: QOS_SUBKEYS, ..spec("qos", parse_qos, show_qos, Effect::Immediate, &["mclock"]) },
+    spec("tier", parse_tier, show_as_is, Effect::Reconciler, &["tiering"]), // 协调器按它算声明，tiering 任务按条件迁移
+    spec("locality", parse_locality, show_as_is, Effect::NewFiles, &["label-match"]),
 ];
 
-/// 后面的里程碑才实现的键：设置 → `EOPNOTSUPP`（`quota.<类>` 按前缀 `quota.` 匹配）。
-pub const LATER: &[(&str, &str)] = &[("qos", "M13"), ("tier", "M13"), ("locality", "M13")];
 /// 二期功能的键（第 5 章）：设置 → `EOPNOTSUPP`"二期功能"。
 const PHASE2: &[&str] = &["ec", "snapshot"];
 
@@ -139,23 +141,17 @@ pub fn find(key: &str) -> Option<&'static AttrSpec> {
     REGISTRY.iter().find(|s| s.key == key || prefixed(s))
 }
 
-/// 还不能设置的已知键（后面的里程碑、二期功能）→ `EOPNOTSUPP` 与原因（写明在哪个里程碑）；别的键 → None。
-fn later(key: &str) -> Option<Failed> {
-    let k = if key.starts_with("quota.") { "quota" } else { key };
-    let why = match LATER.iter().find(|(n, _)| *n == k) {
-        Some((_, m)) => format!("在 {m} 实现，现在还不能设置"),
-        None if PHASE2.contains(&k) => "是二期功能".to_string(),
-        None => return None,
-    };
-    Some(Failed::new(ErrCode::EOPNOTSUPP, format!("属性 {key} {why}")))
+/// 二期功能的键 → `EOPNOTSUPP`"二期功能"；别的键 → None。
+fn phase2(key: &str) -> Option<Failed> {
+    PHASE2.contains(&key).then(|| Failed::new(ErrCode::EOPNOTSUPP, format!("属性 {key} 是二期功能")))
 }
 
-/// 一个单独给出的键（`wmfs unset`）：注册表里的 → 它的 [`AttrSpec`]；还不能设置的 → `EOPNOTSUPP`（与 set 的说法相同）；其他 →
+/// 一个单独给出的键（`wmfs unset`）：注册表里的 → 它的 [`AttrSpec`]；二期功能的 → `EOPNOTSUPP`（与 set 的说法相同）；其他 →
 /// `EINVAL`"未知属性"。
 pub fn spec_of(key: &str) -> Result<&'static AttrSpec, Failed> {
     match find(key) {
         Some(s) => Ok(s),
-        None => Err(later(key).unwrap_or_else(|| einval(format!("未知属性 {key}")))),
+        None => Err(phase2(key).unwrap_or_else(|| einval(format!("未知属性 {key}")))),
     }
 }
 
@@ -182,7 +178,7 @@ pub fn split(text: &str) -> Result<Vec<Parsed>, Failed> {
             return Err(einval(format!("属性字符串里有空的片段：{text:?}")));
         }
         let (k, v) = frag.split_once('=').map_or((frag, None), |(k, v)| (k.trim(), Some(v.trim())));
-        if let Some(e) = later(k) {
+        if let Some(e) = phase2(k) {
             return Err(e);
         }
         // 顶层属性名：开始一个新属性
@@ -220,9 +216,9 @@ fn parse_one(s: &'static AttrSpec, key: String, v: &str, subs: &[(String, String
     Ok(Parsed { spec: s, key, norm })
 }
 
-/// 启动时的对账（3.8）：插件 manifest 的 `attrs` 里每个名字都得是认识的键（M7 的、后面里程碑的），否则多半是写错了。
+/// 启动时的对账（3.8）：插件 manifest 的 `attrs` 里每个名字都得是认识的键（首发的、二期的），否则多半是写错了。
 pub fn check_manifest_attrs(plugin: &str, attrs: &[&str]) -> Result<(), String> {
-    match attrs.iter().find(|a| find(a).is_none() && later(a).is_none()) {
+    match attrs.iter().find(|a| find(a).is_none() && phase2(a).is_none()) {
         Some(a) => Err(format!("插件 {plugin} 的 manifest 声明消费属性 {a}，属性注册表里没有这个键")),
         None => Ok(()),
     }
@@ -244,9 +240,11 @@ fn int_in(v: &str, lo: u64, hi: u64) -> Result<u64, String> {
 
 fn parse_class(v: &str, subs: &[(String, String)]) -> Result<String, String> {
     no_subkeys(subs)?;
-    let ok =
-        (1..=32).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if ok { Ok(v.to_string()) } else { Err("存储类名应是 1–32 个小写字母、数字或 -".into()) }
+    if class_name_ok(v) {
+        Ok(v.to_string())
+    } else {
+        Err("存储类名应是 1–32 个小写字母、数字或 -".into())
+    }
 }
 
 fn parse_replicas(v: &str, subs: &[(String, String)]) -> Result<String, String> {

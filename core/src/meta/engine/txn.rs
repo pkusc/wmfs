@@ -12,6 +12,7 @@ use crate::hooks::manifest::Manifest;
 use crate::hooks::pipeline::Pipeline;
 use crate::meta::attrs::AttrResolver;
 use crate::meta::changelog::Subject;
+use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::schema::records::ClusterSettingsV1;
 use crate::proto::meta::MetaReply;
 use crate::proto::peer::ClusterMap;
@@ -90,6 +91,7 @@ pub struct OpCtx<'a> {
     pub map: &'a ClusterMap, // 批次开始时的集群图快照（placement 用）
     pub settings: &'a ClusterSettingsV1,
     pub cap_key: &'a [u8; 32], // 实现注记（M5）：K_cap——Open/Create/改长度的 SetAttr 的回复与后台任务的管理 cap 都在闭包里签
+    pub usage: &'a TargetUsage, // 实现注记（M13，只增）：leader 内存里各 target 心跳报的用量（按用量放置、rebalance）
 }
 
 // ---- 3.4.1.4 串行执行器的请求 ----
@@ -221,8 +223,16 @@ mod tests {
             empty_map(),
             ClusterSettingsV1::default(),
         );
-        let ctx =
-            OpCtx { req: &req, pipeline: &pipeline, attrs: &attrs, map: &map, settings: &settings, cap_key: &[0; 32] };
+        let usage = TargetUsage::default();
+        let ctx = OpCtx {
+            req: &req,
+            pipeline: &pipeline,
+            attrs: &attrs,
+            map: &map,
+            settings: &settings,
+            cap_key: &[0; 32],
+            usage: &usage,
+        };
 
         let mut kv = BTreeMap::new();
         let op: TxnOp = Box::new(|v, _c| put_if_absent(v, b"k"));

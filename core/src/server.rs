@@ -123,7 +123,7 @@ pub fn start(
     let kv_keys = Arc::new(meta.keys(master));
     let keys: Arc<dyn KeyLookup + Send + Sync> = kv_keys.clone();
     let rpc = RpcServer::new(ServerId { cluster_id, node_id: node.node_id }, pipeline.clone(), keys.clone(), &cfg.net);
-    let svc = MetaService::start(meta.clone(), cfg.debug_ops)?;
+    let svc = MetaService::start(meta.clone(), cfg.debug_ops, meta.target_usage())?;
     rpc.add_service(MSG_META_CALL, svc.clone());
     rpc.add_service(MSG_NODE_CALL, svc.clone());
     if let Some(net) = meta.net() {
@@ -193,6 +193,7 @@ pub fn start(
         board: Some(board),
         wrapper: Some(wrapper),
         live: Some(svc.live()),
+        qos: pipeline.qos_call().map(|(q, _)| q.clone()),
     };
     if let Err(e) = mgmt.start(Arc::new(ctx)) {
         let _ = std::fs::remove_file(&pid_file);
@@ -295,7 +296,11 @@ fn start_background(
     });
     // 总期限 30 s（DataClient 默认 120 s）：服务端内部的 Uninline 与 gc 不必等那么久，失败交给客户端或 gc 的下一轮重试
     let (rpc_t, op_t) = (std::time::Duration::from_secs(10), std::time::Duration::from_secs(30));
-    let data = Arc::new(DataClient::new(side.peer, map_of, false).with_timeouts(rpc_t, op_t));
+    let mut data = DataClient::new(side.peer, map_of, false).with_timeouts(rpc_t, op_t);
+    if let Some(c) = pipeline.codec(CODEC_REPLICA) {
+        data = data.with_codec(c.clone()); // 迁移、uninline 读的时候也按 read_order 分散到各副本（M13）
+    }
+    let data = Arc::new(data);
     svc.set_data(data.clone());
     let eng = meta.clone();
     let local: LocalGet = Arc::new(move |k| {

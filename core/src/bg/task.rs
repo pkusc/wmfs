@@ -11,11 +11,12 @@
 //! 实现注记（M11）：只增——`TaskCtx.node`（`EveryDataNode` 任务拿到本节点的数据面：scrub 要解码、修复、上报，`data::repair`；
 //! `targets` 只有存储接口，不够用；内置任务都用 `node`，`targets` 留给只需要存储接口的第三方任务）与 `BgTask::default_rate`（任务自己的
 //! 默认限速，例如 scrub 的 50 MiB/s，4.12；`wmfs task set` 设了就用设的）。都有默认值或只读，`CORE_ABI_VERSION` 不变。
+//! 实现注记（M13 审查）：只增——[`StepBudget`]（一步的额度，协调器、ttl、tiering、rebalance 共用，以前各插件各抄一份）。
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::base::ErrCode;
+use crate::base::{ErrCode, clock};
 use crate::client::data_client::DataClient;
 use crate::data::DataNode;
 use crate::hooks::manifest::Manifest;
@@ -53,6 +54,30 @@ pub trait BgTask: Send {
     /// 任务级限速的默认值（字节/秒，0 = 只受节点级限速；实现注记（M11））。
     fn default_rate(&self) -> u64 {
         0
+    }
+}
+
+/// 一步的额度（`BgTask::step` 的"≤ 100 个对象 / ≤ 64 MiB / ≤ 1 s"；字节取大约一秒的限速量，[`RateLimiter::step_bytes`]）。
+pub struct StepBudget {
+    t0: u64,
+    pub items: u64,
+    pub bytes: u64,
+    max_bytes: u64,
+}
+
+impl StepBudget {
+    pub fn new(ctx: &TaskCtx) -> StepBudget {
+        StepBudget { t0: clock::mono_ms(), items: 0, bytes: 0, max_bytes: ctx.limiter.step_bytes(64 << 20) }
+    }
+
+    /// 还能再做一项吗（100 个对象、字节额度、1 s 都没到）。
+    pub fn more(&self) -> bool {
+        self.items < 100 && self.bytes < self.max_bytes && clock::mono_ms().saturating_sub(self.t0) < 1000
+    }
+
+    /// 做完了一项（搬了 `bytes` 字节）。
+    pub fn add(&mut self, bytes: u64) {
+        (self.items, self.bytes) = (self.items + 1, self.bytes + bytes);
     }
 }
 

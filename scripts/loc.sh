@@ -112,9 +112,22 @@ LIMIT=38000
 # M12 落实 ADR-0043（design.md 2.2 的注记）：再新增约 57 行。余下的工作已经装不下的三个按剩余工作重估：core/net 1270 → 1285（已约 1,261：
 # 握手协商出的 feature 位记在连接上、`RpcClient::features`；余下小改约 20）、core/meta/ns 2060 → 2075（已约 2,045：回收站按文件属主分子目录；
 # 余下 M13 约 30）、core/client 2465 → 2480（已约 2,452：发锁与追加之前核对 feature 位；余下约 30）。Σ max ≈ 36,655。
+# M13（design.md 2.2 的 M13 注记）：新增约 1,665 行（预算约 1,350）。超出或余下的工作已经装不下的按剩余工作重估，共六个：core/meta 2895 → 3120
+# （已约 3,077：qos/tier/locality 的解析与显示、qos 的实际；余下 M14 的 3.10 每个属性的 status 与 7.3 的量约 40）、core/meta/cluster 1340 → 1450
+# （已约 1,444：classes.rs；余下小改）、core/mgmt 1360 → 1455（已约 1,375：存储类与 qos 的端点；余下 M14 的 trace、feature、node 端点约 80）、
+# core/bg 1195 → 1200（已约 1,187；余下 M14 的 declared_mismatch_files 约 10）、core/client 2480 → 2485（已约 2,473；余下 M14 的 trace 约 10）、
+# plugins 5290 → 4930（下调：已约 4,919，首发的插件都写完了；M14 的 audit-log、webhook 在 wmfs-mgr 里，不在 plugins）。Σ max ≈ 36,735。
+# M13 审查修复（design.md 2.2 的 M13 审查修复注记）：再新增约 250 行。重估四个已超出估算的（已写完，余下小改）：core/meta/cluster 1450 → 1540
+# （已约 1,539：per_node、starved、按链成员算隔离承诺、保底欠额的 PolicyViolation）、plugins 4930 → 4980（已约 4,976）、core/bg 1200 → 1210
+# （已约 1,206：StepBudget、tier_pending）、core/meta/ns 2075 → 2080（已约 2,079）。Σ max ≈ 36,890。
+# M13 验证修复（design.md 2.2 的 M13 验证修复注记）：再新增约 13 行。重估一个已超出估算的：core/meta/cluster 1540 → 1555（已约 1,551：
+# 转发失败只算下游这次启动以来一直活着的那段，`chain_mgr::since_up`；余下小改）。Σ max ≈ 36,905。
+# M13 收尾（ADR-0044，design.md 2.2 的注记）：再新增约 190 行。重估两个已超出估算的：core/meta/cluster 1555 → 1605（已约 1,603：
+# p99 的记账与 latency_target_exceeded、hdd 标注；余下小改）、core/data 3120 → 3206（已约 3,138：latency.rs、slots.rs；余下 M14 的
+# trace span 约 68，与上次重估相同）。Σ max ≈ 37,041（超过上报线 37,000，写进了 M13 收尾的 escalations；没有超过上限 38,000）。
 MODULES="wmfs-api:1175 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1285 core/hooks:1145
-core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2075 core/meta:2895 core/meta/cluster:1340
-core/data:3120 core/client:2480 core/bg:1195 core/mgmt:1360 core:970 plugins:5290 cli:5500 dashboard:880
+core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2080 core/meta:3120 core/meta/cluster:1605
+core/data:3206 core/client:2485 core/bg:1210 core/mgmt:1455 core:970 plugins:4980 cli:5500 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

@@ -12,10 +12,12 @@
 //!
 //! - [`chain_plan`]：链管理器的决定（纯函数：离线、重启、唯一幸存者、回来、修复、drain、新 target，M9）
 //! - [`chain_mgr`]：链管理器在 cluster-mgr 线程上的一轮、SyncDone、force-serving、调小租约的过渡（M9）
+//! - [`classes`]：存储类的 TOML、`wmfs class update` 的规则、QoS 包络与按节点均分、由实际部署算出的隔离承诺（M13）
 
 pub mod chain_mgr;
 pub mod chain_plan;
 pub mod chains;
+pub mod classes;
 pub mod cluster_mgr;
 pub mod join;
 pub mod map;

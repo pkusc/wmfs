@@ -11,7 +11,7 @@ use wmfs_core::base::config::NodeConfig;
 #[cfg(feature = "local-fs")]
 use wmfs_core::base::types::ChunkId;
 use wmfs_core::hooks::registry::PluginSet;
-use wmfs_core::hooks::traits::{CacheStore, Transport};
+use wmfs_core::hooks::traits::{CacheStore, CodecPlugin, Transport};
 use wmfs_core::meta::schema::records::PluginListV1;
 
 /// 按 node.toml 装出本节点的插件集合并校验（altitude、唯一性、abi_version、预算、fail point 声明、配置键）。
@@ -51,8 +51,13 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     s.transform(Arc::new(wmfs_plugins::aes_gcm::AesGcm::new()));
     #[cfg(feature = "replica")]
     s.codec(Arc::new(wmfs_plugins::replica::Replica::new()));
+    #[cfg(feature = "mclock")]
+    s.qos(Arc::new(wmfs_plugins::mclock::Mclock::new()));
+    // qos 只允许一个活跃（3.7.2）：fifo 是 mclock 被停用（minimal profile 的 disable = ["quota", "mclock"]）时的那一个（实现注记（M13））
     #[cfg(feature = "fifo")]
-    s.qos(Arc::new(wmfs_plugins::fifo::Fifo::new()));
+    if s.qos_plugins().is_empty() {
+        s.qos(Arc::new(wmfs_plugins::fifo::Fifo::new()));
+    }
     #[cfg(feature = "gc")]
     s.bg_task(Box::new(wmfs_plugins::gc::Gc::new()));
     #[cfg(feature = "gc")]
@@ -65,6 +70,10 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     s.bg_task(Box::new(wmfs_plugins::trash_expire::TrashExpire::new()));
     #[cfg(feature = "ttl")]
     s.bg_task(Box::new(wmfs_plugins::ttl::Ttl::new()));
+    #[cfg(feature = "tiering")]
+    s.bg_task(Box::new(wmfs_plugins::tiering::Tiering::new()));
+    #[cfg(feature = "rebalance")]
+    s.bg_task(Box::new(wmfs_plugins::rebalance::Rebalance::new()));
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST); // embedded-kv：代码在 core（元数据 Raft 是契约，4.10）
     if !cfg.plugins.dylib.is_empty() {
         return Err("node.toml 的 [plugins] dylib：动态库插件 M14 才支持".into());
@@ -80,8 +89,8 @@ pub fn chunk_path(root: &Path, id: &ChunkId) -> PathBuf {
     wmfs_plugins::local_fs::committed_path(root, id)
 }
 
-/// `wmfs mount --cache` 的取值（design.md 4.11、7.2）：`memory[:SIZE]`（默认 512 MiB）→ cache-memory；`none` → 不缓存；
-/// `local-nvme:DIR:SIZE` 在 M13。装进一个只有它的 PluginSet 校验 manifest（fail point 声明、预算），再从集合里交出去。
+/// `wmfs mount --cache` 的取值（design.md 4.11、7.2）：`memory[:SIZE]`（默认 512 MiB）→ cache-memory；`local-nvme:DIR[:SIZE]`（默认
+/// 50 GiB，M13）→ cache-local-nvme；`none` → 不缓存。
 pub fn cache_store(spec: &str) -> Result<Option<Arc<dyn CacheStore>>, String> {
     let (kind, arg) = spec.split_once(':').unwrap_or((spec, ""));
     match kind {
@@ -89,17 +98,53 @@ pub fn cache_store(spec: &str) -> Result<Option<Arc<dyn CacheStore>>, String> {
         #[cfg(feature = "cache-memory")]
         "memory" => {
             use wmfs_plugins::cache_memory::{CacheMemory, DEFAULT_CAPACITY};
-            let size = if arg.is_empty() { DEFAULT_CAPACITY } else { wmfs_core::base::units::parse_size(arg)? };
-            let mut s = PluginSet::new(&[]);
-            s.cache_store(Arc::new(CacheMemory::new(size)));
-            s.validate(&Default::default())?;
-            Ok(s.cache_store_plugin().cloned())
+            validated(Arc::new(CacheMemory::new(size_or(arg, DEFAULT_CAPACITY)?)))
         }
         #[cfg(not(feature = "cache-memory"))]
         "memory" => Err("这个 wmfs 没有编进 cache-memory 插件：用 --cache none".into()),
-        "local-nvme" => Err("--cache local-nvme 在 M13 才有（现在可以用 memory[:SIZE] 或 none）".into()),
-        _ => Err(format!("--cache 应写成 memory[:SIZE] 或 none：{spec:?}")),
+        #[cfg(feature = "cache-local-nvme")]
+        "local-nvme" if !arg.is_empty() => {
+            use wmfs_plugins::cache_local_nvme::{DEFAULT_CAPACITY, LocalNvme};
+            let (dir, sz) = dir_and_size(arg);
+            validated(Arc::new(LocalNvme::new(std::path::Path::new(dir), size_or(sz, DEFAULT_CAPACITY)?)?))
+        }
+        #[cfg(not(feature = "cache-local-nvme"))]
+        "local-nvme" => Err("这个 wmfs 没有编进 cache-local-nvme 插件：用 --cache memory 或 none".into()),
+        _ => Err(format!("--cache 应写成 memory[:SIZE]、local-nvme:DIR[:SIZE] 或 none：{spec:?}")),
     }
+}
+
+/// 装进一个只有它的 PluginSet 校验 manifest（fail point 声明、预算），再从集合里交出去。
+#[cfg(any(feature = "cache-memory", feature = "cache-local-nvme"))]
+fn validated(p: Arc<dyn CacheStore>) -> Result<Option<Arc<dyn CacheStore>>, String> {
+    let mut s = PluginSet::new(&[]);
+    s.cache_store(p);
+    s.validate(&Default::default())?;
+    Ok(s.cache_store_plugin().cloned())
+}
+
+/// 缓存大小：空 = 默认值。
+#[cfg(any(feature = "cache-memory", feature = "cache-local-nvme"))]
+fn size_or(s: &str, default: u64) -> Result<u64, String> {
+    if s.is_empty() { Ok(default) } else { wmfs_core::base::units::parse_size(s) }
+}
+
+/// `local-nvme:` 后面的 `DIR[:SIZE]`：最后一个冒号后面以数字开头才是 SIZE（目录名里可以有冒号）。
+#[cfg(feature = "cache-local-nvme")]
+fn dir_and_size(arg: &str) -> (&str, &str) {
+    match arg.rsplit_once(':') {
+        Some((dir, size)) if size.starts_with(|c: char| c.is_ascii_digit()) => (dir, size),
+        _ => (arg, ""),
+    }
+}
+
+/// 客户端读副本的顺序用的 codec 插件（replica 的 `read_order`，ADR-0040 第 10 条，M13；它的 manifest 由每个节点的 `build_plugins` 校验，
+/// 调用照样经 3.7.4 的包装）。
+pub fn read_codec() -> Option<Arc<dyn CodecPlugin>> {
+    #[cfg(feature = "replica")]
+    return Some(Arc::new(wmfs_plugins::replica::Replica::new()));
+    #[cfg(not(feature = "replica"))]
+    None
 }
 
 /// 一次性命令（`wmfs ping` 等）用的传输：同一组传输插件，只用来连别人、不监听。

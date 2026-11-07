@@ -53,6 +53,16 @@ impl ApiClient {
         self.request("DELETE", path, Vec::new())
     }
 
+    /// body 原样发出（M13：存储类的 TOML，`POST /api/v1/classes`、`PUT /api/v1/classes/<名字>`）；`method` 是 POST 或 PUT。
+    pub fn send_raw<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> Result<T, ApiError> {
+        self.request(method, path, body.to_vec())
+    }
+
     fn request<T: serde::de::DeserializeOwned>(&self, method: &str, path: &str, body: Vec<u8>) -> Result<T, ApiError> {
         let mut last = ApiError::new(
             0,
@@ -99,6 +109,7 @@ impl ApiClient {
         let r = match method {
             "GET" => self.agent.get(&url).header("Authorization", &auth).call(),
             "DELETE" => self.agent.delete(&url).header("Authorization", &auth).call(),
+            "PUT" => self.agent.put(&url).header("Authorization", &auth).send(body),
             _ => self
                 .agent
                 .post(&url)

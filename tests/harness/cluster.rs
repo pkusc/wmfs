@@ -25,14 +25,20 @@ const MEM: PoolConfig = PoolConfig { s_mb: 16, m_slots: 12, l_slots: 2, repl_lan
 pub struct Cluster {
     pub dir: TempDir,
     pub nodes: Vec<Option<Running>>, // 下标 0 = node1
+    capacity: String,                // 每个 target 的容量（node.toml 的 capacity；"0" = 不限）
 }
 
 impl Cluster {
     /// 起 `n` 个节点，等到 min(n, 3) 个元数据 voter。
     pub fn start(name: &str, n: usize) -> Cluster {
+        Cluster::start_sized(name, n, "0")
+    }
+
+    /// 同 [`Cluster::start`]，每个 target 的容量是 `capacity`（M13 的 rebalance：链的使用率按它算）。
+    pub fn start_sized(name: &str, n: usize, capacity: &str) -> Cluster {
         let dir = TempDir::new(&format!("cluster-{name}"));
         let _ = std::fs::remove_dir_all(&dir.0);
-        let mut c = Cluster { dir, nodes: Vec::new() };
+        let mut c = Cluster { dir, nodes: Vec::new(), capacity: capacity.into() };
         c.init_first();
         for i in 2..=n {
             c.join(i, &[]).unwrap();
@@ -47,7 +53,7 @@ impl Cluster {
 
     fn target(&self, i: usize) -> Vec<TargetConfig> {
         let path = self.node_dir(i).join("targets/1").display().to_string();
-        vec![TargetConfig { path, labels: vec![], capacity: "0".into() }]
+        vec![TargetConfig { path, labels: vec![], capacity: self.capacity.clone() }]
     }
 
     fn init_first(&mut self) {

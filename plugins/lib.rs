@@ -94,3 +94,19 @@ pub mod trash_expire;
 #[cfg(feature = "ttl")]
 #[path = "ttl/mod.rs"]
 pub mod ttl;
+
+#[cfg(feature = "mclock")]
+#[path = "mclock/mod.rs"]
+pub mod mclock;
+
+#[cfg(feature = "tiering")]
+#[path = "tiering/mod.rs"]
+pub mod tiering;
+
+#[cfg(feature = "rebalance")]
+#[path = "rebalance/mod.rs"]
+pub mod rebalance;
+
+#[cfg(feature = "cache-local-nvme")]
+#[path = "cache-local-nvme/mod.rs"]
+pub mod cache_local_nvme;

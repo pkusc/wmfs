@@ -1,0 +1,13 @@
+# mclock qos 插件的 manifest（design.md 3.7.1、4.5）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "mclock"
+version = "0.1.0"
+hooks = ["qos"]
+altitude = 410
+hot_path = true
+abi_version = 1
+attrs = ["qos", "class"]
+budget_ns = 2000
+fail_points = ["plugin.mclock.qos"]
+
+[config_schema]
+# 没有部署参数：份额来自目录的 qos 属性或存储类的 [qos]（行为策略一律走目录属性与存储类）

@@ -29,8 +29,8 @@
 //!   cap 的权限位与 RenewCap 相同（写：能读时再加读），inline 内容只给能读的人（ADR-0033 第 11 条）。
 
 use super::common::{
-    Node, attr_out, authz, bump_ctime, get, is_file, kill_suid, max_file_size, may_read, open_out, save, sign_cap,
-    write_rights,
+    Node, attr_out, authz, bump_ctime, get, governing, is_file, kill_suid, max_file_size, may_read, open_out, save,
+    sign_cap, write_rights,
 };
 use crate::base::ErrCode;
 use crate::base::types::Ts;
@@ -221,7 +221,7 @@ fn handle_rights(v: &dyn KvRead, c: &OpCtx, ino: u64, write: bool) -> Result<(No
 
 pub fn renew_cap(v: &dyn KvRead, c: &OpCtx, ino: u64, write: bool) -> Result<MetaReply, ErrCode> {
     let (n, _, rights) = handle_rights(v, c, ino, write)?;
-    Ok(MetaReply::Cap { cap: sign_cap(c, &n, rights, c.req.session) })
+    Ok(MetaReply::Cap { cap: sign_cap(c, &n, rights, c.req.session, governing(v, c, &n)?.qos_id) })
 }
 
 pub fn reopen_handle(v: &dyn KvRead, c: &OpCtx, ino: u64, write: bool) -> Result<MetaReply, ErrCode> {
@@ -317,7 +317,7 @@ pub fn uninline_intent(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, cid: u64) -> Resu
     // 只用来签 cap 的副本：layout 换成新 epoch（cap 里的 epoch 要是它），不保存——文件的 layout 要到切换时才换
     let mut for_cap = n.clone();
     for_cap.rec.layout = Some(l.clone());
-    let cap = sign_cap(c, &for_cap, RIGHT_WRITE, 0);
+    let cap = sign_cap(c, &for_cap, RIGHT_WRITE, 0, 0);
     Ok(MetaReply::Opened(OpenOut {
         attr: attr_out(v, c, &n)?,
         layout: Some(l),

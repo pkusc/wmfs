@@ -4,7 +4,8 @@
 //! - 一轮：先扫 DIRATTR 找出显式设了 `ttl`（不是 off）的目录（"规则根"，按 ino 排好），逐个子树 DFS（`bg::walker`）；每个不是目录、不在
 //!   回收站里、生效的 ttl 不是 0、mtime 已经过期的名字 → 一个内部批次（`ns::trash::ttl`：在批次里按当前状态再判一遍，期间被改写、改名的
 //!   不删）。嵌套的规则根会被走两遍（每一项幂等，最小方案）。
-//! - 一步最多 100 个删除、或 1 s（3.10；在一页里删到一半也停：游标退回这一页的开头，下一步重走这一页——每一项幂等，删掉的不会再出现）；
+//! - 一步最多 100 个删除、或 1 s（3.10，`bg::task::StepBudget`；在一页里删到一半也停：游标退回这一页的开头，下一步重走这一页——每一项幂等，
+//!   删掉的不会再出现）；
 //!   游标 = (规则根, DFS 游标) 的 postcard，换 leader 后接着走（解不开就从头开始）。积压 = 这一轮还没走完的规则根个数。指标
 //!   `wmfs_ttl_deleted_total`（只数真删的：批次里再判时已经不过期的不算）；fail point `plugin.ttl.bg_task`（本体包在每一步外层）。
 
@@ -12,9 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wmfs_core::api::metrics::{self, Counter};
+use wmfs_core::base::ErrCode;
 use wmfs_core::base::types::ReqCtx;
-use wmfs_core::base::{ErrCode, clock};
-use wmfs_core::bg::task::{BgTask, RunOn, StepResult, TaskCtx};
+use wmfs_core::bg::task::{BgTask, RunOn, StepBudget, StepResult, TaskCtx};
 use wmfs_core::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
 use wmfs_core::meta::engine::txn::txn_value;
 use wmfs_core::meta::ns::trash::{self, ttl_due};
@@ -36,9 +37,6 @@ pub static MANIFEST: Manifest = Manifest {
     budget_ns: 0,
     fail_points: &["plugin.ttl.bg_task"],
 };
-
-const MAX_ITEMS: u64 = 100;
-const MAX_STEP_MS: u64 = 1000;
 
 pub struct Ttl {
     deleted: Arc<Counter>,
@@ -90,8 +88,7 @@ impl BgTask for Ttl {
 
     fn step(&mut self, ctx: &mut TaskCtx, cursor: &[u8]) -> Result<StepResult, ErrCode> {
         let (mut root, mut dfs): (u64, Vec<u8>) = decode_body(cursor).unwrap_or_default();
-        let (roots, t0, mut items) = (roots(ctx)?, clock::mono_ms(), 0);
-        let full = |items: u64| items >= MAX_ITEMS || clock::mono_ms().saturating_sub(t0) >= MAX_STEP_MS;
+        let (roots, mut b) = (roots(ctx)?, StepBudget::new(ctx));
         let paused = |root: u64, dfs: Vec<u8>, items: u64| -> Result<StepResult, ErrCode> {
             let backlog = roots.iter().filter(|r| **r >= root).count() as u64;
             Ok(StepResult { cursor: encode_body(&(root, dfs)), items, bytes: 0, backlog, pass_done: false })
@@ -106,17 +103,17 @@ impl BgTask for Ttl {
                 if txn_value(ctx.meta, ReqCtx::internal(), move |v, c| trash::ttl(v, c, parent, &name, ino))? {
                     self.deleted.inc();
                 }
-                items += 1;
-                if full(items) {
-                    return paused(root, dfs, items); // 这一页删到一半：下一步从这一页的开头重走（见文件头）
+                b.add(0);
+                if !b.more() {
+                    return paused(root, dfs, b.items); // 这一页删到一半：下一步从这一页的开头重走（见文件头）
                 }
             }
             (root, dfs) = if page.done { (root + 1, vec![]) } else { (root, page.cursor) };
-            if full(items) {
-                return paused(root, dfs, items);
+            if !b.more() {
+                return paused(root, dfs, b.items);
             }
         }
-        Ok(StepResult { cursor: vec![], items, bytes: 0, backlog: 0, pass_done: true })
+        Ok(StepResult { cursor: vec![], items: b.items, bytes: 0, backlog: 0, pass_done: true })
     }
 }
 

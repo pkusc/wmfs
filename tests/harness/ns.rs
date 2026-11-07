@@ -15,6 +15,7 @@ use wmfs_core::hooks::traits::ConnIdentity;
 use wmfs_core::init::initial_kv;
 use wmfs_core::meta::attrs::AttrResolver;
 use wmfs_core::meta::cluster::map;
+use wmfs_core::meta::cluster::targets::TargetUsage;
 use wmfs_core::meta::engine::txn::{KvRead, KvScan, KvTxn, OpCtx};
 use wmfs_core::meta::ns;
 use wmfs_core::meta::schema::keys;
@@ -73,6 +74,7 @@ pub struct Ns {
     pub kv: View,
     pipeline: Pipeline,
     attrs: AttrResolver,
+    usage: TargetUsage,
     pub now: i64,               // 每个操作之后 + 1 秒（于是能看出 mtime/ctime 是不是被更新了）
     pub session: u64,           // 请求带的会话号（默认 SESSION；测试可以改，看会话检查）
     pub caps: Vec<(u64, bool)>, // 连接身份的路径限制（M10 的 path-caps；默认没有）
@@ -106,6 +108,7 @@ impl Ns {
             kv,
             pipeline: ns_pipeline(),
             attrs: AttrResolver::default(),
+            usage: TargetUsage::default(),
             now: 1_800_000_000,
             session: SESSION,
             caps: vec![],
@@ -146,6 +149,7 @@ impl Ns {
             map: &m,
             settings: &m.settings,
             cap_key: &CAP_KEY,
+            usage: &self.usage,
         };
         let r = f(&mut v, &c);
         if r.is_ok() {
@@ -171,6 +175,7 @@ impl Ns {
             map: &m,
             settings: &m.settings,
             cap_key: &CAP_KEY,
+            usage: &self.usage,
         };
         f(&self.kv, &c)
     }

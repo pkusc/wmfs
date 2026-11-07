@@ -84,3 +84,71 @@ fn same_seed_same_order_and_seeds_spread_files_over_chains() {
     }
     assert!(first[1..].iter().all(|n| *n >= 20), "200 个文件应大致均匀地分到 4 条链上：{first:?}");
 }
+
+#[test]
+fn prefer_client_puts_chains_headed_on_the_client_node_first() {
+    let cands: Vec<ChainView> = (1..=3)
+        .map(|i| ChainView { members: vec![(i, i), (i % 3 + 1, i % 3 + 1)], ..chain(i, 1, 3, 3, 0, 0) })
+        .collect();
+    let c = class(1);
+    for (locality, client, want) in [(1, Some(2), 2), (1, Some(3), 3), (0, Some(2), 0), (1, None, 0)] {
+        let eff = EffectiveAttrs { locality, ..EffectiveAttrs::defaults(1, 3) };
+        let mut firsts = std::collections::BTreeSet::new();
+        for seed in 0..40 {
+            let input = PlacementInput {
+                eff: &eff,
+                class: &c,
+                replicas: 3,
+                stripe: 1,
+                client_node: client,
+                seed,
+                exclude: &[],
+                size_hint: 0,
+            };
+            let mut v = cands.clone();
+            LabelMatch::new().rank(&input, &mut v).unwrap();
+            firsts.insert(v[0].members[0].1);
+        }
+        if want == 0 {
+            assert!(
+                firsts.len() > 1,
+                "locality={locality}、客户端节点 {client:?}：不偏向哪个节点（按 seed 分散）：{firsts:?}"
+            );
+        } else {
+            assert_eq!(firsts, [want].into(), "prefer-client：head 在客户端节点 {want} 上的链排第一");
+        }
+    }
+}
+
+/// ADR-0044 第 8 条的退路：没有以客户端节点为 head 的链时，有一个成员在客户端节点上的链优先（之后按原来的规则排）。
+#[test]
+fn prefer_client_falls_back_to_chains_with_a_member_on_the_client_node() {
+    let c = class(1);
+    let eff = EffectiveAttrs { locality: 1, ..EffectiveAttrs::defaults(1, 3) };
+    let first = |cands: &[ChainView], seed: u64| {
+        let input = PlacementInput {
+            eff: &eff,
+            class: &c,
+            replicas: 3,
+            stripe: 1,
+            client_node: Some(3),
+            seed,
+            exclude: &[],
+            size_hint: 0,
+        };
+        let mut v = cands.to_vec();
+        LabelMatch::new().rank(&input, &mut v).unwrap();
+        v.iter().map(|c| c.id).collect::<Vec<u32>>()
+    };
+    let with = |id: u32, nodes: &[u32], used: u64| ChainView {
+        members: nodes.iter().map(|n| (*n, *n)).collect(),
+        ..chain(id, 1, 3, 3, used, 100)
+    };
+    // 节点 3 重启过：在两条链上都排在末尾；链 1 根本没有它。链 2 比链 3 满，照样排在链 1 前面
+    let cands = [with(1, &[1, 2], 0), with(2, &[1, 2, 3], 50), with(3, &[2, 1, 3], 10)];
+    for seed in 0..20 {
+        assert_eq!(first(&cands, seed), vec![3, 2, 1], "有成员在节点 3 上的链优先，再按使用率");
+    }
+    let headed = [with(4, &[3, 1], 90), with(2, &[1, 2, 3], 0), with(1, &[1, 2], 0)];
+    assert_eq!(first(&headed, 7), vec![4, 2, 1], "有以节点 3 为 head 的链时它仍排第一，其次是有成员在节点 3 上的");
+}

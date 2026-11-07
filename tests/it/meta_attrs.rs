@@ -97,8 +97,10 @@ fn validation_consumers_and_warnings() {
     assert_eq!(e.code, ErrCode::ENOENT, "没设置过的键");
     let e = ns.txn(&ROOT, |v, c| attr_ops::unset(v, c, "/proj", "chunck")).unwrap_err();
     assert_eq!((e.code, e.msg.as_str()), (ErrCode::EINVAL, "未知属性 chunck"));
+    let e = ns.txn(&ROOT, |v, c| attr_ops::unset(v, c, "/proj", "snapshot")).unwrap_err();
+    assert!(e.code == ErrCode::EOPNOTSUPP && e.msg.contains("二期"), "与 set 的说法相同：{e:?}");
     let e = ns.txn(&ROOT, |v, c| attr_ops::unset(v, c, "/proj", "tier")).unwrap_err();
-    assert!(e.code == ErrCode::EOPNOTSUPP && e.msg.contains("M13"), "与 set 的说法相同：{e:?}");
+    assert_eq!(e.code, ErrCode::ENOENT, "M13 起 tier 是认识的键：没设置过 → ENOENT");
     // 没有 label-match（placement）的管线：stripe 没有消费者，chunk（core）照常
     let mut set_ = PluginSet::new(&[]);
     set_.authz(Arc::new(PosixMode::new()));
@@ -205,8 +207,8 @@ fn status_reports_declared_and_actual_and_usage_reads_rstat() {
     assert!(s.attrs.iter().filter(|a| a.key != "replicas").all(|a| !a.mismatched), "{:?}", s.attrs);
     assert_eq!(
         s.attrs.len(),
-        16,
-        "每个已实现的属性都有声明与实际（M10 加了 quota、quota.*、acl.default，M11 加了 compress、encrypt，M12 加了 trash、ttl、audit）"
+        19,
+        "每个属性都有声明与实际（M10 加了 quota、quota.*、acl.default，M11 加了 compress、encrypt，M12 加了 trash、ttl、audit，M13 加了 qos、tier、locality）"
     );
     let f = ns.create(&OWNER, p, "f").unwrap();
     ns.op(&OWNER, MetaOp::Symlink { parent: p, name: b"l".to_vec(), target: b"f".to_vec() }).unwrap();

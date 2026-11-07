@@ -284,11 +284,14 @@ fn on_reply(node: &Arc<DataNode>, id: &ChunkId, version: u64, succ: u32, res: Re
             format_args!("fail point chain.ack.drop：丢掉 {id:?} v{version} 的确认（等 chain-timer 重新驱动）"),
         );
     }
-    let extra = res.as_ref().ok().and_then(|f| f.error()).map_or(0, |e| e.extra); // STALE_CHAIN：后继的 chain_ver
-    let rep = res.and_then(check_reply).and_then(|f| decode_body::<PeerReply>(&f.body));
-    if matches!(rep, Ok(PeerReply::Ack { .. })) {
+    // 后继回了话（确认、NeedFull，或者错误：刚重启、还没换上新图、自我隔离着）就是送到了，"转发不到后继"从头算（3.4.2.10 的 M13
+    // 验证注记：以前只有确认才清，死掉又在租约内重启的后继回错误的那几秒也被算进"10 s 转发不到"，它被移出链、30 min 回不来）
+    let delivered = res.is_ok();
+    if delivered {
         forward::note_ok(node, id.chain, succ);
     }
+    let extra = res.as_ref().ok().and_then(|f| f.error()).map_or(0, |e| e.extra); // STALE_CHAIN：后继的 chain_ver
+    let rep = res.and_then(check_reply).and_then(|f| decode_body::<PeerReply>(&f.body));
     // 只认当前后继的回复：后继换过（规则 4）之后旧后继迟到的确认不代表新后继有了这个版本（I3）；pending 已经没了（重复的确认：
     // 重新驱动过）也什么都不做
     if node.chunks.with_pending(id, Some(version), |p| p.successor == Some(succ)) != Some(true) {
@@ -323,7 +326,7 @@ fn on_reply(node: &Arc<DataNode>, id: &ChunkId, version: u64, succ: u32, res: Re
         }
         other => {
             let e = other.err().unwrap_or(ErrCode::INTERNAL);
-            if matches!(e, ErrCode::ECONNRESET | ErrCode::ETIMEDOUT) {
+            if !delivered && matches!(e, ErrCode::ECONNRESET | ErrCode::ETIMEDOUT) {
                 forward::note_fail(node, id.chain, succ);
             }
             log::debug(

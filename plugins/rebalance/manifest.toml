@@ -1,0 +1,13 @@
+# rebalance 后台任务插件的 manifest（design.md 3.7.1、4.12）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "rebalance"
+version = "0.1.0"
+hooks = ["bg_task"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = []
+budget_ns = 0
+fail_points = ["plugin.rebalance.bg_task"]
+
+[config_schema]
+# 没有部署参数：20% / 10% 的门限是 design.md 4.12 定的；限速用 wmfs task set rebalance bw=…

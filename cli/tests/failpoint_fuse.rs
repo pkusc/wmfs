@@ -5,6 +5,7 @@
 //!   （放松 ⑩：文件长度还是 0）。
 //! - `plugin.cache-memory.cache_store=return(EIO)`：缓存插件每次都失败 → 读照常从数据节点读，内容正确（缓存只是加速）；挂载日志
 //!   （debug 级）里有"cache_store 出错……绕过缓存"——确认 fail point 真的触发了、读走的是绕过缓存那条路。
+//! - `plugin.cache-local-nvme.cache_store=return(EIO)`（M13）：同上，`--cache local-nvme:DIR`；缓存目录里一个块也没有。
 
 mod common;
 
@@ -62,6 +63,24 @@ fn a_failing_cache_store_only_bypasses_the_cache() {
     let r = n.mount("r", &[("WMFS_FAILPOINTS", "plugin.cache-memory.cache_store=return(EIO)"), ("WMFS_LOG", "debug")]);
     assert!(read_all(&r.p("f")) == bytes(2, 3 << 20), "缓存插件出错：照常从数据节点读，内容正确");
     assert!(r.log_text().contains("cache_store 出错"), "fail point 触发了、读绕过了缓存：{}", r.log_text());
+    w.unmount();
+    r.unmount();
+    n.stop();
+}
+
+#[test]
+fn a_failing_local_nvme_cache_only_bypasses_the_cache() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let n = Node::start("fp-nvme");
+    let w = n.mount("w", &[]);
+    std::fs::write(w.p("f"), bytes(3, 3 << 20)).unwrap();
+    let dir = n.dir.join("nvme-cache");
+    let env = [("WMFS_FAILPOINTS", "plugin.cache-local-nvme.cache_store=return(EIO)"), ("WMFS_LOG", "debug")];
+    let r = n.mount_cache("r", &env, &format!("local-nvme:{}:64M", dir.display()));
+    assert!(read_all(&r.p("f")) == bytes(3, 3 << 20), "缓存插件出错：照常从数据节点读，内容正确");
+    assert!(r.log_text().contains("cache_store 出错"), "fail point 触发了、读绕过了缓存：{}", r.log_text());
+    let blocks = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name() != ".lock").count();
+    assert_eq!(blocks, 0, "put 每次都失败：缓存目录里没有块");
     w.unmount();
     r.unmount();
     n.stop();

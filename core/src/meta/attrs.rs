@@ -1,4 +1,6 @@
 //! 目录属性的解析结果与解析器（design.md 3.12、3.8，ADR-0026）。
+//! 实现注记（M13）：`qos` 的生效值只记来源目录（`qos_id`，数值在 QOS 表里；`qos=<类>` 另记类名 `qos_class`，给 `wmfs get` 显示，ADR-0044
+//! 第 2 条）；`tier`、`locality` 没设时取存储类的 `[lifecycle]`、`[placement] locality`（6.1）。
 //!
 //! 继承解析 `resolve(dir)`：沿 `parent` 指针从 dir 点查到根，逐级收集 DIRATTR；Inherit 键取最近的定义；遇到 `inherit=false` 的
 //! 目录，它自己的值仍生效，但不再向上取 Inherit 键；Stacked 键（配额，M10）不受 `inherit=false` 影响。最后用内置默认值补齐
@@ -7,7 +9,7 @@
 //!
 //! 缓存（3.8）：leader 上的 `AttrResolver` 按 `dir → Arc<EffectiveAttrs>` 与 `dir → 祖先链` 缓存，整体打一个 `attr_epoch` 标签：
 //! 每次查都点查一次 GLOBAL `attr_epoch`，与标签不同就整个清空。**任何**属性修改与**任何**目录 rename 都令 `attr_epoch += 1`
-//! （[`bump_attr_epoch`]：`attr_ops`、`ns::rename`、删掉有 DIRATTR 的目录；存储类的修改在 M13 也要这样），所以"同一个 attr_epoch 下
+//! （[`bump_attr_epoch`]：`attr_ops`、`ns::rename`、删掉有 DIRATTR 的目录、存储类的增删改——`mgmt/classes.rs`），所以"同一个 attr_epoch 下
 //! 解析结果相同"。实现注记（M7）：执行器的批次覆盖层里 `attr_epoch` 可能已经加了一、批次却没能提交（作废、丢失、fail point）——那时
 //! 按覆盖层算出的缓存项就不对了，所以执行器在批次没有成功应用时调用 [`AttrResolver::clear`]；同一个操作里加了 `attr_epoch` 之后不再
 //! 解析（操作失败回滚时也就不会留下错的项）。缓存的大小按"生效属性每项 1、祖先链按长度"计（[`CACHE_MAX`]），很深的目录树也撑不大内存。
@@ -17,8 +19,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use wmfs_api::metrics::{self, Counter};
 
-use crate::base::{ErrCode, lock};
+use crate::base::{ErrCode, lock, log};
 use crate::data::format::{CK_BLAKE3, CK_CRC32C, CK_XXH3, CMP_LZ4, CMP_NONE, CMP_ZSTD};
+use crate::meta::attr_registry::qos_tier::{locality_id, qos_class, split_tier};
 use crate::meta::attr_registry::trash_ttl_audit::{audit_spec, ms_or_off};
 use crate::meta::attr_registry::{self, AttrKind, attr_ttl_ms};
 use crate::meta::engine::txn::{KvRead, KvTxn};
@@ -63,8 +66,9 @@ pub struct EffectiveAttrs {
     pub locality: u8,
     pub acl_default: Option<Vec<u8>>,
     pub qos_id: u64,
+    pub qos_class: Option<String>, // qos=<类> 借用的存储类名（None = 数值或没设）
     pub quotas: Vec<(u64 /*目录*/, QuotaDecl)>, // Stacked：所有祖先上的 quota 与 quota.<class>
-    pub sources: Vec<(&'static str, u64)>,      // 每个键的来源目录（0 = 内置默认值）
+    pub sources: Vec<(&'static str, u64)>, // 每个键的来源目录（0 = 内置默认值）
 }
 
 impl EffectiveAttrs {
@@ -90,6 +94,7 @@ impl EffectiveAttrs {
             locality: 0,
             acl_default: None,
             qos_id: 0,
+            qos_class: None,
             quotas: vec![],
             sources: vec![],
         }
@@ -133,7 +138,8 @@ impl Default for AttrResolver {
     }
 }
 
-fn attr_epoch(v: &dyn KvRead) -> Result<u64, ErrCode> {
+/// GLOBAL `attr_epoch`（见文件头；`class delete` 用它做"只读阶段之后目录属性没变"的 CAS）。
+pub fn attr_epoch(v: &dyn KvRead) -> Result<u64, ErrCode> {
     kv::get::<u64>(v, &keys::global(G_ATTR_EPOCH))?.ok_or(ErrCode::INTERNAL)
 }
 
@@ -236,9 +242,20 @@ fn compute(v: &dyn KvRead, chain: &[u64]) -> Result<EffectiveAttrs, ErrCode> {
         }
     }
     let class = got.iter().find(|(k, ..)| *k == "class").map_or(DEFAULT_CLASS, |(_, v, _)| v.as_str());
-    let id = kv::get::<ClassIdV1>(v, &keys::class_name(class))?.ok_or(ErrCode::INTERNAL)?.id;
+    let id = match kv::get::<ClassIdV1>(v, &keys::class_name(class))? {
+        Some(c) => c.id,
+        None => {
+            // 防御（M13 审查）：提到的类不在了（`class delete` 本来不删被提到的类）→ 按 default 解析，不让整棵子树都回 INTERNAL
+            log::warn("attr", format_args!("目录属性里的存储类 {class} 不存在：按 default 解析（wmfs set 改掉它）"));
+            kv::get::<ClassIdV1>(v, &keys::class_name(DEFAULT_CLASS))?.ok_or(ErrCode::INTERNAL)?.id
+        }
+    };
     let rec = kv::get::<StorageClassV1>(v, &keys::class(id))?.ok_or(ErrCode::INTERNAL)?;
     let mut eff = EffectiveAttrs::defaults(id, rec.replica);
+    eff.locality = rec.locality; // 实现注记（M13）：没设 locality 属性 = 存储类的 [placement] locality
+    if let (Some(to), Some(when)) = (&rec.tier_to, &rec.tier_when) {
+        eff.tier = tier_rule(v, &rec.name, to, when)?; // 类的 [lifecycle] = 隐式的 tier 规则（6.1）
+    }
     for (k, d) in [
         ("quota", stacked.iter().find(|(_, q)| q.class.is_none())),
         ("quota.*", stacked.iter().find(|(_, q)| q.class.is_some())),
@@ -249,7 +266,14 @@ fn compute(v: &dyn KvRead, chain: &[u64]) -> Result<EffectiveAttrs, ErrCode> {
     }
     eff.quotas = stacked;
     for (k, val, d) in got {
-        set_typed_field(&mut eff, k, &val).ok_or(ErrCode::INTERNAL)?; // DIRATTR 里存的是规范化过的值：解不开 = 状态损坏
+        match k {
+            "qos" => (eff.qos_id, eff.qos_class) = (d, qos_class(&val).map(str::to_string)), // 队列键的 qos_id = 来源目录（4.5）
+            "tier" => {
+                let (from, to, cond) = split_tier(&val).ok_or(ErrCode::INTERNAL)?; // 存的是规范化过的值：解不开 = 状态损坏
+                eff.tier = tier_rule(v, from, to, cond)?;
+            }
+            _ => set_typed_field(&mut eff, k, &val).ok_or(ErrCode::INTERNAL)?, // DIRATTR 里存的是规范化过的值：解不开 = 状态损坏
+        }
         if k == "trash" {
             eff.trash_root = d; // 回收站建在 trash 的来源目录下（第 5 章，M12）
         }
@@ -279,9 +303,19 @@ fn set_typed_field(eff: &mut EffectiveAttrs, key: &str, v: &str) -> Option<()> {
         "trash" => eff.trash_ms = ms_or_off(v)?,
         "ttl" => eff.ttl_ms = ms_or_off(v)?,
         "audit" => eff.audit = audit_spec(v)?,
+        "locality" => eff.locality = locality_id(v),
         _ => return None,
     }
     Some(())
+}
+
+/// 分层规则 `from -> to : cond` → [`TierRule`]（两端换成存储类 id）；有一端的类已经不在了 → None（这条规则不生效）。
+fn tier_rule(v: &dyn KvRead, from: &str, to: &str, cond: &str) -> Result<Option<TierRule>, ErrCode> {
+    let id = |name: &str| kv::get::<ClassIdV1>(v, &keys::class_name(name)).map(|c| c.map(|c| c.id));
+    Ok(match (id(from)?, id(to)?) {
+        (Some(from), Some(to)) => Some(TierRule { from, to, cond: cond.to_string() }),
+        _ => None,
+    })
 }
 
 /// 规范化的压缩写法（`none`、`lz4`、`zstd:<级别>`）→ (算法编号, 级别)。

@@ -36,7 +36,8 @@ pub fn meta_server(eng: Arc<EmbeddedEngine>, hint: Option<String>) -> MetaServer
     let keys = Arc::new(eng.keys(MASTER));
     let rpc =
         RpcServer::new(ServerId { cluster_id: CLUSTER, node_id: 1 }, pipeline.clone(), keys, &NetConfig::default());
-    let svc = MetaService::start(eng, true).unwrap();
+    let usage = eng.target_usage();
+    let svc = MetaService::start(eng, true, usage).unwrap();
     rpc.add_service(MSG_META_CALL, svc.clone());
     rpc.add_service(MSG_NODE_CALL, svc.clone());
     if let Some(h) = hint {

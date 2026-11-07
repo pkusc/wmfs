@@ -12,6 +12,7 @@
 //! - [`replica`]：PeerCall 服务与 repl 线程（后继处理转发、确认、同步与删除的传播，M9）
 //! - [`redrive`]：链变化时的前滚与 chain-timer（3.4.2.6，M9）；[`sync`]：重同步（3.4.2.8，M9）
 //! - [`datakey`]：数据加密密钥的包裹、解包与内存里的缓存（M11）；[`repair`]：校验与修复一个 chunk 副本、上报，写路径要的修复（M11）
+//! - [`slots`]：数据服务的排队位置（整个节点与每个 QoS 队列的上限）；[`latency`]：按存储类统计的延迟（M13 收尾，ADR-0044 第 5、6 条）
 //!
 //! 实现注记（M5）：单节点数据路径——链长 1，head 写完 pending 就本地提交（3.4.2.3 第 5 步"无后继"一支）。实现注记（M9）：多成员链
 //! ——转发不占线程（`call_cb` + pending 表，回调只把结果 try_send 进 repl 队列）、逆向确认、前滚、重同步、target 租约与自我隔离（I5）。
@@ -22,6 +23,7 @@ pub mod chain;
 pub mod datakey;
 pub mod format;
 pub mod forward;
+pub mod latency;
 pub mod node_hb;
 pub mod packed;
 pub mod read;
@@ -29,6 +31,7 @@ pub mod redrive;
 pub mod repair;
 pub mod replica;
 pub mod service;
+pub mod slots;
 pub mod state;
 pub mod superblock;
 pub mod sync;
@@ -158,6 +161,7 @@ pub struct DataNode {
     pub craq: Craq,
     pub keys: datakey::DataKeys, // 实现注记（M11）：解包过的数据密钥（只在内存里）
     pub repair_q: OnceLock<Sender<(u32, ChunkId)>>, // 实现注记（M11）：交给 repair 线程修的 (target, chunk)（repair.rs）
+    pub latency: latency::ClassLatency,             // 按存储类统计的客户端请求延迟（心跳报 p99，ADR-0044 第 5 条）
 }
 
 /// CRAQ 的计数器（7.3 的"数据"一行）。
@@ -208,6 +212,7 @@ impl DataNode {
             craq: Craq::new(),
             keys: datakey::DataKeys::default(),
             repair_q: OnceLock::new(),
+            latency: latency::ClassLatency::default(),
         })
     }
 

@@ -19,7 +19,8 @@
   标注"不迁移"）、位于降级链上的文件数与字节数，最后是协调器的进度与积压。一次最多看 100 万个 inode，看不完就在警告里明说统计不全。
   quota 与 `quota.<类>` 的"实际"是管着这个目录的各个配额此刻的用量与上限（软限的计时与宽限剩余），超了软限（含宽限已过）或超了硬限
   算不一致。M12 起：trash 的"实际"是它的回收站里的文件数与字节数，ttl 的是已经过期、还没被删掉的文件数，audit 的是审计消费者（`audit-log`
-  游标）落后最新 changelog 的条数（落后就算不一致）。qos、tier 的"实际"在 M13 加入。
+  游标）落后最新 changelog 的条数（落后就算不一致）。M13 起：qos 的"实际"是下发到每个节点的份额（按节点数均分之后）、隔离承诺与各节点
+  报的保底欠额（有欠额就算不一致），tier 的是条件已经成立、还没迁过去的文件数。
 
 ---
 
@@ -116,19 +117,23 @@
 | 属性 | 对新文件 | 对已有文件 |
 |---|---|---|
 | `class`、`replicas`、`compress`、`encrypt` | 立即 | 由后台协调器迁移，进度见 `wmfs status`。**迁移完成之前，往已有文件里新写的数据仍按旧设置存放**（例如刚开加密时，已有文件的新写入仍是明文，直到它被转换）；**一直处于写打开状态的文件不会被转换**——`wmfs set` 时会提醒，`wmfs status` 单独列出这类文件的个数，跳过超过 24 小时会产生告警（ADR-0021） |
-| `chunk`、`stripe`、`inline`、`checksum`、`locality` | 立即 | 不迁移（理念文档写的 checksum、locality 是"新数据"；因为这些参数属于文件的存储布局，已有文件的新写入沿用它原来的设置）；`locality` 对读的副本选择立即生效 |
+| `chunk`、`stripe`、`inline`、`checksum`、`locality` | 立即 | 不迁移（理念文档写的 checksum、locality 是"新数据"；因为这些参数属于文件的存储布局，已有文件的新写入沿用它原来的设置）。`locality` 只管新文件放在哪、不管读：所有文件的读都先找与客户端同一台主机上的副本，其余按 chunk 分散到各个副本（ADR-0044 第 1 条） |
 | `quota`、`quota.<class>`、`qos`、`trash`、`audit` | 立即 | 立即 |
 | `consistency`（及 `attr_ttl`） | 对之后新打开的文件 | 对之后新打开的文件；目录项/属性缓存时长立即按新值 |
-| `tier`、`ttl` | 由后台任务按条件执行 | 同左 |
+| `tier`、`ttl` | 由后台任务按条件执行 | 同左（`tier`：已经分层过去的文件留在目标类里，之后再被读写也不会被挪回来；想挪回去请改目录的属性） |
 | `acl.default` | 新建的文件与目录 | 不改已有对象 |
 
 设置时如果声明在当前集群无法满足（例如单节点上 `replicas=3`，或 `stripe` 大于可用的链数），设置照样成功，但会给出警告，见第 7 节。
 
-M12 起能设置的属性：`class`、`replicas`、`chunk`、`stripe`、`inline`、`checksum`（`crc32c`、`xxh3`、`blake3`）、`compress`、`encrypt`、`consistency`
+M13 起能设置的属性：`class`、`replicas`、`chunk`、`stripe`、`inline`、`checksum`（`crc32c`、`xxh3`、`blake3`）、`compress`、`encrypt`、`consistency`
 （`cto` 与 `attr_ttl`，或 `strong`）、`inherit`、`quota`、`quota.<类>`、`acl.default`、`trash`（`off` 或保留期，最长 365d）、`ttl`（`off` 或时长，
-按 mtime）、`audit`（`off`、`on`，可加过滤 `ops=create+unlink`、`uids=1000+1001`）。还没有实现的属性（`qos`、`tier`、`locality`，M13）设置时
-**明确报错**（`EOPNOTSUPP`，写明在哪个里程碑实现），拼错的属性名报"未知属性"，没有插件消费的属性（例如对应的
-插件被停用了）也被拒绝——都不会被静默接受。存储类现在只有 `default`（M13 起可以建）。
+按 mtime）、`audit`（`off`、`on`，可加过滤 `ops=create+unlink`、`uids=1000+1001`），以及 M13 的 `qos`（`r=<保底>,w=<权重>,l=<上限>[,bw=<字节/秒>][,burst=<时长>]`，
+单位见第 6 节；或 `qos=<存储类名>`：借用那个类的 QoS 包络，跟着那个类变——改了那个类的 `[qos]`，借用它的目录约 1 s 内用上新份额；`wmfs get` 显示类名；被借用的类不能删，ADR-0044 第 2 条）、`tier`（`<from>-><to>:<条件>`，条件 `idle>时长`、`age>时长`、
+`size>尺寸`，用 `&` 连接）、`locality`（`prefer-client`：新文件的写入口（链头）优先放在客户端所在的节点上；没有以那个节点为链头的链时（例如它重启过，见第 6 节），优先放在有一个副本在那个节点上的链上，再没有就按普通规则放；`any`）。还没有实现的只剩二期功能（`ec`、
+`snapshot`），设置时**明确报错**（`EOPNOTSUPP`），拼错的属性名报"未知属性"，没有插件消费的属性（例如 minimal 部署停用了 mclock，`qos`
+就没有插件消费）也被拒绝——都不会被静默接受。存储类用 `wmfs class create|update|list|show|delete` 管理（TOML 定义，design.md 6.1）：
+`update` 只改 QoS 时只下发新份额、不搬数据，改副本数或分层规则时后台从根整树转换，不能改设备标签与独占（请新建一个类再改目录的 `class`）；
+首发只能删没用过的类。
 
 后台转换（M11 起）：`wmfs set` 了 `class`、`replicas`、`compress`、`encrypt` 之后，协调器在后台把已有文件逐个换到新布局（限速，
 `wmfs task set reconciler bw=…`；`wmfs task pause|resume reconciler` 暂停与恢复；元数据 leader 换了从断点接着做）。换布局时内容不变
@@ -155,11 +160,13 @@ M12 起能设置的属性：`class`、`replicas`、`chunk`、`stripe`、`inline`
 
 ## 6. 隔离承诺（理念文档 6.3 [固定]）
 
-- vSSD 类的默认隔离手段是**独占物理盘或 namespace**（存储类 `devices.dedicated = true`，每块盘一个 target）。系统把每个 target 所在目录解析到**物理整盘或 NVMe namespace**（分区算它所在的整盘；LVM/dm/md 一直追到底下的物理盘；loop 设备或解析失败算"未知"）。只有一个类的物理盘与其他类完全不重合、且没有"未知"时，才显示"份额 + 尾延迟（以设备能力为限）"。同一块盘上的两个分区、同一个 PV 上的两个 LV，都算共用。
+- vSSD 类的默认隔离手段是**独占物理盘或 namespace**（存储类 `devices.dedicated = true`，每块盘一个 target）。系统把每个 target 所在目录解析到**物理整盘或 NVMe namespace**（分区算它所在的整盘；LVM/dm/md 一直追到底下的物理盘；loop 设备或解析失败算"未知"）。只有一个类**声明了 `dedicated = true`**、它的物理盘与其他类（包括其他类已有的数据所在的盘）完全不重合、且没有"未知"时，才显示"份额 + 尾延迟（以设备能力为限）"（没声明独占的类随时可能有别的类建在同一批盘上，碰巧不共用也不承诺；ADR-0044 第 3 条）。同一块盘上的两个分区、同一个 PV 上的两个 LV，都算共用。本机只有一块盘，所以永远显示 shared。
 - **共用设备（或未知）时只承诺份额（mClock 的保底/权重/上限），不承诺尾延迟。** 声明了 `dedicated` 却实际共用时，产生 `isolation_downgraded` 告警。
+- `dedicated = true` 的类**拿走**打了它的标签的 target：别的类的新文件从此不放在这些盘上；可别的类**已经**建在这些盘上的链与数据还留着，这时这个类如实显示 shared（并告警 `isolation_downgraded`）。所以要真正独占，**dedicated 类要在它的盘被别的类用上之前建好**：先 `wmfs class create`，再加入打了这个标签的 target（`wmfs join … --target <路径>:<标签>`）。会让别的类一个 target 也不剩的新建（例如 `label = "*"`）回 `EINVAL`（ADR-0044 第 4 条）。
+- 存储类的 `latency_target` **只测量与告警，不承诺**：某个节点上这个类的客户端请求最近 10 s 的 p99 延迟连续 10 s 超过它时，changelog 里记一条 `PolicyViolation`（`kind=latency_target_exceeded`），回落之后再超再记（ADR-0044 第 5 条）。
 - vHDD 类（`priority = low`，label 为 hdd 的类默认如此）只承诺容量、带宽份额与**低优先级**：在按权重分享的阶段，只有普通优先级的队列都没有可派发的请求时才轮到它（保底不受影响），**不承诺延迟**；HDD 类只适合顺序大块与冷数据，随机 IO 请放 NVMe 类。系统不会按热度自动把数据挪来挪去（只按目录属性 `tier` 与文件访问时间分层）。
 - QoS 的数字是"成本单位"：一次 IO 的成本 = 1 + 字节数 / 128 KiB（4 KiB = 1，1 MiB = 9，4 MiB = 33），存储类里的 `iops_*` 与目录 `qos` 的 `r/l` 都按它计；`wmfs class show` 直接显示换算成带宽的结果。
-- QoS 首发只在数据节点执行；目录或存储类上的保底与上限按该类的可用数据节点数**静态均分**到每个节点（没有跨节点协调）：负载不均时总保底可能达不到、总上限偏保守。元数据请求不做 QoS（ADR-0010）。
+- QoS 首发只在数据节点执行；目录或存储类上的保底与上限按该类的可用数据节点数**静态均分**到每个节点（没有跨节点协调）：负载不均时总保底可能达不到、总上限偏保守。一个文件的写只经过它的链头节点，所以单个文件的写入速度受"每节点份额"限制（例如 `iops_max = 300`、3 个节点：每节点 100，1 MiB 的写成本 9，约 11 MiB/s）。重启过的节点在每条链上都排到末尾，首发不会把写入口（链头）调回均匀：几个节点轮流重启之后，链头可能都集中在一个节点上，这时一个类的写只能用到它在那个节点上的份额（ADR-0044 第 8 条；链头自动均衡留到二期）。元数据请求不做 QoS（ADR-0010）。后台任务（协调器迁移、scrub、重同步）的数据请求进一个低优先级队列，受节点级后台限速。
 - cgroup io 隔离、NVMe WRR、NVM Sets、FDP 首发不做（ADR-0011）；唯一兑现的硬件隔离是整盘（或整 namespace）独占。
 - 块设备（ublk 网关）首发不提供。
 
@@ -261,6 +268,10 @@ M12 起能设置的属性：`class`、`replicas`、`chunk`、`stripe`、`inline`
   - **审计标记**（`audit=on`）：之后这棵子树里的修改（命名空间、setattr、xattr、写入长度与属性变更）在 changelog 里带 `audited: true`，被拒绝的
     修改也记一条（`result` 是错误码）；第一次启用时建 `audit-log` 游标，从此 changelog 按它保留（最多 7 天 / 1000 万条）。把审计记录写进文件
     的 audit-log 在 M14 的 `wmfs mgr` 里；在那之前 `wmfs status` 与 `/api/v1/health` 显示"审计消费者落后 N 条"。
+- **改集群图时写会停顿一下（M13 起实测）**：会改集群图的操作（`wmfs set`/`unset` 的 `qos`、`wmfs class create/update/delete`、
+  `wmfs cluster set`、`wmfs key` 等）之后约 1 s 内，正在写的文件偶尔有一次写停顿约 1 s（本机实测 0.7–0.9 s）：每个数据节点换上新集群图的
+  那一两毫秒里暂停服务，赶上这一刻的写由链头约 0.5–1 s 之后重发。一个存储类（或一种副本数）的第一个文件，第一次写可能停顿约 1–1.5 s
+  （本机实测 0.7–1.5 s：新建的链要先传到各个数据节点）。都不报错，只是慢一下（ADR-0044 第 9 条）。
 - 声明无法满足时（例如单节点上 `replicas=3`，或 `stripe=4` 但只有 2 条可用的链）：文件照常创建，但实际副本数 / 条带数较少；**不会静默**：`wmfs init` 与 `wmfs dev up` 的输出、server 启动日志、`wmfs mount` 的输出、`wmfs status` 的第一行、`wmfs get` 的 semantics 行（"replicas:声明3/实际1"）、`wmfs set` 时都会警告，dashboard 显示差距；加入节点后自动补齐（ADR-0016，人类于 2026-10-20 批准"照常创建、到处警告"）。
 - 集群里每个节点必须启用同一组会影响策略的插件（授权、配额、QoS、放置、变换、后台任务等）。插件配置与集群清单不一致的节点会**退出**并列出差异，而不是带着少一条规则的配置继续服务。M8 起：不一致的节点以退出码 3 退出、日志列出差异与修法；`wmfs join` 时插件配置不同直接被拒绝（退出码 3）；用 `wmfs cluster plugins add|remove`
   改了清单之后各节点都会退出，要用新配置重启全部节点（M9 起：只做数据的节点这时多半拿不到新的集群图——元数据节点都不一致、没有就绪的

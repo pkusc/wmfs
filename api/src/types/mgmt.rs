@@ -131,6 +131,8 @@ pub struct AttrActual {
     pub bytes: Option<u64>, // 实现注记（M12，只增）：trash——回收站里的字节数（files 是文件数）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lag: Option<u64>, // 实现注记（M12，只增）：audit——audit-log 游标落后最新 changelog 的条数（还没有游标 → 没有）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deficit: Option<u64>, // 实现注记（M13，只增）：qos——各节点心跳报的保底欠额之和（成本单位/秒；目录设了 qos 才有）
 }
 
 /// `GET /api/v1/status` 里一个属性的声明 vs 实际。

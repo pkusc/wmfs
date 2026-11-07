@@ -1,0 +1,13 @@
+# tiering 后台任务插件的 manifest（design.md 3.7.1、4.12）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "tiering"
+version = "0.1.0"
+hooks = ["bg_task"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = ["tier"]
+budget_ns = 0
+fail_points = ["plugin.tiering.bg_task"]
+
+[config_schema]
+# 没有部署参数：分层规则是目录属性 tier 与存储类的 [lifecycle]

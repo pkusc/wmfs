@@ -7,6 +7,7 @@
 //! 就拉一张新集群图（`GetClusterMap`）。数据服务发现请求带的链比本地视图新、或本地还不认识这条链时调用 [`MapHolder::poke`]，
 //! hb 线程立刻拉一次（3.4.2.4：通知 hb 线程立即拉集群图）。
 //!
+//! 实现注记（M13 收尾，ADR-0044 第 5 条）：心跳末尾带上按存储类统计的 p99 延迟（`class_p99`，`latency.rs`）。
 //! 实现注记（M5）：M5 只是"最小版"。实现注记（M8）：每拿到一张集群图先交给 `on_map`（服务端装配时给的：比对集群插件清单，不一致 →
 //! 退出码 3，3.7.2）。实现注记（M9）：心跳成功就续 target 租约（按**发送时刻** + 0.8 × 回复里的租约，I5，`chain.rs`），上报持续转发
 //! 不到后继的链（3.4.2.10）；新集群图交给 `redrive::switch`：先按 3.4.2.6 处理完 pending，再换上；同步线程交来的 SyncDone 跟在心跳
@@ -196,7 +197,8 @@ fn beat_to(hb: &HbDeps, ep: &Endpoint, poked: bool, hint: &mut Option<String>) -
         forward_failures,
         features: vec![],
         wall_ms: clock::wall_ms(),
-        qos_deficit: vec![],
+        qos_deficit: deficits(&hb.data),
+        class_p99: d.latency.p99s(clock::mono_ms()), // 设了 latency_target 的类最近 10 s 的 p99（ADR-0044 第 5 条）
     };
     let sent = clock::mono_ms(); // 租约从发送时刻算（持有方的计时起点早于授予方，3.4.4）
     let epoch = match call(&hb.rpc, ep, &NodeOp::Heartbeat(msg), hint)? {
@@ -219,4 +221,13 @@ fn beat_to(hb: &HbDeps, ep: &Endpoint, poked: bool, hint: &mut Option<String>) -
         log::info("hb", format_args!("链 {chain} 的 target {target} SyncDone（chain_ver {chain_ver}）：{r:?}"));
     }
     Ok(())
+}
+
+/// 心跳里报的保底欠额（3.3.6、3.10，实现注记（M13））：qos 插件的每个队列最近的欠额，按 qos_id 加起来，只报非 0 的。
+fn deficits(d: &DataNode) -> Vec<(u64, u32)> {
+    let mut m = std::collections::BTreeMap::<u64, f64>::new();
+    for q in d.pipeline.qos_call().map(|(p, _)| p.stats()).unwrap_or_default() {
+        *m.entry(q.key.qos_id).or_default() += q.deficit_per_s;
+    }
+    m.into_iter().filter(|(_, x)| *x >= 0.5).map(|(id, x)| (id, x.round().min(u32::MAX as f64) as u32)).collect()
 }

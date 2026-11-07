@@ -95,6 +95,7 @@ pub struct NodeHeartbeat {
     pub features: Vec<String>,
     pub wall_ms: u64,
     pub qos_deficit: Vec<(u64, u32)>, // (qos_id, 最近 10 s 平均保底欠额，成本单位/秒)；只报非 0 的，给"声明 vs 实际"用（3.10）
+    pub class_p99: Vec<(u16, u32)>, // (类 id, 最近 10 s 客户端请求的 p99 延迟，微秒)；只报设了 latency_target 的类（ADR-0044 第 5 条）
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

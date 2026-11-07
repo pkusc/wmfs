@@ -8,6 +8,9 @@
 //! 运行：SIGTERM / SIGINT → 把全部脏数据写出去 → 卸载 → 关会话、退出；挂载点被别人卸载（`wmfs umount`、`fusermount3 -u`）→ 会话
 //! 结束 → 同样写出脏数据、关会话、退出。
 //!
+//! 实现注记（M13）：`--host-id`（7.2 的参数表里没有）：会话报给 leader 的"主机"，缺省是 `/etc/machine-id`（与服务端的缺省 host_id 相同，
+//! 1.1）；locality = prefer-client 的新文件放在 head 在这台主机上的链，读时优先这台主机上的副本。`wmfs dev mount --node n` 用它冒充第 n 个
+//! 开发节点所在的主机（`host-<n>`）。
 //! 实现注记（M10）：`--allow-other`（7.2 的参数表里没有）只给容器里以 root 挂载、跑切换用户的 pjdfstest 权限子集用（宿主机上普通
 //! 用户经 fusermount3 挂载时它要求 /etc/fuse.conf 的 user_allow_other，本仓库不改那个文件）。会话被驱逐之后（MetaClient 换新会话，
 //! `client/lease.rs`）在另一个线程上对已知 inode `inval_inode`（不在 FUSE 工作线程上调：内核可能正等着它回复）。
@@ -80,6 +83,9 @@ pub struct MountArgs {
     /// 允许别的用户访问这个挂载（只在容器里以 root 挂载时用；见文件头）
     #[arg(long)]
     allow_other: bool,
+    /// 本客户端所在的"主机"（默认 /etc/machine-id；与某个节点的 host_id 相同时 locality 放置与读副本按它认，`wmfs dev mount --node n` 用它）
+    #[arg(long)]
+    host_id: Option<String>,
 }
 
 pub fn run(a: MountArgs) -> i32 {
@@ -109,8 +115,13 @@ fn mount(a: MountArgs) -> Result<(), String> {
     let rpc = RpcClient::new(pool, registry::client_transports()?, key, net)
         .map_err(|e| format!("建 RPC 客户端失败（--transport {}）：{e}", a.transport))?;
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default().trim().to_string();
-    let info =
-        SessionInfo { client_name: "wmfs-mount".into(), host, host_id: String::new(), mount: mp.display().to_string() };
+    let host_id = host_of(&a);
+    let info = SessionInfo {
+        client_name: "wmfs-mount".into(),
+        host,
+        host_id: host_id.clone(),
+        mount: mp.display().to_string(),
+    };
     let opts = MetaClientOpts { rpc_timeout: Duration::from_secs(10), op_timeout };
     let meta = match MetaClient::connect_with(rpc.clone(), &seeds, info, opts) {
         Ok(m) => Arc::new(m),
@@ -120,7 +131,7 @@ fn mount(a: MountArgs) -> Result<(), String> {
         }
         Err(e) => return Err(format!("连接集群失败：{e}")),
     };
-    let r = serve(&a, &mp, rpc, meta.clone(), max_ttl, op_timeout);
+    let r = serve(&a, &mp, rpc, meta.clone(), host_id, max_ttl, op_timeout);
     meta.close(); // 不论成败：会话开了就要关（不关要等租约到期被驱逐）
     r
 }
@@ -131,13 +142,17 @@ fn serve(
     mp: &Path,
     rpc: Arc<RpcClient>,
     meta: Arc<MetaClient>,
+    host_id: String,
     max_ttl: Duration,
     op_timeout: Duration,
 ) -> Result<(), String> {
     let map = meta.map();
     check_data_scheme(&map, &a.transport)?;
     let mut lines: Vec<String> = map.warnings.iter().map(|w| format!("警告：{w}")).collect();
-    let data = DataClient::for_meta(rpc, meta.clone(), Duration::from_secs(10), op_timeout);
+    let mut data = DataClient::for_meta(rpc, meta.clone(), Duration::from_secs(10), op_timeout).with_host(host_id);
+    if let Some(c) = registry::read_codec() {
+        data = data.with_codec(c); // 读副本的顺序：同主机的优先、其余按 chunk 分散（M13）
+    }
     let fc = FileClient::start(meta.clone(), data, registry::cache_store(&a.cache)?);
     let fs = WmfsFs::new(fc.clone(), max_ttl, a.job_id_var.clone());
     let slot = fs.notifier.clone();
@@ -184,6 +199,12 @@ fn serve(
     let _ = t.join();
     log::info("fuse", format_args!("已卸载 {}", mp.display()));
     Ok(())
+}
+
+/// 本客户端所在的"主机"：`--host-id`，缺省 `/etc/machine-id`（与服务端的缺省 host_id 相同，1.1）。
+fn host_of(a: &MountArgs) -> String {
+    let machine = || std::fs::read_to_string("/etc/machine-id").unwrap_or_default().trim().to_string();
+    a.host_id.clone().unwrap_or_else(machine)
 }
 
 /// `a,b,c`（`host:port` 或 `scheme://host:port`）→ Endpoint 列表。

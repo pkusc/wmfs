@@ -10,12 +10,14 @@
 //! `cluster plugins show|add|remove`、`dev up --nodes N`、`dev leader`、`debug meta-hash`。M9 加了 `chain list|show|force-serving`
 //! （`chain.rs`）、`dev restart-all`、`dev pause|resume`、`dev wait chains-serving`、`dev up --profile nas-safe`。M10 加了
 //! `key create|list|revoke`、`session list|evict`（`key.rs`）、`dev wait session-evicted`、`mount --allow-other`。M11 加了
-//! `task list|show|pause|resume|run|set` 与 `datakey create`（`task.rs`）、`dev wait task-idle <任务>`。
+//! `task list|show|pause|resume|run|set` 与 `datakey create`（`task.rs`）、`dev wait task-idle <任务>`。M13 加了 `class create|update|list|show|delete`
+//! （`class.rs`）、`dev mount --node`、`mount --host-id` 与 `mount --cache local-nvme:DIR[:SIZE]`。
 //! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod attr;
 mod chain;
 mod changelog;
+mod class;
 mod cluster;
 mod debug;
 mod dev;
@@ -116,6 +118,11 @@ enum Cmd {
     Cluster {
         #[command(subcommand)]
         cmd: cluster::ClusterCmd,
+    },
+    /// 存储类（create、update、list、show、delete）
+    Class {
+        #[command(subcommand)]
+        cmd: class::ClassCmd,
     },
     /// 数据链（list、show、force-serving）
     Chain {
@@ -225,6 +232,7 @@ fn main() {
         Cmd::Status(a) => attr::status(a),
         Cmd::Changelog { cmd } => changelog::run_changelog(cmd),
         Cmd::Cluster { cmd } => cluster::run_cluster(cmd),
+        Cmd::Class { cmd } => class::run_class(cmd),
         Cmd::Chain { cmd } => chain::run_chain(cmd),
         Cmd::Key { cmd } => key::run_key(cmd),
         Cmd::Session { cmd } => key::run_session(cmd),
@@ -332,13 +340,15 @@ mod tests {
             "authz:posix-acl",
             "authz:posix-mode",
             "bg_task:gc",
+            "bg_task:rebalance",
             "bg_task:reconciler",
             "bg_task:scrub",
+            "bg_task:tiering",
             "bg_task:trash-expire",
             "bg_task:ttl",
             "codec:replica",
             "placement:label-match",
-            "qos:fifo",
+            "qos:mclock",
             "quota_admission:quota",
             "transform:aes-gcm",
             "transform:blake3",

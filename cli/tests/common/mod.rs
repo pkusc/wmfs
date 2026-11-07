@@ -37,6 +37,11 @@ impl Node {
 
     /// 挂上一个客户端（`env`：给挂载进程的环境变量，例如 `WMFS_FAILPOINTS`、`WMFS_LOG`）。
     pub fn mount(&self, name: &str, env: &[(&str, &str)]) -> Mount {
+        self.mount_cache(name, env, "memory:64M")
+    }
+
+    /// 同 [`Node::mount`]，缓存用 `--cache <cache>`（M13：`local-nvme:DIR[:SIZE]`）。
+    pub fn mount_cache(&self, name: &str, env: &[(&str, &str)], cache: &str) -> Mount {
         let mp = self.dir.join(name);
         std::fs::create_dir_all(&mp).unwrap();
         let log = self.dir.join(format!("{name}.log"));
@@ -44,7 +49,7 @@ impl Node {
         let err = File::create(self.dir.join(format!("{name}.stderr"))).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_wmfs"));
         cmd.arg("mount").arg(self.rpc()).arg(&mp).arg("--key-file").arg(&key).arg("--log").arg(&log);
-        cmd.args(["--cache", "memory:64M", "--op-timeout", "30s"]).env_remove("WMFS_FAILPOINTS");
+        cmd.args(["--cache", cache, "--op-timeout", "30s"]).env_remove("WMFS_FAILPOINTS");
         cmd.envs(env.iter().copied()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(err);
         let mut child = cmd.spawn().unwrap();
         let mp = std::fs::canonicalize(&mp).unwrap();

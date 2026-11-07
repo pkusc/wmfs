@@ -1,0 +1,13 @@
+# cache-local-nvme 缓存插件的 manifest（design.md 3.7.1、4.11）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "cache-local-nvme"
+version = "0.1.0"
+hooks = ["cache_store"]
+altitude = 0
+hot_path = true
+abi_version = 1
+attrs = []
+budget_ns = 50000000
+fail_points = ["plugin.cache-local-nvme.cache_store"]
+
+[config_schema]
+# 没有部署参数：目录与容量是挂载参数 --cache local-nvme:DIR[:SIZE]

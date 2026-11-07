@@ -42,6 +42,7 @@ pub fn handles(path: &str) -> bool {
         || super::cluster::handles(path)
         || super::keys::handles(path)
         || super::tasks::handles(path)
+        || super::classes::handles(path)
 }
 
 /// 签名校验 → 有元数据引擎 → 本节点是就绪的 leader → 按 (方法, 路径) 分派（见文件头）。
@@ -68,6 +69,9 @@ pub(super) fn serve(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&st
     }
     if super::tasks::handles(path) {
         return super::tasks::serve(ctx, eng, &req, method, path, body); // M11：后台任务、数据密钥
+    }
+    if super::classes::handles(path) {
+        return super::classes::serve(eng, &req, (method, path, query), body); // M13：存储类
     }
     if super::cluster::handles(path) {
         let usage = ctx.usage.as_deref();

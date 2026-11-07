@@ -17,12 +17,12 @@ use std::sync::atomic::AtomicUsize;
 
 use wmfs_api::failpoint;
 use wmfs_api::metrics;
-use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health, NodeAddrs};
+use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health, NodeAddrs, QosQueue, QosReply};
 
 use crate::base::{ErrCode, log};
 use crate::bg::progress::TaskBoard;
 use crate::data::datakey::Wrapper;
-use crate::hooks::traits::KeyLookup;
+use crate::hooks::traits::{BG_QUEUE, KeyLookup, QosPlugin, QueueStat};
 use crate::meta::changelog::{self, AUDIT_CURSOR};
 use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::engine::EmbeddedEngine;
@@ -51,6 +51,7 @@ pub struct MgmtCtx {
     pub board: Option<Arc<TaskBoard>>,
     pub wrapper: Option<Arc<Wrapper>>,
     pub live: Option<Arc<Live>>,
+    pub qos: Option<Arc<dyn QosPlugin>>, // 本节点的 qos 插件（`GET /api/v1/qos`，M13）
 }
 
 /// 已经绑定好地址、还没开始处理请求的管理 API（先绑定，才知道实际地址写进 health）。
@@ -144,9 +145,31 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
         (_, "/api/v1/failpoints") => failpoints(ctx, method, url, auth, body),
         ("GET", "/api/v1/debug/meta-hash") => cluster::meta_hash(ctx, method, url, auth, body), // 每个节点都回答本节点的（M8）
         ("GET", "/api/v1/node") => tasks::node_info(ctx, method, url, auth, body), // 每个节点都回答本节点的（M11）
+        ("GET", "/api/v1/qos") => qos(ctx, method, url, auth, body),               // 本节点的 QoS 队列（M13）
         (_, p) if api::handles(p) => api::serve(ctx, method, url, auth, body),
         _ => err(404, "enoent", format!("没有这个接口：{method} {path}")),
     }
+}
+
+/// `GET /api/v1/qos`（节点本地，需认证，7.1）：本节点 qos 插件的每个队列（后台队列的键写成 null）。
+fn qos(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]) -> Reply {
+    if let Err(d) = auth::check(&*ctx.keys, method, url, auth, body, false) {
+        return err(d.status, d.code, d.message);
+    }
+    let Some(q) = &ctx.qos else { return json(200, &QosReply::default()) };
+    let row = |s: QueueStat| {
+        let bg = s.key == BG_QUEUE; // 后台队列：三个键都是 null
+        QosQueue {
+            tenant: (!bg).then_some(s.key.tenant),
+            qos_id: (!bg).then_some(s.key.qos_id),
+            class_id: (!bg).then_some(s.key.class_id),
+            depth: s.depth,
+            served_per_s: s.served_per_s,
+            deficit_per_s: s.deficit_per_s,
+            limited_total: s.limited_total,
+        }
+    };
+    json(200, &QosReply { plugin: q.manifest().name.into(), queues: q.stats().into_iter().map(row).collect() })
 }
 
 /// `audit-log` 游标落后最新 changelog 的条数（3.8 变更通知 ⑥：`audit` 第一次启用时才有这个游标；没有 → None）。
@@ -230,8 +253,8 @@ mod tests {
         };
         let keys = Arc::new(InitKeys::new(MASTER, 0));
         let (meta, usage, polls) = (None, None, AtomicUsize::new(0));
-        let (board, wrapper, live) = (None, None, None);
-        let ctx = MgmtCtx { health, role: None, keys, failpoints_api, meta, usage, polls, board, wrapper, live };
+        let (board, wrapper, live, qos) = (None, None, None, None);
+        let ctx = MgmtCtx { health, role: None, keys, failpoints_api, meta, usage, polls, board, wrapper, live, qos };
         m.start(Arc::new(ctx)).unwrap();
         addr
     }

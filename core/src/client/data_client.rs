@@ -10,6 +10,10 @@
 //!   数据请求天然幂等（同一 extents 写两次结果相同，3.3.8），所以重试不需要 seq。不用 `net::retry::retry`：重定向与换副本要
 //!   立即重发、不退避（重定向同样受总期限约束，换副本最多换链长那么多次），只有可重试的错误才退避。
 //!
+//! 实现注记（M13，ADR-0040 第 10 条）：读的副本顺序接入 codec 插件的 `read_order`（[`DataClient::with_codec`]，按 3.7.4 包装调用）——
+//! Serving 成员里与客户端同一台"主机"的优先（[`DataClient::with_host`]：host_id 与节点的 host_id 相同；`wmfs dev mount --node n` 冒充第 n
+//! 个节点所在的主机），其余按 chunk 轮转，把读负载分散到各副本；没有 codec 插件（测试）或它出错 → 同主机的优先、其余按链序（M9 的做法）。
+//! ADR-0041 的读窗口规则照旧：`CHUNK_DIRTY` 改问 last serving、`BUSY`/连不上/`FENCED` 马上换下一个 Serving 副本。
 //! 实现注记（M5）：`new` 的 `background` 参数不用（后台请求由 cap 的管理权限位标明，`proto/cap.rs` 的注记）；读的 `into` 只在第一次
 //! 尝试时当 `recv_into` 用，重试时从 RpcClient 的池里另取一个（所以返回的缓冲不一定是 `into`——3.12 的签名本来就返回缓冲）；副本先按链序
 //! 选（codec 的 `read_order` 在 M9 有多副本时接入）。新增（只增不改）：[`DataClient::with_refresh`]、[`DataClient::with_timeouts`]、
@@ -23,6 +27,9 @@ use super::meta_client::MetaClient;
 use crate::base::types::ChunkId;
 use crate::base::{ErrCode, clock, rand};
 use crate::buf::{Buf, BufSlice, Lane, MemPool, POOL_WAIT};
+use crate::hooks::manifest::Hook;
+use crate::hooks::pipeline::HookCall;
+use crate::hooks::traits::CodecPlugin;
 use crate::meta::cluster::chains::SERVING;
 use crate::meta::schema::records::LayoutV1;
 use crate::net::client::{Endpoint, Family, RpcClient};
@@ -38,13 +45,15 @@ pub struct DataClient {
     refresh: Option<Arc<dyn Fn() + Send + Sync>>,
     rpc_timeout: Duration,
     op_timeout: Duration,
+    codec: Option<(Arc<dyn CodecPlugin>, HookCall)>, // M13：读副本的顺序（见文件头）
+    host_id: String,                                 // M13：本客户端所在的"主机"（空 = 不认）
 }
 
 /// 发给谁：链的 head，或某个 Serving 成员（读：`prefer` = 优先这个节点上的；`into` = 第一次尝试的接收缓冲，`len` = 重试时
 /// 另取的接收缓冲多大）。
 enum To {
     Head,
-    Read { prefer: Option<u32>, into: Option<Buf>, len: usize },
+    Read { prefer: Option<u32>, into: Option<Buf>, len: usize, chunk: ChunkId },
 }
 
 /// 文件第 `idx` 个 chunk 的身份：链 = `layout.chains[idx % chains.len()]`（3.2.4，在 (ino, epoch) 的生命周期内固定）。
@@ -65,7 +74,20 @@ impl DataClient {
     ) -> DataClient {
         let _ = background; // 见文件头的实现注记
         let (rpc_timeout, op_timeout) = (Duration::from_secs(10), Duration::from_secs(120));
-        DataClient { rpc, map, refresh: None, rpc_timeout, op_timeout }
+        DataClient { rpc, map, refresh: None, rpc_timeout, op_timeout, codec: None, host_id: String::new() }
+    }
+
+    /// 读副本的顺序按这个 codec 插件的 `read_order`（见文件头）。
+    pub fn with_codec(mut self, c: Arc<dyn CodecPlugin>) -> DataClient {
+        let h = HookCall::new(c.manifest(), Hook::Codec);
+        self.codec = Some((c, h));
+        self
+    }
+
+    /// 本客户端所在的"主机"（读时优先同一主机上的副本，见文件头）。
+    pub fn with_host(mut self, host_id: String) -> DataClient {
+        self.host_id = host_id;
+        self
     }
 
     /// 用 MetaClient 的集群图建一个 DataClient（CLI、FUSE、测试共用）：集群图过期时让 MetaClient 拉一张新的（C6）。
@@ -115,7 +137,12 @@ impl DataClient {
     ) -> Result<(Buf, u32 /*实际长度*/), ErrCode> {
         let _ = layout; // 多副本、纠删码时选分片用（M9 起）
         let op = |ver| DataOp::ReadChunk { chunk, chain_ver: ver, off, len };
-        let to = To::Read { prefer: prefer_node, into: Some(into), len: len as usize };
+        let prefer = match prefer_node {
+            Some(n) => Some(n),
+            None if self.host_id.is_empty() => None,
+            None => host_node(&(self.map)(), &self.host_id), // 与本客户端同一台"主机"的节点（见文件头）
+        };
+        let to = To::Read { prefer, into: Some(into), len: len as usize, chunk };
         let f = self.exchange(cap, chunk.chain, &op, &[], to)?;
         let n = match decode_body(&f.body)? {
             DataReply::Read { len, .. } => len,
@@ -190,7 +217,7 @@ impl DataClient {
         let (mut backoff, mut skip, mut down, mut redirect) = (BACKOFF_START_MS, Vec::new(), Vec::new(), None);
         loop {
             let map = (self.map)();
-            let code = match pick(&map, chain, &to, &skip, &down, redirect.take()) {
+            let code = match pick(&map, chain, &to, &skip, &down, redirect.take(), self.codec.as_ref()) {
                 Err(e) => e,
                 Ok((ver, target, ep)) => {
                     let recv_into = match &mut to {
@@ -260,6 +287,11 @@ fn written(f: &InFrame) -> Result<u64, ErrCode> {
     }
 }
 
+/// host_id 是 `host` 的节点（没有 → None）。
+fn host_node(map: &ClusterMap, host: &str) -> Option<u32> {
+    map.nodes.iter().find(|(_, n)| n.host_id == host).map(|(id, _)| *id)
+}
+
 /// 这一次发给谁：(chain_ver, target, 它所在节点的地址)。读的副本都试过、都坏了 → `EIO`；集群图里没有这条链、没有 Serving
 /// 成员或找不到地址 → `NOT_SERVING`（拉新集群图后重试）。
 fn pick(
@@ -269,6 +301,7 @@ fn pick(
     skip: &[u32],
     down: &[u32],
     redirect: Option<u32>,
+    codec: Option<&(Arc<dyn CodecPlugin>, HookCall)>,
 ) -> Result<(u64, u32, Endpoint), ErrCode> {
     let (_, c) = map.chains.iter().find(|(id, _)| *id == chain).ok_or(ErrCode::NOT_SERVING)?;
     let node_of = |t: u32| map.targets.iter().find(|(id, _)| *id == t).map(|(_, r)| r.node);
@@ -277,13 +310,19 @@ fn pick(
         (To::Head, _) => *serving.first().ok_or(ErrCode::NOT_SERVING)?,
         (To::Read { .. }, Some(t)) if down.contains(&t) => return Err(ErrCode::NOT_SERVING), // last serving 连不上：退避
         (To::Read { .. }, Some(t)) => t,
-        (To::Read { prefer, .. }, None) => {
+        (To::Read { prefer, chunk, .. }, None) => {
             serving.retain(|t| !skip.contains(t) && !down.contains(t));
             if let Some(n) = prefer {
                 serving.sort_by_key(|t| node_of(*t) != Some(*n)); // 稳定排序：同节点的在前，其余保持链序
             }
+            let with_nodes: Vec<(u32, u32)> = serving.iter().map(|t| (*t, node_of(*t).unwrap_or(0))).collect();
+            let order: Vec<u32> = match codec {
+                Some((c, h)) => h.call(|| Ok(c.read_order(&with_nodes, *prefer, chunk))).unwrap_or_default(), // 出错 → 链序
+                None => vec![],
+            };
             let none = if skip.is_empty() || !down.is_empty() { ErrCode::NOT_SERVING } else { ErrCode::EIO };
-            *serving.first().ok_or(none)?
+            let first = order.into_iter().find(|t| serving.contains(t)); // 只认 Serving 里的
+            first.or_else(|| serving.first().copied()).ok_or(none)?
         }
     };
     let node = node_of(target).ok_or(ErrCode::NOT_SERVING)?;

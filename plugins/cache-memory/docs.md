@@ -16,7 +16,7 @@
 
 ## 配置
 
-挂载参数 `--cache memory[:SIZE]`（默认 `memory:512M`），`--cache none` 关掉缓存；没有 node.toml 里的部署参数。local-nvme 缓存在 M13。
+挂载参数 `--cache memory[:SIZE]`（默认 `memory:512M`），`--cache none` 关掉缓存；没有 node.toml 里的部署参数。要更大的、放在本地盘上的缓存用 cache-local-nvme（`--cache local-nvme:DIR[:SIZE]`）。
 
 ## 诚实说明
 

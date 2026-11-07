@@ -25,32 +25,34 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::api::types::{AttrEntry, AttrGetReply, AttrSetReply, AttrUnsetReply, DEFAULT_SOURCE, DirAttrs};
 use crate::base::types::Role;
-use crate::base::units::{fmt_duration, fmt_size};
 use crate::base::{ErrCode, Failed};
-use crate::data::format::{CMP_NONE, CMP_ZSTD, ENC_AES256GCM, checksum_name, compress_name};
+use crate::data::format::{CMP_NONE, ENC_AES256GCM};
 use crate::hooks::traits::TransformKind;
-use crate::meta::attr_registry::trash_ttl_audit::{audit_text, fmt_ms};
+use crate::meta::attr_registry::qos_tier::{qos_class, qos_spec, split_tier};
 use crate::meta::attr_registry::{AttrKind, Effect, Parsed, REGISTRY, find, spec_of};
 use crate::meta::attrs::{
     CONSISTENCY_STRONG, EffectiveAttrs, bump_attr_epoch, checksum_id, compress_id, queue_reconcile,
 };
 use crate::meta::changelog::{self, AUDIT_CURSOR, Change};
 use crate::meta::cluster::chains::{SERVING, candidates};
+use crate::meta::cluster::classes::envelope;
 use crate::meta::engine::txn::{KvRead, KvScan, KvTxn, OpCtx};
-use crate::meta::ns::acl;
 use crate::meta::ns::common::Node;
 use crate::meta::ns::read_ops::{node_at, path_of};
 use crate::meta::quota;
 use crate::meta::schema::keys::{self, T_DIRATTR};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::{AttrMapV1, ChainRecV1, ClassIdV1, DataKeyIdV1, DataKeyV1, decode_v1};
+use crate::meta::schema::records::{
+    AttrMapV1, ChainRecV1, ClassIdV1, DataKeyIdV1, DataKeyV1, QosSpecV1, StorageClassV1, decode_v1,
+};
 use crate::proto::peer::ClusterMap;
 
+mod display;
 mod status;
+use display::{effective_text, isolation_text, qos_actual, shown, ttl};
 pub use status::status;
 
 /// `-r` 最多列出、status 最多检查多少个目录。
@@ -81,11 +83,17 @@ fn check(v: &dyn KvRead, c: &OpCtx, p: &Parsed) -> Result<String, Failed> {
             format!("属性 {k} 没有已启用的插件消费（消费它的插件：{who}；node.toml 的 [plugins] disable 里停掉了？）");
         return Err(Failed::new(ErrCode::EINVAL, msg));
     }
-    let class = if k == "class" { Some(p.norm.as_str()) } else { p.key.strip_prefix("quota.") }; // quota.<类> 的类也要存在
-    if let Some(name) = class
-        && kv::get::<ClassIdV1>(v, &keys::class_name(name))?.is_none()
-    {
-        return Err(Failed::new(ErrCode::EINVAL, format!("存储类 {name} 不存在")));
+    // 提到的存储类都要存在：class、quota.<类>、tier 的两端、qos=<类>（M13）
+    let names: Vec<&str> = match k {
+        "class" => vec![p.norm.as_str()],
+        "tier" => split_tier(&p.norm).map_or(vec![], |(a, b, _)| vec![a, b]),
+        "qos" => qos_class(&p.norm).into_iter().collect(),
+        _ => p.key.strip_prefix("quota.").into_iter().collect(),
+    };
+    for name in names {
+        if kv::get::<ClassIdV1>(v, &keys::class_name(name))?.is_none() {
+            return Err(Failed::new(ErrCode::EINVAL, format!("存储类 {name} 不存在")));
+        }
     }
     let off = |kind, alg| c.pipeline.transform(kind, alg).is_none();
     let bad = |what: &str| Err(Failed::new(ErrCode::EINVAL, format!("{what} {} 的插件没有启用", p.norm)));
@@ -95,8 +103,17 @@ fn check(v: &dyn KvRead, c: &OpCtx, p: &Parsed) -> Result<String, Failed> {
             bad("压缩算法")
         }
         "encrypt" if p.norm != "none" => datakey_of(v, c, &p.norm),
-        _ => Ok(p.norm.clone()),
+        _ => Ok(p.norm.clone()), // qos=<类> 存类名原样（活的借用，ADR-0044 第 2 条；QOS 表里的数值见 [`qos_record`]）
     }
+}
+
+/// DIRATTR 里存的 qos 值 → QOS 表里放的数值：类名（借用）= 那个类此刻的包络（`wmfs class update` 改了 [qos] 时 `mgmt/classes.rs`
+/// 重写借用它的目录的记录，ADR-0044 第 2 条），否则就是存的数值。
+fn qos_record(v: &dyn KvRead, norm: &str) -> Result<QosSpecV1, Failed> {
+    let Some(name) = qos_class(norm) else { return Ok(qos_spec(norm).ok_or(ErrCode::INTERNAL)?) };
+    let id = kv::get::<ClassIdV1>(v, &keys::class_name(name))?.ok_or(ErrCode::INTERNAL)?.id; // check 已核对它存在
+    let k = kv::get::<StorageClassV1>(v, &keys::class(id))?.ok_or(ErrCode::INTERNAL)?;
+    Ok(envelope(&k))
 }
 
 /// `encrypt=tenant:<名字>`：加密插件已启用、数据密钥存在（DATAKEY_NAME 点查）、属于设置者的租户（admin 例外）→ 它的数字 id。
@@ -114,18 +131,6 @@ fn datakey_of(v: &dyn KvRead, c: &OpCtx, norm: &str) -> Result<String, Failed> {
         return Err(Failed::new(ErrCode::EACCES, format!("数据密钥 {name} 属于租户 {}，不是你的", k.tenant)));
     }
     Ok(id.to_string())
-}
-
-/// 一个键的存储形式 → 显示形式：`encrypt` 存的是数据密钥的 id，按集群图显示成 `tenant:<名字>`；其余按注册表的 `show`。
-fn shown(c: &OpCtx, key: &str, norm: &str) -> String {
-    match (key, norm.parse::<u32>()) {
-        ("encrypt", Ok(id)) => format!("tenant:{}", datakey_name(c, id)),
-        _ => find(key).map_or(norm.to_string(), |s| (s.show)(norm)),
-    }
-}
-
-fn datakey_name(c: &OpCtx, id: u32) -> String {
-    c.map.datakeys.iter().find(|(i, _)| *i == id).map_or(format!("#{id}"), |(_, k)| k.name.clone())
 }
 
 pub fn set(v: &mut dyn KvTxn, c: &OpCtx, path: &str, items: &[Parsed]) -> Result<AttrSetReply, Failed> {
@@ -153,17 +158,21 @@ pub fn set(v: &mut dyn KvTxn, c: &OpCtx, path: &str, items: &[Parsed]) -> Result
         _ => None,
     };
     kv::put(v, &keys::dirattr(d.ino), &m);
+    if let Some(norm) = m.entries.get("qos").filter(|_| given_norm(items, "qos").is_some()) {
+        // 同批写 QOS 表，随集群图下发给数据节点（4.5，M13；qos=<类> 放那个类此刻的包络，ADR-0044 第 2 条）
+        let q = qos_record(v, norm)?;
+        kv::put(v, &keys::qos(d.ino), &q);
+        kv::bump_map_epoch(v)?;
+    }
     bump_attr_epoch(v)?; // 最后一步（见文件头）
-    // 这次给出的键的规范化值（没给 → None）
-    let given = |k: &str| items.iter().find(|p| p.spec.key == k).map(|p| p.norm.as_str());
-    let class = match given("class") {
+    let class = match given_norm(items, "class") {
         Some(name) => kv::get::<ClassIdV1>(v, &keys::class_name(name))?.map_or(before.class_id, |x| x.id),
         None => before.class_id,
     };
-    let replicas = given("replicas").and_then(|r| r.parse().ok()).unwrap_or(before.replicas);
-    let stripe = given("stripe").and_then(|s| s.parse().ok()).unwrap_or(before.stripe);
-    let topo = given("replicas").is_some() || given("class").is_some();
-    let check_stripe = topo || given("stripe").is_some();
+    let replicas = given_norm(items, "replicas").and_then(|r| r.parse().ok()).unwrap_or(before.replicas);
+    let stripe = given_norm(items, "stripe").and_then(|s| s.parse().ok()).unwrap_or(before.stripe);
+    let topo = given_norm(items, "replicas").is_some() || given_norm(items, "class").is_some();
+    let check_stripe = topo || given_norm(items, "stripe").is_some();
     out.warnings = unmet(c.map, class, replicas, stripe, topo, check_stripe, "");
     let moved: Vec<&str> =
         items.iter().filter(|p| p.spec.effect == Effect::NewDataAndReconcile).map(|p| p.spec.key).collect();
@@ -182,6 +191,7 @@ pub fn set(v: &mut dyn KvTxn, c: &OpCtx, path: &str, items: &[Parsed]) -> Result
     Ok(out)
 }
 
+/// 这次给出的键 `key` 的规范化值（没给 → None）。
 fn given_norm<'a>(items: &'a [Parsed], key: &str) -> Option<&'a str> {
     items.iter().find(|p| p.spec.key == key).map(|p| p.norm.as_str())
 }
@@ -211,6 +221,10 @@ pub fn unset(v: &mut dyn KvTxn, c: &OpCtx, path: &str, key: &str) -> Result<Attr
     let extra = vec![("key".into(), key.into()), ("old".into(), old.clone())];
     changelog::append(v, c, Change { op: "AttrUnset", ino: d.ino, extra, ..Default::default() })?;
     quota::forget(v, d.ino, key)?; // 配额键：软限的起点一并删掉
+    if key == "qos" {
+        v.delete(&keys::qos(d.ino)); // M13：QOS 表里这一项也删掉
+        kv::bump_map_epoch(v)?;
+    }
     if s.effect == Effect::NewDataAndReconcile {
         queue_reconcile(v, d.ino, 1)?;
     }
@@ -260,42 +274,6 @@ fn unmet(
     w
 }
 
-/// 一个键的生效值（显示形式）。加了键要在这里加一行（`attr_registry.rs` 文件头的清单）。
-fn display(c: &OpCtx, e: &EffectiveAttrs, own: &AttrMapV1, key: &str) -> String {
-    match key {
-        "class" => c.map.class_name(e.class_id),
-        "replicas" => e.replicas.to_string(),
-        "chunk" => fmt_size(e.chunk as u64),
-        "stripe" => e.stripe.to_string(),
-        "inline" => fmt_size(e.inline_max as u64),
-        "checksum" => checksum_name(e.checksum).into(),
-        "compress" if e.compress == CMP_ZSTD => format!("zstd:{}", e.compress_level),
-        "compress" => compress_name(e.compress).into(),
-        "encrypt" if e.encrypt_key == 0 => "none".into(),
-        "encrypt" => format!("tenant:{}", datakey_name(c, e.encrypt_key)),
-        "consistency" if e.consistency == CONSISTENCY_STRONG => "strong".into(),
-        "consistency" => format!("cto,attr_ttl={}", ttl(e)),
-        "inherit" => own.entries.get(key).cloned().unwrap_or_else(|| "true".into()), // 只看目录自己的
-        // Stacked：最近的那个（来源一栏是它的目录）；没有 → none
-        "quota" | "quota.*" => {
-            let q = e.quotas.iter().find(|(_, q)| q.class.is_some() == (key == "quota.*"));
-            q.map_or("none".into(), |(_, q)| quota::decl_text(q, q.class.map(|k| c.map.class_name(k)).as_deref()))
-        }
-        "acl.default" => {
-            e.acl_default.as_deref().and_then(|b| acl::parse(b).ok()).map_or("none".into(), |a| acl::to_text(&a))
-        }
-        "trash" => fmt_ms(e.trash_ms), // M12：0 显示成 off
-        "ttl" => fmt_ms(e.ttl_ms),
-        "audit" => audit_text(&e.audit),
-        // 这里还没处理的键（不该有）：目录自己存的值（显示形式），没有就空着——不冒充成某个生效值
-        _ => own.entries.get(key).map(|x| find(key).map_or(x.clone(), |s| (s.show)(x))).unwrap_or_default(),
-    }
-}
-
-fn ttl(e: &EffectiveAttrs) -> String {
-    fmt_duration(Duration::from_millis(e.attr_ttl_ms as u64))
-}
-
 /// 一个键的来源：来源目录的路径，内置默认值是 [`DEFAULT_SOURCE`]；Local 键（inherit）只看目录自己的。
 fn source(v: &dyn KvRead, e: &EffectiveAttrs, own: &AttrMapV1, dir: u64, key: &str) -> Result<String, ErrCode> {
     let local = find(key).is_some_and(|s| s.kind == AttrKind::Local);
@@ -319,13 +297,13 @@ pub fn get(v: &dyn KvScan, c: &OpCtx, path: &str, recursive: bool) -> Result<Att
     let (dir, e, own) = dir_attrs_of(v, c, &node_at(v, c, path)?)?;
     let mut attrs = Vec::new();
     for s in REGISTRY.iter() {
-        let value = display(c, &e, &own, s.key);
+        let value = effective_text(c, &e, &own, s.key);
         let source = source(v, &e, &own, dir, s.key)?;
         attrs.push(AttrEntry { key: s.key.into(), value, source, effect: s.effect.name().into() });
     }
     let warnings = unmet(c.map, e.class_id, e.replicas, e.stripe, true, true, "这个目录：");
     let actual = domains(c.map, e.class_id).min(e.replicas as usize);
-    let iso = "shared-device(先进先出,不承诺份额与尾延迟)"; // qos 插件现在只有 fifo（mclock 在 M13，到时按插件分开写）
+    let iso = isolation_text(c, e.class_id); // M13：mclock 时是由实际部署算出的隔离承诺（6.3）
     let from = match source(v, &e, &own, dir, "consistency")? {
         s if s == DEFAULT_SOURCE => s,
         s => format!("(来源 {s})"),

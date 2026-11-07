@@ -96,9 +96,12 @@ pub enum DevCmd {
         /// client key（默认 <开发目录>/n1/keys/client.key）
         #[arg(long)]
         key_file: Option<PathBuf>,
-        /// 块缓存：memory[:SIZE] 或 none（传给 wmfs mount --cache）
+        /// 块缓存：memory[:SIZE]、local-nvme:DIR[:SIZE] 或 none（传给 wmfs mount --cache）
         #[arg(long)]
         cache: Option<String>,
+        /// 客户端冒充第 n 个开发节点所在的"主机"（locality 演示；传给 wmfs mount --host-id host-<n>）
+        #[arg(long)]
+        node: Option<u32>,
     },
     /// 卸载 wmfs dev mount 挂上的挂载点，等挂载进程写完数据退出
     Umount { mountpoint: PathBuf },
@@ -146,7 +149,7 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
             .map_err(|e| format!("读 {} 失败：{e}", log_path(&d, n).display())),
         DevCmd::Wait { what, timeout } => wait::wait(&d, &what, timeout),
         DevCmd::Leader => cluster::leader(&d),
-        DevCmd::Mount { mountpoint, key_file, cache } => mount::mount(&d, &mountpoint, &key_file, &cache),
+        DevCmd::Mount { mountpoint, key_file, cache, node } => mount::mount(&d, &mountpoint, &key_file, &cache, node),
         DevCmd::Umount { mountpoint } => mount::umount(&d, &mountpoint),
         DevCmd::ClientPid { mountpoint } => mount::client_pid(&d, &mountpoint),
     };

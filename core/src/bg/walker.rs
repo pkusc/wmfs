@@ -2,7 +2,8 @@
 //!
 //! - **子树 DFS**（[`Walker::subtree`]）：游标 = 栈 `Vec<(目录 ino, 这个目录里最后处理的名字)>` 的 postcard 编码（空 = 从 `root` 开始）。
 //!   每次最多读 256 个目录项：取栈顶目录、按名字顺序往后读；遇到子目录就把它压栈、先进去（DFS），一个目录读完就弹出。每项读出 inode 与
-//!   它的生效属性（目录 = 它自己的，其他 = 主父目录的，`ns::common::governing`；按 attr_epoch 缓存）。
+//!   它的生效属性（目录 = 它自己的，其他 = 主父目录的，`ns::common::governing`；按 attr_epoch 缓存；M13 起文件再套用 tier 规则——
+//!   `bg::status::declared`，所以协调器、tiering 与 `wmfs status` 拿到的都是同一份"声明"）。
 //! - **全量扁平扫描**（[`Walker::flat`]）：按 ino 顺序扫 INODE 键空间，游标 = 上次的 ino（最简单、天然可续跑）。
 //!
 //! 每次调用是一个线性一致读（一个一致的快照）；两次调用之间命名空间可能变了（rename、删除）：子树里新出现的东西可能这一遍看不到、
@@ -11,6 +12,7 @@
 
 use std::sync::Arc;
 
+use super::status::declared;
 use crate::base::ErrCode;
 use crate::base::types::ReqCtx;
 use crate::meta::attrs::EffectiveAttrs;
@@ -103,7 +105,7 @@ impl Walker {
 }
 
 fn walked(v: &dyn KvScan, c: &OpCtx, n: Node, parent: u64, name: Vec<u8>) -> Result<Walked, ErrCode> {
-    let eff = governing(v, c, &n)?;
+    let eff = declared(c, n.ino, &n.rec, governing(v, c, &n)?); // 实现注记（M13）：再套用 tier 规则（`bg::status::declared`）
     Ok(Walked { ino: n.ino, inode: n.rec, parent, name, eff })
 }
 

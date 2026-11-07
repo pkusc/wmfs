@@ -3,6 +3,10 @@
 //! - **到期**：距 leader 最近一次收到它的心跳（`sessions::Live`，本任期记下的）超过 `session_lease` → 第一阶段。换了 leader（或刚
 //!   就绪）时计时重置为就绪那一刻（3.4.1.10：驱逐最多推迟一个租约周期，推迟是安全的，提前才危险）。调小租约的过渡（ADR-0038
 //!   第 5 条）：判定用 max(当前值, GLOBAL `settings_prev`)；settings_prev 由链管理器在一个旧租约周期之后删掉（`chain_mgr.rs`）。
+//!   实现注记（M13 收尾，ADR-0044 第 10 条）：本任期还没有心跳记录的 Active 会话，从**驱逐线程本任期第一次看到它**的时刻起算（自己记，
+//!   换任期清空，不再是 Active 就删）——新会话的记录在 SessionOpen 的批次一应用就扫得到，`Live::touch` 却要等回调才做，以前按就绪时刻
+//!   算，leader 就绪已超过一个租约时落在这个空隙里的新会话会被立即驱逐。不能用 `Live::touch` 补记：它把会话记成"已收到打开文件的全集"，
+//!   换 leader 之后孤儿 GC 会以为它没打开任何文件。
 //! - **第一阶段**（[`evict`]，一个批次；手动驱逐 `POST /api/v1/sessions/<id>/evict` 与撤销 key 也走它）：`state = Evicting`、
 //!   `evict_since_ms`、`map_epoch += 1`、`EVICTED(session) = {evicted_ms, map_epoch: 新值}`、changelog `SessionEvicted`
 //!   （`extra` 的 `why` 是原因）。之后它的任何请求 → `SESSION_EVICTED`；数据节点拿到新集群图就拒绝它的 cap（`data/service.rs`，
@@ -15,6 +19,7 @@
 //!   一行）。换了 leader 之后从 `state = Evicting` 与 `evict_map_epoch` 重新判断（3.4.1.10 的表）。
 //! - 指标 `wmfs_meta_sessions`（7.3：Active 的会话数，只有就绪的 leader 报，每 1 s 刷新）。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use wmfs_api::metrics::{self, Gauge};
@@ -42,6 +47,7 @@ pub const EVICTED_KEEP_MS: u64 = 24 * 3600 * 1000;
 pub struct Evictor {
     term: u64,
     ready_since: u64,
+    first_seen: HashMap<u64, u64>, // Active 会话 → 本任期第一次看到它的时刻（ADR-0044 第 10 条，见文件头）
 }
 
 impl Evictor {
@@ -55,6 +61,7 @@ impl Evictor {
         }
         if role.term != self.term {
             (self.term, self.ready_since) = (role.term, now);
+            self.first_seen.clear();
         }
         // 集群图或 settings_prev 读不出来：这一轮不做决定——绝不退回到调小之后的较短租约
         let Ok(map) = eng.cluster_map() else { return };
@@ -64,12 +71,14 @@ impl Evictor {
         if eng.local_scan(&mut |v| kv::scan_tag(v, T_SESSION).map(|r| rows = r)).is_err() {
             return;
         }
-        let mut active = 0;
+        let mut seen = HashMap::new(); // 这一轮的 Active 会话 → 本任期第一次看到它的时刻
         for (k, b) in rows {
             let (sid, Ok(rec)) = (kv::key_id(&k), decode_v1::<SessionRecV1>(&b)) else { continue };
             if rec.state == SESSION_ACTIVE {
-                active += 1;
-                let idle = now.saturating_sub(live.last_seen(sid, role.term).unwrap_or(0).max(self.ready_since));
+                let first = self.first_seen.get(&sid).copied().unwrap_or(now);
+                seen.insert(sid, first);
+                // 本任期最后一次心跳；没有记录（新会话的 Live::touch 还没做）→ 本任期第一次看到它的时刻（ADR-0044 第 10 条）
+                let idle = now.saturating_sub(live.last_seen(sid, role.term).unwrap_or(first).max(self.ready_since));
                 if idle > s.session_lease_ms {
                     let why = format!("{idle} ms 没有收到心跳（会话租约 {} ms）", s.session_lease_ms);
                     let _ = evict(eng, sid, why); // 失败（例如刚失去 leader）：下一轮再看
@@ -92,7 +101,8 @@ impl Evictor {
                 Err(e) => log::warn("evict", format_args!("会话 {sid:x} 驱逐第二阶段没有提交：{e}（下一轮再试）")),
             }
         }
-        sessions_gauge().set(active as f64);
+        sessions_gauge().set(seen.len() as f64);
+        self.first_seen = seen; // 不再是 Active（或已删除）的会话不再记
     }
 }
 

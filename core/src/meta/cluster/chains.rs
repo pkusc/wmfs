@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 
 use crate::base::ErrCode;
 use crate::hooks::traits::ChainView;
+use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::engine::txn::{KvTxn, OpCtx};
 use crate::meta::schema::keys::{self, G_NEXT_CHAIN};
 use crate::meta::schema::kv;
@@ -30,10 +31,15 @@ fn label_ok(labels: &[String], label: &str) -> bool {
     label == "*" || labels.iter().any(|l| l == label)
 }
 
-/// 存储类 `class` 可以用 target `t` 吗（不看它此刻是否 Up）：不是只读、标签匹配、不被另一个 dedicated 类占用。
-fn fits(m: &ClusterMap, class: &StorageClassV1, t: &TargetRecV1) -> bool {
+/// 存储类 `class` 可以用 target `t` 吗（不看它此刻是否 Up）：不是只读、[`owned`]。
+pub fn fits(m: &ClusterMap, class: &StorageClassV1, t: &TargetRecV1) -> bool {
+    !t.read_only && owned(m, class, t)
+}
+
+/// target `t` 归存储类 `class` 用吗：标签匹配、不被另一个 dedicated 类占用（不看只读与在不在线）。
+pub fn owned(m: &ClusterMap, class: &StorageClassV1, t: &TargetRecV1) -> bool {
     let taken = m.classes.iter().any(|k| k.dedicated && k.id != class.id && label_ok(&t.labels, &k.label));
-    !t.read_only && label_ok(&t.labels, &class.label) && !taken
+    label_ok(&t.labels, &class.label) && !taken
 }
 
 /// 存储类 `class` 能用的 target：Up 且 [`fits`]，(target, node)，按 target id 升序。
@@ -99,7 +105,7 @@ pub fn gen_chains(
             removed: vec![],
         };
         kv::put(v, &keys::chain(id), &rec);
-        out.push(view_of(c.map, id, &rec));
+        out.push(view_of(c.map, c.usage, id, &rec));
     }
     if !out.is_empty() {
         kv::bump_map_epoch(v)?; // 改变了链的批次在同一批次里 map_epoch += 1（3.3.6）
@@ -108,18 +114,24 @@ pub fn gen_chains(
 }
 
 /// 一条链给 placement 看的样子：成员 (target, node)、Serving 成员数、容量（有上限的成员里最小的那个；成员全都不限或未知
-/// 才是 0 = 不限）。实现注记（M4）：`used` 来自 target 心跳（M5），现在一律是 0。
-pub fn view_of(m: &ClusterMap, id: u32, r: &ChainRecV1) -> ChainView {
+/// 才是 0 = 不限）。实现注记（M13）：容量与已用来自 leader 内存里的 target 心跳（`usage`：心跳报的容量 = min(配置的 capacity,
+/// 文件系统大小)；还没听到心跳的成员用记录里配置的容量、已用按 0），已用取成员里最多的那个——链满不满看最满的成员。
+pub fn view_of(m: &ClusterMap, usage: &TargetUsage, id: u32, r: &ChainRecV1) -> ChainView {
     let target = |t: u32| m.targets.iter().find(|(i, _)| *i == t).map(|(_, x)| x);
-    let caps = r.members.iter().filter_map(|(t, _)| target(*t)).map(|x| x.capacity);
+    // (容量, 已用)：心跳报的；还没听到心跳的用记录里配置的容量、已用按 0
+    let stat = |t: u32| match usage.stat(t) {
+        Some(s) => (s.capacity, s.used),
+        None => (target(t).map_or(0, |x| x.capacity), 0),
+    };
+    let stats: Vec<(u64, u64)> = r.members.iter().map(|(t, _)| stat(*t)).collect();
     ChainView {
         id,
         class_id: r.class_id,
         replicas: r.replicas,
         serving: serving_count(r) as u8,
         members: r.members.iter().map(|(t, _)| (*t, target(*t).map_or(0, |x| x.node))).collect(),
-        used: 0,
-        capacity: caps.filter(|c| *c > 0).min().unwrap_or(0),
+        used: stats.iter().map(|s| s.1).max().unwrap_or(0),
+        capacity: stats.iter().map(|s| s.0).filter(|c| *c > 0).min().unwrap_or(0),
     }
 }
 

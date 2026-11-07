@@ -204,7 +204,7 @@ pub fn relay(node: &DataNode, op: PeerOp, succ: u32, up: Responder, ok: Vec<u8>)
     rpc.call_cb(&ep, Family::Data, peer_frame(&op, vec![]), RELAY_TIMEOUT, Box::new(cb));
 }
 
-/// 转发到后继失败 / 成功（"持续 10 s 无法把转发送达后继"由心跳上报，3.4.2.10）。
+/// 转发送不到后继（连接断开、超时）/ 送到了（后继回了话，哪怕回的是错误）："持续 10 s 无法把转发送达后继"由心跳上报，3.4.2.10。
 pub fn note_fail(node: &DataNode, chain: u32, succ: u32) {
     lock(&node.fwd_fail).entry((chain, succ)).or_insert_with(clock::wall_ms);
 }

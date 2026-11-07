@@ -184,6 +184,9 @@ pub struct QueueKey {
     pub class_id: u16,
 }
 
+/// 后台请求的队列键（4.5，实现注记（M13），只增）：qos 插件把 `background` 的请求都放进这一个队列，`stats()` 里按它认出后台队列。
+pub const BG_QUEUE: QueueKey = QueueKey { tenant: u32::MAX, qos_id: u64::MAX, class_id: u16::MAX };
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QosItem {
     pub key: QueueKey,

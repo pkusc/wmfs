@@ -49,23 +49,63 @@ fn values_are_validated_and_normalized() {
 #[test]
 fn keys_that_cannot_be_set_yet_are_rejected_explicitly() {
     for (text, code) in [
-        ("chunk=1M,tier=a->b:idle>30d", ErrCode::EOPNOTSUPP),
-        ("qos=r=100,w=10", ErrCode::EOPNOTSUPP),
         ("ec=4+2", ErrCode::EOPNOTSUPP),
+        ("chunk=1M,snapshot=on", ErrCode::EOPNOTSUPP),
         ("class=wasm:policy", ErrCode::FEATURE_UNSUPPORTED),
     ] {
         assert_eq!(err(text).0, code, "{text}");
     }
     assert!(err("snapshot=on").1.contains("二期"));
-    assert!(err("locality=any").1.contains("M13"));
     // 单独给出的键（wmfs unset）与 set 的说法相同
     assert_eq!(spec_of("chunk").map(|s| s.key).ok(), Some("chunk"));
-    let f = spec_of("qos").unwrap_err();
-    assert!(f.code == ErrCode::EOPNOTSUPP && f.msg.contains("M13"), "{f:?}");
+    assert_eq!(spec_of("qos").map(|s| s.key).ok(), Some("qos"), "M13");
     assert_eq!(spec_of("quota.ssd").map(|s| s.key).ok(), Some("quota.*"), "M10：quota.<类> 按前缀匹配");
     assert_eq!(spec_of("ec").unwrap_err().code, ErrCode::EOPNOTSUPP);
     let f = spec_of("chunck").unwrap_err();
     assert_eq!((f.code, f.msg.as_str()), (ErrCode::EINVAL, "未知属性 chunck"));
+}
+
+/// M13：qos、tier、locality 的切分、校验与 DIRATTR 里存的形式（只增的持久取值：qos 五项都写，或 `qos=<类>` 存类名原样——活的借用，
+/// QOS 表里放那个类此刻的包络，ADR-0044 第 2 条；tier 存原样、`→` 换成 `->`）。
+#[test]
+fn qos_tier_and_locality_are_parsed() {
+    assert_eq!(ok("qos=r=0,w=1,l=3000"), vec![("qos", "r=0,w=1,l=3000,bw=0,burst=0s".into())]);
+    assert_eq!(ok("qos=l=300,bw=4M,burst=30s"), vec![("qos", "r=0,w=1,l=300,bw=4194304,burst=30s".into())]);
+    assert_eq!(ok("qos=gold"), vec![("qos", "gold".into())], "借用存储类的包络：存类名");
+    assert_eq!(
+        (qos_tier::qos_class("gold"), qos_tier::qos_spec("gold"), show_qos("gold")),
+        (Some("gold"), None, "gold".into())
+    );
+    assert_eq!(qos_tier::qos_class("r=0,w=1,l=3000,bw=0,burst=0s"), None, "数值的形式不是类名");
+    assert_eq!(show_qos("r=0,w=1,l=300,bw=4194304,burst=30s"), "r=0,w=1,l=300,bw=4M,burst=30s");
+    let q = qos_tier::qos_spec("r=1,w=2,l=3,bw=4,burst=5ms").unwrap();
+    assert_eq!((q.r, q.w, q.l, q.bw_max, q.burst_ms), (1, 2, 3, 4, 5), "存的形式解回数值");
+    for bad in ["qos=r=10,l=5", "qos=w=0", "qos=x=1", "qos=r=1,r=2", "qos=Gold", "qos=l=-1"] {
+        assert_eq!(err(bad).0, ErrCode::EINVAL, "{bad}");
+    }
+    assert_eq!(ok("tier=gold->silver:idle>30d"), vec![("tier", "gold->silver:idle>30d".into())]);
+    assert_eq!(ok("tier=gold→silver:age>2s&size>1M"), vec![("tier", "gold->silver:age>2s&size>1M".into())]);
+    for bad in ["tier=gold", "tier=gold->gold:idle>1d", "tier=a->b:hot>1d", "tier=a->b:idle>x", "tier=A->b:size>1"] {
+        assert_eq!(err(bad).0, ErrCode::EINVAL, "{bad}");
+    }
+    assert_eq!(ok("locality=prefer-client"), vec![("locality", "prefer-client".into())]);
+    assert_eq!(err("locality=near").0, ErrCode::EINVAL);
+    assert_eq!(find("tier").unwrap().effect.name(), "协调器");
+    let f = |s: u64, a: i64, m: i64, b: i64| crate::hooks::policy::FileFacts {
+        ino: 1,
+        size: s,
+        atime: crate::base::types::Ts { secs: a, nanos: 0 },
+        mtime: crate::base::types::Ts { secs: m, nanos: 0 },
+        btime: crate::base::types::Ts { secs: b, nanos: 0 },
+        class_id: 1,
+        uid: 0,
+    };
+    let now = 100_000; // 第 100 秒（毫秒）
+    assert!(qos_tier::holds("idle>30s", &f(0, 60, 50, 0), now), "最后一次读写在第 60 秒：闲了 40 s");
+    assert!(!qos_tier::holds("idle>30s", &f(0, 50, 80, 0), now), "mtime 在第 80 秒：只闲了 20 s");
+    assert!(qos_tier::holds("age>90s&size>1K", &f(2048, 99, 99, 5), now));
+    assert!(!qos_tier::holds("age>90s&size>1K", &f(1024, 99, 99, 5), now), "size 要大于");
+    assert!(!qos_tier::holds("bogus", &f(1, 0, 0, 0), now), "解不开 = 不成立");
 }
 
 /// M11：compress 规范化成 none / lz4 / zstd:<级别>（只写 zstd = 级别 3）；encrypt 先原样留着名字（设置时换成数据密钥的 id）。
@@ -103,10 +143,8 @@ fn show_turns_the_stored_form_back() {
 
 #[test]
 fn plugin_manifests_must_name_known_attributes() {
-    assert!(
-        check_manifest_attrs("label-match", &["class", "replicas", "stripe", "locality"]).is_ok(),
-        "locality 在 M13"
-    );
+    assert!(check_manifest_attrs("label-match", &["class", "replicas", "stripe", "locality"]).is_ok());
+    assert!(check_manifest_attrs("mclock", &["qos", "class"]).is_ok());
     assert!(check_manifest_attrs("crc32c", &["checksum"]).is_ok());
     let e = check_manifest_attrs("x", &["chunck"]).unwrap_err();
     assert!(e.contains("chunck"), "{e}");

@@ -6,7 +6,9 @@
 //! `FEATURE_UNSUPPORTED`（"二期功能"），不静默忽略。二期把 BuiltinPolicy 换成"WASM 优先、内置兜底"，调用点不变。
 
 use crate::api::ops::op_name;
+use crate::base::clock;
 use crate::base::types::Ts;
+use crate::meta::attr_registry::qos_tier::holds;
 use crate::meta::attrs::EffectiveAttrs;
 use crate::meta::schema::records::ChangeRecV1;
 
@@ -40,8 +42,10 @@ pub trait PolicyEvaluator: Send + Sync {
 
 /// 首发的内置策略求值器。实现注记（M5）：先只回"默认"（后台任务框架要一个求值器）；第 5 章的简单表达式在 M7 起加入。
 /// 实现注记（M12）：AuditFilter（写 changelog 时，`meta/changelog.rs`）——`audit` 属性生效、操作在审计范围里（没写 `ops=` 时是命名空间
-/// 修改、setattr、xattr、写入长度与属性变更：[`AUDIT_DEFAULT`]）、调用者在 `uids=` 里（没写 = 所有人）→ `Bool(true)`。其余求值点
-/// 仍回"默认"（tier 条件在 M13；属性值的校验在属性注册表里做完了）。
+/// 修改、setattr、xattr、写入长度与属性变更：[`AUDIT_DEFAULT`]）、调用者在 `uids=` 里（没写 = 所有人）→ `Bool(true)`。
+/// 实现注记（M13）：TierCondition（`bg::status::declared`，协调器、tiering 与 `wmfs status` 共用）——生效的 tier 规则的条件对这个文件
+/// 此刻成立 → `Bool(true)`（`attr_registry::qos_tier::holds`）。CreatePlacement、AttrValidate 仍回"默认"（放置由 placement 插件做，
+/// 属性值的校验在属性注册表里做完了）。
 pub struct BuiltinPolicy;
 
 /// `audit=on` 没写 `ops=` 时审计的操作（ADR-0029 的名字）。
@@ -74,6 +78,10 @@ impl PolicyEvaluator for BuiltinPolicy {
                 };
                 PolicyOutput::Bool(a.on && op_in && (a.uids.is_empty() || a.uids.contains(&e.uid)))
             }
+            (PolicyPoint::TierCondition, _) => match (&input.attrs.tier, input.file) {
+                (Some(t), Some(f)) => PolicyOutput::Bool(holds(&t.cond, f, clock::wall_ms())),
+                _ => PolicyOutput::Default,
+            },
             _ => PolicyOutput::Default,
         }
     }

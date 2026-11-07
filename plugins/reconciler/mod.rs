@@ -10,8 +10,8 @@
 //! - **全量扫描**：本任期就绪之后每 24 h 一次（测试用 fail point `reconciler.full_every_ms` 的 `return(<毫秒>)` 缩短）按 ino 扫全部 inode
 //!   （`Walker::flat`）：与声明不同的文件照样迁移（漏网的、队列丢了的都在这里补上）；每个目录顺带做一次递归计数的在线自检
 //!   （`meta::rstat::selfcheck`：偏差 → 一个批次修正 + changelog `RStatDrift`，3.9）。
-//! - **一步**（3.10："≤ 100 个对象 / ≤ 64 MiB / ≤ 1 s"）：迁移满 100 个文件、或搬的字节到了大约一秒的限速量（`wmfs task set reconciler bw=…`，
-//!   没设就是 64 MiB；`RateLimiter::step_bytes`）、或花了 1 s 就停；游标记着做到哪（见 [`Cursor`]），断点续跑。中途停下的那一页下一步从头
+//! - **一步**（3.10："≤ 100 个对象 / ≤ 64 MiB / ≤ 1 s"，`bg::task::StepBudget`）：迁移满 100 个文件、或搬的字节到了大约一秒的限速量
+//!   （`wmfs task set reconciler bw=…`，没设就是 64 MiB；`RateLimiter::step_bytes`）、或花了 1 s 就停；游标记着做到哪（见 [`Cursor`]），断点续跑。中途停下的那一页下一步从头
 //!   再看一遍（已经迁移好的文件一比较就跳过）。每一步都幂等：迁移原语自己是 CAS（3.10），删队列项是点删。
 //! - 积压 = 队列里的项数（每项是一个目录）。指标 `wmfs_reconciler_files_migrated_total`、`wmfs_reconciler_rstat_fixed_total`（另有框架的
 //!   `wmfs_task_*` 与迁移原语的 `wmfs_migrations_total`、`wmfs_migration_skipped_open_files`）；fail point `plugin.reconciler.bg_task`（本体包在
@@ -28,7 +28,7 @@ use wmfs_core::base::types::ReqCtx;
 use wmfs_core::base::{ErrCode, clock};
 use wmfs_core::bg::migrator::Migrated;
 use wmfs_core::bg::status::differs;
-use wmfs_core::bg::task::{BgTask, RunOn, StepResult, TaskCtx};
+use wmfs_core::bg::task::{BgTask, RunOn, StepBudget, StepResult, TaskCtx};
 use wmfs_core::bg::walker::Walked;
 use wmfs_core::hooks::manifest::{CORE_ABI_VERSION, Hook, Manifest};
 use wmfs_core::meta::engine::txn::{TxnOp, txn_blocking};
@@ -56,9 +56,6 @@ pub static MANIFEST: Manifest = Manifest {
 const FULL_EVERY_MS: u64 = 24 * 3600 * 1000;
 const HOLD_MS: u64 = 10_000;
 const HOLD_MAX_MS: u64 = 600_000;
-const MAX_ITEMS: u64 = 100;
-const MAX_BYTES: u64 = 64 << 20;
-const MAX_STEP_MS: u64 = 1000;
 const FLAT_PAGE: usize = 100;
 
 /// 游标（插件私有的字节，postcard）：`Start` = 一轮的开头；`Walk` = 正在走队列项 seq（跳过过没有、DFS 游标）；`Full` = 全量扫描到了
@@ -75,20 +72,6 @@ enum Cursor {
     Full {
         after: u64,
     },
-}
-
-/// 一步的额度（见文件头）。
-struct Budget {
-    t0: u64,
-    items: u64,
-    bytes: u64,
-    max_bytes: u64,
-}
-
-impl Budget {
-    fn more(&self) -> bool {
-        self.items < MAX_ITEMS && self.bytes < self.max_bytes && clock::mono_ms().saturating_sub(self.t0) < MAX_STEP_MS
-    }
 }
 
 pub struct Reconciler {
@@ -149,7 +132,7 @@ impl Reconciler {
 
     /// 一个普通文件与声明不同（或留着别人的迁移意图，见文件头）就交给迁移原语；回 false = 没迁成（写打开、期间被写、现在迁不了），
     /// 这一项要留着。
-    fn reconcile_file(&self, ctx: &TaskCtx, w: &Walked, b: &mut Budget) -> Result<bool, ErrCode> {
+    fn reconcile_file(&self, ctx: &TaskCtx, w: &Walked, b: &mut StepBudget) -> Result<bool, ErrCode> {
         let i = &w.inode;
         let stale = i.pending_epoch != 0 && i.flags & F_INLINE == 0;
         if i.kind != KIND_FILE || i.nlink == 0 || !(stale || differs(i, &w.eff)) {
@@ -157,7 +140,7 @@ impl Reconciler {
         }
         match ctx.migrate.migrate(ctx, w.ino, &w.eff)? {
             Migrated::Done { bytes } => {
-                (b.items, b.bytes) = (b.items + 1, b.bytes + bytes);
+                b.add(bytes);
                 self.migrated.inc();
                 Ok(true)
             }
@@ -173,7 +156,7 @@ impl Reconciler {
         seq: u64,
         mut skipped: bool,
         dfs: Vec<u8>,
-        b: &mut Budget,
+        b: &mut StepBudget,
     ) -> Result<Cursor, ErrCode> {
         let Some(dir) = item_dir(ctx, seq)? else { return Ok(Cursor::Start) }; // 已经删了
         let page = ctx.walker.subtree(ctx.meta, dir, &dfs)?;
@@ -197,7 +180,7 @@ impl Reconciler {
     }
 
     /// 全量扫描的一批（见文件头）。
-    fn full_scan_batch(&mut self, ctx: &TaskCtx, after: u64, b: &mut Budget) -> Result<Option<Cursor>, ErrCode> {
+    fn full_scan_batch(&mut self, ctx: &TaskCtx, after: u64, b: &mut StepBudget) -> Result<Option<Cursor>, ErrCode> {
         let page = ctx.walker.flat(ctx.meta, after, FLAT_PAGE)?;
         let mut at = after;
         for w in &page.items {
@@ -241,7 +224,7 @@ impl BgTask for Reconciler {
             (self.term, self.full_from) = (term, now); // 换了 leader：从本任期就绪算起
             self.hold.clear();
         }
-        let mut b = Budget { t0: now, items: 0, bytes: 0, max_bytes: ctx.limiter.step_bytes(MAX_BYTES) };
+        let mut b = StepBudget::new(ctx);
         let q = queue(ctx)?;
         self.hold.retain(|seq, _| q.iter().any(|(s, _)| s == seq)); // 已经删了的项不必再记
         let pick = q.iter().map(|(seq, _)| *seq).find(|seq| self.hold.get(seq).is_none_or(|(until, _)| *until <= now));

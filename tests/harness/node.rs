@@ -29,8 +29,8 @@ use wmfs_core::net::client::{Endpoint, RpcClient};
 use wmfs_core::proto::meta::{MetaOp, MetaReply, O_RDONLY, OpenOut, SetAttrIn};
 use wmfs_core::server::{self, Running};
 use wmfs_plugins::{
-    aes_gcm, blake3, crc32c, fifo, gc, label_match, local_fs, lz4, path_caps, posix_acl, posix_mode, quota, reconciler,
-    replica, scrub, shared_key, tcp, trash_expire, ttl, xxh3, zstd,
+    aes_gcm, blake3, crc32c, fifo, gc, label_match, local_fs, lz4, mclock, path_caps, posix_acl, posix_mode, quota,
+    rebalance, reconciler, replica, scrub, shared_key, tcp, tiering, trash_expire, ttl, xxh3, zstd,
 };
 
 use super::meta::admin_ctx;
@@ -66,7 +66,11 @@ pub fn plugins(cfg: &NodeConfig) -> PluginSet {
     s.transform(Arc::new(zstd::Zstd::new()));
     s.transform(Arc::new(aes_gcm::AesGcm::new()));
     s.codec(Arc::new(replica::Replica::new()));
-    s.qos(Arc::new(fifo::Fifo::new()));
+    if MCLOCK.load(std::sync::atomic::Ordering::Relaxed) {
+        s.qos(Arc::new(mclock::Mclock::new())); // M13：qos 属性要 mclock 消费
+    } else {
+        s.qos(Arc::new(fifo::Fifo::new()));
+    }
     s.bg_task(Box::new(gc::Gc::new()));
     if FULL_BG.load(std::sync::atomic::Ordering::Relaxed) {
         s.bg_task(Box::new(gc::GcLocal::new()));
@@ -74,6 +78,8 @@ pub fn plugins(cfg: &NodeConfig) -> PluginSet {
         s.bg_task(Box::new(scrub::Scrub::new()));
         s.bg_task(Box::new(trash_expire::TrashExpire::new())); // M12：会改数据的任务也只在 FULL_BG 之后装
         s.bg_task(Box::new(ttl::Ttl::new()));
+        s.bg_task(Box::new(tiering::Tiering::new())); // M13
+        s.bg_task(Box::new(rebalance::Rebalance::new()));
     }
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST);
     s.validate(&cfg.plugin).unwrap();
@@ -85,6 +91,13 @@ static FULL_BG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// 这个测试进程里之后 init / start 的节点都装上协调器、scrub 与 gc 的本地孤儿扫描（M11 的用例）。
 pub fn set_full_bg() {
     FULL_BG.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static MCLOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 这个测试进程里之后 init / start 的节点用 mclock 而不是 fifo（M13 的用例：`qos` 属性要它消费）。
+pub fn set_mclock() {
+    MCLOCK.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 测试用的临时目录 `<tmp>/wmfs-<名字>-<pid>`：丢弃时（包括测试失败 panic 时）删掉，不在 /tmp 留下垃圾。
@@ -113,8 +126,18 @@ pub fn target_dir(dir: &Path) -> PathBuf {
 
 /// 在 `dir` 里初始化一个单节点（一个 target，小内存池，打开 debug_ops 与 fail point 接口）。
 pub fn init(dir: &Path) {
+    init_targets(dir, &[&[]]);
+}
+
+/// 同 [`init`]，但有几个 target、各带这些标签（M13 的 dedicated 存储类）：第 i 个在 `<dir>/n1/targets/<i>`（第 1 个就是 [`target_dir`]）。
+pub fn init_targets(dir: &Path, labels: &[&[&str]]) {
     let _ = std::fs::remove_dir_all(dir);
     let cfg = NodeConfig::default();
+    let targets = labels.iter().enumerate().map(|(i, l)| TargetConfig {
+        path: node_dir(dir).join(format!("targets/{}", i + 1)).display().to_string(),
+        labels: l.iter().map(|x| x.to_string()).collect(),
+        capacity: "0".into(),
+    });
     let o = InitOpts {
         data_dir: node_dir(dir),
         addr: "127.0.0.1".into(),
@@ -125,11 +148,7 @@ pub fn init(dir: &Path) {
         debug_ops: true,
         host_id: Some("host-1".into()),
         plugins: plugins(&cfg).plugin_list(),
-        targets: vec![TargetConfig {
-            path: target_dir(dir).display().to_string(),
-            labels: vec![],
-            capacity: "0".into(),
-        }],
+        targets: targets.collect(),
         profile: Profile::Default,
     };
     init_node(&o).unwrap();
@@ -180,11 +199,17 @@ pub fn connect_seeds(nd: &Path, seeds: &[Endpoint], key: &str, pool: PoolConfig)
 
 /// 同 [`connect_seeds`]，但不起会话心跳（M10 的驱逐测试：一个"失联"的客户端）。
 pub fn connect_silent(nd: &Path, seeds: &[Endpoint], key: &str, pool: PoolConfig) -> Client {
+    connect_as(nd, seeds, key, pool, "h")
+}
+
+/// 同 [`connect_silent`]，会话报的"主机"是 `host_id`（M13 的 locality：多节点测试里节点 i 的 host_id 是 `host-<i>`）。
+pub fn connect_as(nd: &Path, seeds: &[Endpoint], key: &str, pool: PoolConfig, host_id: &str) -> Client {
     let kf = KeyFile::parse(&std::fs::read_to_string(nd.join(format!("keys/{key}.key"))).unwrap()).unwrap();
     let pool = MemPool::new(&pool).unwrap();
     let t = tcp::TcpTransport::new(&Default::default(), 5000).unwrap();
     let rpc = RpcClient::new(pool, vec![Arc::new(t)], kf, Default::default()).unwrap();
-    let info = SessionInfo { client_name: "test".into(), host: "h".into(), host_id: "h".into(), mount: "/m".into() };
+    let info =
+        SessionInfo { client_name: "test".into(), host: "h".into(), host_id: host_id.into(), mount: "/m".into() };
     let opts = MetaClientOpts { rpc_timeout: Duration::from_secs(10), op_timeout: Duration::from_secs(30) };
     let meta = Arc::new(MetaClient::connect_with(rpc.clone(), seeds, info, opts).unwrap());
     let data = DataClient::for_meta(rpc.clone(), meta.clone(), Duration::from_secs(10), Duration::from_secs(30));

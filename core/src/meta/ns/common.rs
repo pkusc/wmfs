@@ -6,7 +6,7 @@
 //! layout 在 `ns/layout.rs`（`new_layout`/`set_new_layout`，这里原样转出）；递归计数 RSTAT 由各操作调 `meta/rstat.rs` 更新；
 //! 写打开的 `quota_end` 由 `meta/quota.rs` 按配额算（M10；没有配额、只读打开 → `u64::MAX`）。`OpenOut.cap` 在闭包里签
 //! （[`sign_cap`]，有效期 `cap_ttl`）：权限位按这次打开的方式给（Open 按 O_ACCMODE；Create 新建的文件读写都给，打开已有的文件给写、
-//! 能读才再给读；改了长度的 SetAttr 同后者）；`qos_id` 先填 0（qos 属性在 M13）。`OpenOut.inline`（文件的完整内容）只给能读这个
+//! 能读才再给读；改了长度的 SetAttr 同后者）；`qos_id` = 管辖目录生效的 qos 的来源目录（M13；0 = 用存储类的包络）。`OpenOut.inline`（文件的完整内容）只给能读这个
 //! 文件的人：Open 按这次是否读打开，Create 打开已有的文件、改了 size 的 SetAttr 按调用者有没有读权限（[`may_read`]）；不带时为 None，
 //! 要内容就 GetInline。
 //!
@@ -241,7 +241,7 @@ pub fn open_out(v: &dyn KvRead, c: &OpCtx, n: &Node, with_inline: bool, rights: 
     Ok(OpenOut {
         attr: attr_out(v, c, n)?,
         layout: n.rec.layout.clone(),
-        cap: sign_cap(c, n, rights, c.req.session),
+        cap: sign_cap(c, n, rights, c.req.session, governing(v, c, n)?.qos_id),
         inline,
         quota_end,
         atime_due: false,
@@ -261,7 +261,7 @@ pub fn max_file_size(l: &LayoutV1) -> u64 {
 
 /// 给普通文件 `n` 签一张 cap（3.3.5）：layout 的链与变换参数、调用者的租户与作业、过期时间 = now + `cap_ttl`。
 /// 没有 layout（目录等）或 `rights` 为 0 → 空。
-pub fn sign_cap(c: &OpCtx, n: &Node, rights: u8, session: u64) -> Vec<u8> {
+pub fn sign_cap(c: &OpCtx, n: &Node, rights: u8, session: u64, qos_id: u64) -> Vec<u8> {
     let Some(l) = n.rec.layout.as_ref().filter(|_| rights != 0) else { return vec![] };
     let cap = CapV1 {
         ino: n.ino,
@@ -272,7 +272,7 @@ pub fn sign_cap(c: &OpCtx, n: &Node, rights: u8, session: u64) -> Vec<u8> {
         job_id: c.req.who.job_id,
         chains: l.chains.clone(),
         class_id: n.rec.class_id,
-        qos_id: 0, // qos 属性在 M13
+        qos_id, // qos 属性的来源目录（M13；0 = 用存储类的 QoS 包络）
         chunk_size: l.chunk_size,
         block_size: l.block_size,
         checksum: l.checksum,

@@ -17,13 +17,15 @@
 //! [`StreamTx::wait_room`] 让流的发送方（snap-serve）等发送队列腾出地方，不会把整个快照一下子塞进队列。
 //! 实现注记（M10，ADR-0009"已建立的连接在集群图更新时关闭"）：hb 线程每拿到一张集群图就把其中已撤销的 key 交给
 //! [`RpcServer::set_revoked`]；读线程收到下一帧时（只在名单变过之后查一次）发现自己这条连接的 key 已撤销 → 不处理、关闭连接。
+//! 实现注记（M13 收尾，ADR-0044 第 5 条）：[`Responder::on_done`] 登记"回复成功发出之后"的回调（时长从收到请求算起，与每个消息族的
+//! 耗时直方图同一个起点）：数据节点按存储类统计客户端请求的延迟；消息族的指标拆到 `server/stats.rs`。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
-use wmfs_api::metrics::{self, Counter, Histogram};
+use wmfs_api::metrics;
 
 use crate::base::config::NetConfig;
 use crate::base::types::Role;
@@ -42,7 +44,9 @@ use crate::proto::handshake::PingBody;
 use crate::proto::peer::NodeOp;
 use crate::proto::{decode_body, encode_body};
 
+mod stats;
 mod stream;
+use stats::FamilyStats;
 pub use stream::StreamTx;
 
 /// 一个消息族的服务（M3 起：元数据、数据、节点……）。在连接读线程上调用，**不得阻塞**：只把请求交给别的线程。
@@ -262,46 +266,8 @@ fn ping(f: InFrame, r: Responder) {
     r.reply(f.body, bulk);
 }
 
-/// 一个消息族的服务端指标：`wmfs_rpc_requests_total{family,op,code}` 与 `wmfs_rpc_latency_seconds{family,op}`
-/// （3.11：注册时加锁，热路径只做原子加）。code = OK 的计数器与直方图在创建时注册；某个错误码第一次出现时才注册它的计数器，
-/// 之后从本族自己的小表里取（这把锁只在错误回复上用）。实现注记（M1）：`op` 暂时等于 family，各服务解出具体操作后再细分。
-struct FamilyStats {
-    family: &'static str,
-    ok: Arc<Counter>,
-    latency: Arc<Histogram>,
-    errors: Mutex<Vec<(ErrCode, Arc<Counter>)>>,
-}
-
-impl FamilyStats {
-    fn new(family: &'static str) -> FamilyStats {
-        let l = [("family", family), ("op", family)];
-        let latency =
-            metrics::histogram("wmfs_rpc_latency_seconds", "服务端处理请求的耗时", &l, metrics::SECONDS_BUCKETS);
-        FamilyStats { family, ok: requests(family, "OK"), latency, errors: Mutex::new(Vec::new()) }
-    }
-
-    /// 记一个处理完的请求（`code` = 0 表示成功），耗时从收到请求算起。
-    fn record(&self, code: ErrCode, t0: Instant) {
-        self.latency.observe(t0.elapsed().as_secs_f64());
-        if code == ErrCode(0) {
-            return self.ok.inc();
-        }
-        let mut errs = self.errors.lock().unwrap_or_else(|e| e.into_inner());
-        match errs.iter().find(|(c, _)| *c == code) {
-            Some((_, h)) => h.inc(),
-            None => {
-                let h = requests(self.family, &code.to_string());
-                h.inc();
-                errs.push((code, h));
-            }
-        }
-    }
-}
-
-fn requests(family: &'static str, code: &str) -> Arc<Counter> {
-    let l = [("family", family), ("op", family), ("code", code)];
-    metrics::counter("wmfs_rpc_requests_total", "服务端处理的请求数", &l)
-}
+/// 回复成功发出之后调一次，参数是从收到请求到回复发出的时长（数据节点按存储类统计延迟，ADR-0044 第 5 条）。
+pub type DoneFn = Box<dyn FnOnce(Duration) + Send>;
 
 /// 服务端对一个请求的回复句柄：按值传递，恰好用一次
 pub struct Responder {
@@ -314,12 +280,18 @@ pub struct Responder {
     stats: Arc<FamilyStats>, // 指标句柄（第一次用到这个族时注册好的）
     t0: Instant,
     hint: Option<HintFn>,
+    on_done: Option<DoneFn>,
 }
 
 impl Responder {
     fn new(conn: ConnHandle, req: &FrameHeader, stats: Arc<FamilyStats>, hint: Option<HintFn>) -> Responder {
         let (req_id, msg_type, trace_id, span_id) = (req.req_id, req.msg_type, req.trace_id, req.span_id);
-        Responder { conn, req_id, msg_type, trace_id, span_id, done: false, stats, t0: Instant::now(), hint }
+        let (done, t0, on_done) = (false, Instant::now(), None);
+        Responder { conn, req_id, msg_type, trace_id, span_id, done, stats, t0, hint, on_done }
+    }
+    /// 登记回复成功发出之后要调的 [`DoneFn`]（回 ERROR 帧、被 Drop 而没有回复时不调）。
+    pub fn on_done(&mut self, f: DoneFn) {
+        self.on_done = Some(f);
     }
     /// 编成 Response 帧，ConnHandle::send（try_send，不阻塞）
     pub fn reply(mut self, body: Vec<u8>, bulk: Vec<BufSlice>) {
@@ -371,6 +343,9 @@ impl Responder {
             _ => code, // 其他失败 = 连接已断，对端会重连重试
         };
         self.stats.record(code, self.t0);
+        if let Some(f) = self.on_done.take().filter(|_| code == ErrCode(0)) {
+            f(self.t0.elapsed());
+        }
     }
 }
 

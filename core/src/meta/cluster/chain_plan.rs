@@ -45,7 +45,7 @@ pub struct FwdFailure {
     pub node: u32, // 报告的节点
     pub chain: u32,
     pub down: u32,      // 它的后继（下游 target）
-    pub lasted_ms: u64, // 已持续多久（chain_mgr 交给 plan 时已算到"现在"）
+    pub lasted_ms: u64, // 已持续多久（chain_mgr 交给 plan 时已算到"现在"，且不超过下游这次启动以来一直活着的时长）
     pub heard_ms: u64,  // leader 收到这次心跳的时刻（leader 的 mono_ms）
 }
 

@@ -13,7 +13,10 @@
 新数据作废，稍后重做；写的人随后会把自己的数据重写到新布局，**数据不会丢**。
 
 - 管的四个属性：`class`、`replicas`、`compress`、`encrypt`（chunk、stripe、inline、checksum 只对新文件生效，不迁移）。
-- 触发：`wmfs set`/`unset` 这几个属性、目录 rename 时写一条队列项（RECONCILE_Q），协调器走一遍那个目录的子树；另外每 24 h 扫一遍全部
+- "声明"= 文件所在目录的生效属性**再套用分层规则**（`tier`，或存储类的 `[lifecycle]`；M13）：与 tiering 任务用同一个函数，所以分层过去的
+  文件不会被协调器迁回来。
+- 触发：`wmfs set`/`unset` 这几个属性、目录 rename 时写一条队列项（RECONCILE_Q），协调器走一遍那个目录的子树；`wmfs class update` 改了
+  副本数或分层规则时写一条根目录的队列项（M13），从根整树走一遍；另外每 24 h 扫一遍全部
   inode，漏网的也补上，并顺带检查每个目录的递归用量计数（不一致就修正，changelog 里记一条 `RStatDrift`；正常情况下永远不会发生）。
 - 一直写打开着的文件先跳过（`wmfs status` 单独列出个数），关了之后再转换；被跳过超过 24 小时会产生一条 `PolicyViolation` 事件
   （`kind=migration_blocked_by_open`）。有文件没转换成的队列项过一会儿再重走：10 s 起，每次没成就翻倍，最多 10 min。

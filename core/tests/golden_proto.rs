@@ -322,6 +322,7 @@ fn golden_peer_and_node() {
         features: vec!["proto.v1".into()],
         wall_ms: 1_792_454_400_100,
         qos_deficit: vec![(16, 25)],
+        class_p99: vec![(2, 1_500)], // ADR-0044 第 5 条：末尾加的按类 p99（类 id, 微秒），金样随之更新
     };
     let join = JoinReq {
         hostname: "spark".into(),

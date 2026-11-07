@@ -148,7 +148,16 @@ fn gen_chains_writes_chain_records_and_bumps_map_epoch() {
     let req = ReqCtx { who, session: 0, seq: 0, pid: 0, trace_id: 0, now: Ts::default(), now_ms: 0, internal: true };
     let (pipeline, attrs, settings) =
         (Pipeline::new(PluginSet::new(&[])), AttrResolver::default(), ClusterSettingsV1::default());
-    let c = OpCtx { req: &req, pipeline: &pipeline, attrs: &attrs, map: &m, settings: &settings, cap_key: &[0; 32] };
+    let usage = Default::default();
+    let c = OpCtx {
+        req: &req,
+        pipeline: &pipeline,
+        attrs: &attrs,
+        map: &m,
+        settings: &settings,
+        cap_key: &[0; 32],
+        usage: &usage,
+    };
     let views = gen_chains(&mut v, &c, &m.classes[0], 3).unwrap();
     assert_eq!(
         views.iter().map(|c| (c.id, c.serving, c.members.clone())).collect::<Vec<_>>(),
@@ -177,8 +186,9 @@ fn chain_capacity_is_the_smallest_limited_member() {
         last_serving: None,
         removed: vec![],
     };
-    assert_eq!(view_of(&m, 1, &chain(&[1, 2])).capacity, 100 << 30, "一个成员不限、另一个 100 GiB：按 100 GiB");
-    assert_eq!(view_of(&m, 2, &chain(&[1, 3])).capacity, 0, "成员全都不限：0 = 不限");
+    let u = TargetUsage::default();
+    assert_eq!(view_of(&m, &u, 1, &chain(&[1, 2])).capacity, 100 << 30, "一个成员不限、另一个 100 GiB：按 100 GiB");
+    assert_eq!(view_of(&m, &u, 2, &chain(&[1, 3])).capacity, 0, "成员全都不限：0 = 不限");
 }
 
 #[test]
