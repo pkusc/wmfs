@@ -11,13 +11,24 @@
 //!
 //! 实现注记（M4）：成功的修改由各操作在自己的闭包末尾调用 [`append`]（只有闭包知道 inode 号、名字与长度；写在闭包里，
 //! 它就与修改原子地一起提交、一起回滚）。3.4.1.4 的 `run_one` 里"被拒绝的修改在 audited 时也写"随 `audit` 属性在 M12 加入。
+//!
+//! 实现注记（M12）：**audited 标记**（3.8、3.7.7 的 AuditFilter）：每条记录按它所在的目录（有 `parent` 用它，否则 `ino` 的管辖目录——目录
+//! 是它自己、文件是主父目录；rename 另看目标目录 `new_parent`，哪一边审计都算）的生效 `audit` 属性，交给内置策略求值器判定（`audit=on`
+//! 审计命名空间修改、setattr、xattr、写入长度与属性变更，`ops=`、`uids=` 过滤）；解析结果按 attr_epoch 缓存（`AttrResolver`），不审计的
+//! 目录只多一次缓存命中——所以调用方要在同一个操作令 `attr_epoch += 1` **之前** [`append`]（3.8 的缓存规则）。被拒绝的客户端修改（POSIX
+//! 错误）在 audited 时也写一条（[`rejected`]：`result` = 错误码，执行器的 run_one 在丢弃它的写入之后调用）。
+
+use std::sync::Arc;
 
 use wmfs_api::metrics;
 
 use crate::api::ops::{op_code, op_name};
 use crate::api::types::{ChangeEvent, ChangelogPage, CursorReply};
 use crate::base::{ErrCode, Failed};
+use crate::hooks::policy::{PolicyInput, PolicyOutput, PolicyPoint};
+use crate::meta::attrs::EffectiveAttrs;
 use crate::meta::engine::txn::{KvRead, KvScan, KvTxn, OpCtx};
+use crate::meta::ns::common::{get, governing};
 use crate::meta::schema::keys::{self, G_NEXT_CHANGELOG, T_CHANGELOG, T_CURSOR};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{ChangeRecV1, CursorV1, decode_v1};
@@ -38,12 +49,63 @@ pub struct Change<'a> {
     pub extra: Vec<(String, String)>, // 实现注记（M5）：例如 SetSize 的 via=CommitWrite（ADR-0029 的码表注释）
 }
 
-/// 追加一条成功的事件。操作名不在 ADR-0029 的表里 = 程序写错了（不变量破坏）。
+/// 一个被拒绝的客户端修改的对象（`ns::audit_of` 给出；[`rejected`]）。rename 另有目标目录与名字。
+#[derive(Default)]
+pub struct Subject {
+    pub op: &'static str,
+    pub ino: u64,
+    pub parent: u64,
+    pub name: Vec<u8>,
+    pub new_parent: u64,
+    pub new_name: Vec<u8>,
+}
+
+/// `audit` 第一次启用时 core 创建的 changelog 消费者游标（3.8；进程外的 audit-log 插件提交它，M14）。
+pub const AUDIT_CURSOR: &str = "audit-log";
+
+/// 追加一条成功的事件（`audited` 见文件头）。
 pub fn append(v: &mut dyn KvTxn, c: &OpCtx, ch: Change) -> Result<(), ErrCode> {
-    let op = op_code(ch.op).unwrap_or_else(|| panic!("不变量破坏：changelog 操作名 {} 不在码表里", ch.op));
+    let mut rec = record(c, ch);
+    rec.audited = audited(v, c, &rec);
+    put(v, &rec)
+}
+
+/// 被拒绝的修改（见文件头）：audited 才写一条 `result` = 错误码的记录，否则什么也不写。
+pub fn rejected(v: &mut dyn KvTxn, c: &OpCtx, s: &Subject, e: ErrCode) -> Result<(), ErrCode> {
+    let ch = Change { op: s.op, ino: s.ino, parent: s.parent, name: &s.name, ..Default::default() };
+    let mut rec = record(c, Change { new_parent: s.new_parent, new_name: &s.new_name, ..ch });
+    (rec.result, rec.audited) = (e.0, true);
+    if audited(v, c, &rec) { put(v, &rec) } else { Ok(()) }
+}
+
+/// AuditFilter（见文件头）：事件所在目录（rename 还有目标目录：哪一边审计都算）的生效属性交给策略求值器。没有目录可看（会话事件等）
+/// 或解析不了 → 不审计。
+fn audited(v: &dyn KvRead, c: &OpCtx, r: &ChangeRecV1) -> bool {
+    let by = |eff: Option<Arc<EffectiveAttrs>>| {
+        eff.filter(|e| e.audit.on).is_some_and(|e| {
+            let input =
+                PolicyInput { point: PolicyPoint::AuditFilter, attrs: &e, file: None, event: Some(r), kv: None };
+            c.pipeline.policy().eval(&input) == PolicyOutput::Bool(true)
+        })
+    };
+    match (r.parent, r.ino) {
+        (0, 0) => false,
+        (0, ino) => by(get(v, ino).ok().and_then(|n| governing(v, c, &n).ok())),
+        (dir, _) => [dir, r.new_parent].into_iter().filter(|d| *d != 0).any(|d| by(c.attrs.resolve(v, d).ok())),
+    }
+}
+
+fn put(v: &mut dyn KvTxn, rec: &ChangeRecV1) -> Result<(), ErrCode> {
     let seq = kv::next_id(v, G_NEXT_CHANGELOG)?;
+    kv::put(v, &keys::changelog(seq), rec);
+    Ok(())
+}
+
+/// 一条记录（`result` 0、未审计）。操作名不在 ADR-0029 的表里 = 程序写错了（不变量破坏）。
+fn record(c: &OpCtx, ch: Change) -> ChangeRecV1 {
+    let op = op_code(ch.op).unwrap_or_else(|| panic!("不变量破坏：changelog 操作名 {} 不在码表里", ch.op));
     let (r, who) = (c.req, &c.req.who);
-    let rec = ChangeRecV1 {
+    ChangeRecV1 {
         time_ms: r.now_ms,
         op,
         result: 0,
@@ -60,10 +122,8 @@ pub fn append(v: &mut dyn KvTxn, c: &OpCtx, ch: Change) -> Result<(), ErrCode> {
         new_name: ch.new_name.to_vec(),
         size: ch.size,
         extra: ch.extra,
-        audited: false, // audit 属性在 M12
-    };
-    kv::put(v, &keys::changelog(seq), &rec);
-    Ok(())
+        audited: false,
+    }
 }
 
 /// 一条记录 → 对外的 JSON 形态（`op` 用名字，不认识的数显示 `op#<数>`；名字按 UTF-8 显示，ADR-0029 第 3 条）。
@@ -142,6 +202,12 @@ pub fn set_cursor(v: &mut dyn KvTxn, c: &OpCtx, name: &str, seq: u64) -> Result<
 pub fn get_cursor(v: &dyn KvRead, name: &str) -> Result<Option<CursorReply>, ErrCode> {
     let r = kv::get::<CursorV1>(v, &keys::cursor(name))?;
     Ok(r.map(|r| CursorReply { name: name.into(), seq: r.seq, updated_ms: r.updated_ms }))
+}
+
+/// 游标 `name` 落后最新 seq 几条（没有这个游标 → None）。
+pub fn cursor_lag(v: &dyn KvRead, name: &str) -> Result<Option<u64>, ErrCode> {
+    let last = last_seq(v)?;
+    Ok(get_cursor(v, name)?.map(|c| last.saturating_sub(c.seq)))
 }
 
 /// 按（本节点已应用的）状态刷新每个消费者的落后条数 `wmfs_changelog_consumer_lag{name}` = 最新 seq − 游标。cluster-mgr 每 5 s

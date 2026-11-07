@@ -1,6 +1,7 @@
-//! nas-safe profile 的阶段版（design.md 9.7：M9–M11 = 3 节点、replicas=3，只设置已经有消费者的属性——不设 trash、audit）：
-//! 按 `wmfs dev up --nodes 3 --profile nas-safe` 起 3 个节点（`/home replicas=3`），`wmfs dev mount` 挂上一个客户端，然后跑 9.5 里
-//! 这个阶段已有的检查器：
+//! nas-safe profile 的阶段版（design.md 9.7：M9–M11 = 3 节点、replicas=3，只设置已经有消费者的属性；M12 起 `/home` 加上
+//! `trash=7d`、`audit=on`，只检查 core 的 audited 标记与 changelog——mgr 在 M14）：
+//! 按 `wmfs dev up --nodes 3 --profile nas-safe` 起 3 个节点（`/home replicas=3,trash=7d,audit=on`），`wmfs dev mount` 挂上一个客户端，
+//! 然后跑 9.5 里这个阶段已有的检查器（M12：另有回收站恢复——删掉的文件在 `.wmfs-trash/<uid>/` 里、mv 回来内容不变——与审计标记）：
 //! - ⑥ 单点故障无错误：写入中**依次** `kill -9` 每个节点（含元数据 leader），客户端一个错误也没有（只是等一会儿）；节点回来之后
 //!   `wmfs dev wait chains-serving`（先 Syncing、后 Serving）；
 //! - ① 已确认写不丢：每个文件写完都 fsync，全部 kill 做完之后逐一读回校验（经挂载点，并另用 `wmfs fs get` 绕过页缓存）；
@@ -9,6 +10,7 @@
 //! 用开发集群的固定端口，所以是 `#[ignore]`：只由 `scripts/profiles.sh nas-safe` 跑。
 
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +57,10 @@ fn nas_safe_staged_profile() {
     wmfs(&dir, &["dev", "up", "--nodes", "3", "--profile", "nas-safe"]);
     let get = wmfs(&dir, &["get", "/home", "replicas"]);
     assert!(get.contains("replicas=3") && get.contains("/home"), "nas-safe：/home replicas=3：{get}");
+    for (k, v) in [("trash", "trash=7d"), ("audit", "audit=on")] {
+        let got = wmfs(&dir, &["get", "/home", k]);
+        assert!(got.contains(v), "nas-safe 阶段版（M12）：/home {v}：{got}");
+    }
     let mp = dir.join("mnt");
     std::fs::create_dir_all(&mp).unwrap();
     wmfs(&dir, &["dev", "mount", mp.to_str().unwrap()]);
@@ -106,6 +112,19 @@ fn nas_safe_staged_profile() {
     assert!(std::fs::read(&back).unwrap() == content(n - 1));
     let status = wmfs(&dir, &["status", "/home", "--json"]);
     assert!(status.contains("\"short_files\":0"), "全部节点回来、同步完：副本差距归零：{status}");
+    // M12：回收站恢复（rm 进 .wmfs-trash/<文件属主的 uid>/、mv 回来内容不变，ADR-0043 第 1 条）与审计标记（/home 的修改都带 audited）
+    let uid = std::fs::metadata(home.join("f0")).unwrap().uid();
+    std::fs::remove_file(home.join("f0")).unwrap();
+    let t = home.join(".wmfs-trash").join(uid.to_string());
+    let name =
+        std::fs::read_dir(&t).unwrap().map(|e| e.unwrap().file_name()).find(|n| n.to_string_lossy().ends_with("-f0"));
+    std::fs::rename(t.join(name.expect("f0 在回收站里")), home.join("f0")).unwrap();
+    assert!(std::fs::read(home.join("f0")).unwrap() == content(0), "从回收站 mv 回来，内容不变");
+    let log = wmfs(&dir, &["changelog", "tail", "-n", "20", "--json"]);
+    assert!(
+        log.contains("\"op\":\"Unlink\"") && log.contains("\"trash\"") && log.contains("\"audited\":true"),
+        "{log}"
+    );
     wmfs(&dir, &["dev", "umount", mp.to_str().unwrap()]);
     println!("nas-safe 阶段版：写了 {n} 个 fsync 过的文件，依次 kill 了 3 个节点，0 个错误");
     drop(c);

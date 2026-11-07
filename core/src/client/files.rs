@@ -4,7 +4,8 @@
 //! - **C2**：open 总是向 leader 取最新属性；`change_id` 与本挂载上次见到的不同 → 调用方先 `inval_inode` 再回复、不带
 //!   `FOPEN_KEEP_CACHE`，这里同时丢掉 cache_store 里这个 inode 的旧块（键里带 change_id，不丢也读不错，只是白占内存）；相同 → 带。
 //! - **打开集合**：每 3 s 的会话心跳上报增量（新打开 / 已关闭，带是否写打开；`session.rs`）。
-//! - consistency = strong 或 `O_DIRECT` 打开 → `direct`：FUSE 回 `FOPEN_DIRECT_IO`，写走 `strong.rs` 的同步路径（8.3）。
+//! - consistency = strong 或 `O_DIRECT` 打开 → `direct`：FUSE 回 `FOPEN_DIRECT_IO`，写走 `strong.rs` 的同步路径（8.3）。实现注记（M12）：
+//!   strong 文件以写方式打开、而它还是 inline → 先 `Uninline`（8.5）；句柄记下 strong 与 O_APPEND（读前 GetAttr、追加用 AppendReserve）。
 //! - relatime：读打开的回复带 `atime_due` 时把这一项放进队列，`atime` 线程每 5 s 批量发 `SetAtime`（尽力而为）。
 //! - **cap**：用到 80% 时 `RenewCap`（经已打开的句柄，ADR-0036：属主不看权限位）；续回来的 cap 的 epoch 与手上的 layout 不同 =
 //!   layout 已经变了 → `STALE_LAYOUT`（调用方重新 Open）。数据节点回 `BAD_CAP` 时续一次再试，再失败 → `EACCES`（8.7，
@@ -25,6 +26,7 @@ use crossbeam_channel::{Sender, unbounded};
 use super::data_client::DataClient;
 use super::dirs::DirHandle;
 use super::inode::{Cap, Inode, fix_size};
+use super::locks::Locks;
 use super::meta_client::{Caller, MetaClient};
 use super::session::AtimeItem;
 use super::slots::Slots;
@@ -33,6 +35,7 @@ use crate::hooks::manifest::Hook;
 use crate::hooks::pipeline::HookCall;
 use crate::hooks::traits::CacheStore;
 use crate::meta::attrs::CONSISTENCY_STRONG;
+use crate::meta::schema::records::F_INLINE;
 use crate::proto::cap;
 use crate::proto::meta::{AttrOut, MetaOp, MetaReply, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY, OpenOut};
 
@@ -45,6 +48,21 @@ pub struct Handle {
     pub direct: bool, // FOPEN_DIRECT_IO：strong 或 O_DIRECT（8.3）
     pub sync: bool,   // O_SYNC / O_DSYNC：每次 write 写到全部副本并落盘、提交长度才返回
     pub session: u64, // 打开时的会话号（M10：不是现在的 = 被驱逐的会话里打开的；经它的请求只在这个会话里发）
+    pub strong: bool, // M12：consistency=strong（读前 GetAttr，O_APPEND 用 AppendReserve，8.5）
+    pub append: bool, // M12：O_APPEND（打开时的；FUSE 的 write 按每次 WRITE 带的标志换掉，[`Handle::with_write_flags`]）
+}
+
+impl Handle {
+    /// strong 的 `O_APPEND`：偏移由 `AppendReserve` 分（`strong.rs`）。
+    pub fn strong_append(&self) -> bool {
+        self.strong && self.append
+    }
+
+    /// 按这次 write 带的打开标志算 `append`（内核每次 WRITE 给的是此刻的 f_flags：fcntl F_SETFL 改过之后也对，8.5）。
+    pub fn with_write_flags(mut self, flags: u32) -> Handle {
+        self.append = flags & libc::O_APPEND as u32 != 0;
+        self
+    }
 }
 
 /// open / create 的结果。
@@ -69,6 +87,7 @@ pub struct FileClient {
     pub(super) slots: Slots,
     pub(super) jobs: Sender<(u64, u32)>, // 写满了的 chunk：交给后台写线程
     pub(super) atime: Mutex<Vec<AtimeItem>>,
+    pub(super) locks: Mutex<Locks>, // M12：拿过的锁与等着的 F_SETLKW（`locks.rs`）
 }
 
 impl FileClient {
@@ -94,6 +113,7 @@ impl FileClient {
             slots,
             jobs: tx,
             atime: Mutex::default(),
+            locks: Mutex::default(),
         });
         super::flusher::start_threads(&fc, rx);
         super::session::start_threads(&fc);
@@ -105,7 +125,18 @@ impl FileClient {
         self.meta.gate()?; // 先过自停闸门（可能就在这里发现被驱逐、换了新会话），再记下会话号，只在这个会话里打开
         let sid = self.meta.session();
         let o = expect_open_out(self.meta.read_in(sid, who, MetaOp::Open { ino, flags: flags & O_ACCMODE }))?;
+        let o = self.strong_uninline(who, sid, o, flags)?;
         Ok(self.register(who, o, flags, false, sid))
+    }
+
+    /// strong 文件以写方式打开、而它还是 inline → 先请服务端转出（8.5：strong 的写路径与 AppendReserve 不处理 inline 文件；M12），
+    /// 换上 Uninline 的回复（新 layout 与写 cap，能读时也带读权限）。
+    fn strong_uninline(&self, who: &Caller, sid: u64, o: OpenOut, flags: u32) -> Result<OpenOut, ErrCode> {
+        let write = flags & O_ACCMODE != O_RDONLY;
+        if !write || o.attr.consistency != CONSISTENCY_STRONG || o.attr.flags & F_INLINE == 0 {
+            return Ok(o);
+        }
+        expect_open_out(self.meta.read_in(sid, who, MetaOp::Uninline { ino: o.attr.ino }))
     }
 
     /// 建文件并打开（`flags` 里有 O_EXCL 时名字已存在 → `EEXIST`）。
@@ -123,6 +154,7 @@ impl FileClient {
         self.meta.gate()?;
         let sid = self.meta.session();
         let o = expect_open_out(self.meta.write_in(sid, who, op))?;
+        let o = self.strong_uninline(who, sid, o, flags)?; // 打开的是已有的 inline 文件时
         Ok(self.register(who, o, flags, true, sid))
     }
 
@@ -132,8 +164,10 @@ impl FileClient {
         let inode = self.inode_entry(&o);
         let acc = flags & O_ACCMODE;
         let (read, write) = (acc != O_WRONLY, acc != O_RDONLY);
-        let direct = flags & libc::O_DIRECT as u32 != 0 || o.attr.consistency == CONSISTENCY_STRONG;
+        let strong = o.attr.consistency == CONSISTENCY_STRONG;
+        let direct = flags & libc::O_DIRECT as u32 != 0 || strong;
         let sync = flags & (libc::O_SYNC | libc::O_DSYNC) as u32 != 0;
+        let append = flags & libc::O_APPEND as u32 != 0;
         let mut st = lock(&inode.st);
         let keep_cache = !created && st.seen_change_id == o.attr.change_id;
         st.seen_change_id = o.attr.change_id;
@@ -162,7 +196,7 @@ impl FileClient {
             lock(&self.atime).push(AtimeItem { ino, at: clock::wall_ts(), who: who.clone() });
         }
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        lock(&self.handles).insert(fh, Handle { ino, read, write, direct, sync, session: sid });
+        lock(&self.handles).insert(fh, Handle { ino, read, write, direct, sync, session: sid, strong, append });
         Opened { fh, attr, keep_cache, direct }
     }
 

@@ -22,6 +22,7 @@ use super::txn::{TxnOp, TxnRequest};
 use super::view::{BatchView, ReadView};
 use crate::base::ErrCode;
 use crate::base::types::ReqCtx;
+use crate::meta::changelog::{self, Subject};
 use crate::meta::raft::driver::ProposeOutcome;
 use crate::meta::raft::{or_abort, storage};
 use crate::meta::schema::records::WriteBatchV1;
@@ -110,7 +111,7 @@ fn fill(
         if req.ctx.trace_id != 0 {
             traces.push(req.ctx.trace_id);
         }
-        let result = run_one(view, env, map, &req.ctx, req.op);
+        let result = run_one(view, env, map, &req.ctx, req.op, req.on_reject.as_ref());
         out.push(Executed { done: req.done, result });
         if end_here || view.topology_changed() || out.len() >= MAX_BATCH_OPS || view.encoded_len() >= MAX_BATCH_BYTES {
             break;
@@ -122,8 +123,16 @@ fn fill(
 
 /// 执行一个请求（3.4.1.4 run_one）：会话已驱逐 → `SESSION_EVICTED`；会话是别的 key 打开的 → `EACCES`（实现注记（M4），
 /// `sessions::usable`）；去重命中 → 原结果；否则在操作层里执行闭包，失败就整体丢弃它的写入；最终结果（成功或 POSIX errno）
-/// 写进去重表，并点删 seq − 256 的旧记录（规则 4）。
-fn run_one(view: &mut BatchView, env: &OpEnv, map: &ClusterMap, ctx: &ReqCtx, op: TxnOp) -> Result<MetaReply, ErrCode> {
+/// 写进去重表，并点删 seq − 256 的旧记录（规则 4）。实现注记（M12）：被拒绝（POSIX errno）的客户端修改在 audited 时也写一条 changelog
+/// （`on_reject` = 它的对象，`changelog::rejected`）。
+fn run_one(
+    view: &mut BatchView,
+    env: &OpEnv,
+    map: &ClusterMap,
+    ctx: &ReqCtx,
+    op: TxnOp,
+    on_reject: Option<&Subject>,
+) -> Result<MetaReply, ErrCode> {
     if ctx.seq != 0 {
         sessions::usable(view, ctx.session, ctx.who.conn.key_id)?; // 驱逐是单调的事实；会话不能借给别的 key
         if let Some(r) = dedup::get(view, ctx.session, ctx.seq) {
@@ -140,12 +149,15 @@ fn run_one(view: &mut BatchView, env: &OpEnv, map: &ClusterMap, ctx: &ReqCtx, op
         if ctx.seq > DEDUP_WINDOW {
             dedup::delete(view, ctx.session, ctx.seq - DEDUP_WINDOW); // 点删除，无需扫描
         }
+        if let (Err(e), Some(s)) = (&res, on_reject) {
+            let _ = changelog::rejected(view, &env.op_ctx(ctx, map), s, *e); // 尽力而为：读不出属性就不记
+        }
     }
     // 与伪代码"成功 commit_op、失败 rollback_op"等价：失败时操作层已经清空，这里并入批次的只有去重记录
     // （3.4.1.4 规则 2：错误也写去重表）
     view.commit_op();
     // changelog（3.4.1.4 的 changelog::record）：成功的修改由各操作在自己的闭包末尾写（meta/changelog.rs 的实现注记）；
-    // 被拒绝的修改只在 audited 时写——audit 属性在 M12，到时在这里补上
+    // 被拒绝的修改只在 audited 时写（上面的 rejected）
     res
 }
 

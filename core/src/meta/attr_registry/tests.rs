@@ -48,9 +48,8 @@ fn values_are_validated_and_normalized() {
 
 #[test]
 fn keys_that_cannot_be_set_yet_are_rejected_explicitly() {
-    assert_eq!(err("consistency=strong").0, ErrCode::EOPNOTSUPP, "strong 在 M12");
     for (text, code) in [
-        ("chunk=1M,trash=7d", ErrCode::EOPNOTSUPP),
+        ("chunk=1M,tier=a->b:idle>30d", ErrCode::EOPNOTSUPP),
         ("qos=r=100,w=10", ErrCode::EOPNOTSUPP),
         ("ec=4+2", ErrCode::EOPNOTSUPP),
         ("class=wasm:policy", ErrCode::FEATURE_UNSUPPORTED),
@@ -58,11 +57,11 @@ fn keys_that_cannot_be_set_yet_are_rejected_explicitly() {
         assert_eq!(err(text).0, code, "{text}");
     }
     assert!(err("snapshot=on").1.contains("二期"));
-    assert!(err("trash=7d").1.contains("M12"));
+    assert!(err("locality=any").1.contains("M13"));
     // 单独给出的键（wmfs unset）与 set 的说法相同
     assert_eq!(spec_of("chunk").map(|s| s.key).ok(), Some("chunk"));
-    let f = spec_of("ttl").unwrap_err();
-    assert!(f.code == ErrCode::EOPNOTSUPP && f.msg.contains("M12"), "{f:?}");
+    let f = spec_of("qos").unwrap_err();
+    assert!(f.code == ErrCode::EOPNOTSUPP && f.msg.contains("M13"), "{f:?}");
     assert_eq!(spec_of("quota.ssd").map(|s| s.key).ok(), Some("quota.*"), "M10：quota.<类> 按前缀匹配");
     assert_eq!(spec_of("ec").unwrap_err().code, ErrCode::EOPNOTSUPP);
     let f = spec_of("chunck").unwrap_err();
@@ -144,4 +143,35 @@ fn quota_and_acl_default_are_split_parsed_and_shown() {
         check_manifest_attrs("quota", &["quota", "quota.*"]).is_ok()
             && check_manifest_attrs("posix-acl", &["acl.default"]).is_ok()
     );
+}
+
+/// M12：consistency=strong、trash、ttl、audit 可以设置了（规范化形式见 `attr_registry/policy.rs`）。
+#[test]
+fn strong_trash_ttl_and_audit_are_parsed() {
+    assert_eq!(ok("consistency=strong"), vec![("consistency", "strong".into())]);
+    assert_eq!(err("consistency=strong,attr_ttl=1s").0, ErrCode::EINVAL, "strong 不缓存属性");
+    assert_eq!(ok("trash=7d,ttl=90s"), vec![("trash", "604800000".into()), ("ttl", "90000".into())]);
+    assert_eq!(ok("trash=off")[0].1, "off");
+    for bad in ["trash=366d", "trash=0s", "ttl=0s", "ttl=x", "trash=7d,soft=1"] {
+        assert_eq!(err(bad).0, ErrCode::EINVAL, "{bad}");
+    }
+    assert_eq!((trash_ttl_audit::show_ms("604800000"), trash_ttl_audit::show_ms("off")), ("7d".into(), "off".into()));
+    assert_eq!(ok("audit=on")[0].1, "on");
+    assert_eq!(ok("audit=off")[0].1, "off");
+    let a = ok("audit=on,ops=create+UNLINK,uids=1000+1001");
+    assert_eq!(a, vec![("audit", "on,ops=Create+Unlink,uids=1000+1001".into())], "操作名按表里的写法存");
+    assert_eq!(ok("audit=ops=setattr,uids=7")[0].1, "on,ops=SetAttr,uids=7", "过滤直接写成值 = on 加过滤");
+    for bad in [
+        "audit=maybe",
+        "audit=on,ops=bogus",
+        "audit=on,uids=x",
+        "audit=off,ops=create",
+        "audit=on,ops=create,ops=unlink",
+    ] {
+        assert_eq!(err(bad).0, ErrCode::EINVAL, "{bad}");
+    }
+    let spec = trash_ttl_audit::audit_spec("on,ops=Create+Unlink,uids=1000").unwrap();
+    assert_eq!((spec.on, spec.ops, spec.uids), (true, vec![3, 8], vec![1000]));
+    assert_eq!(trash_ttl_audit::audit_text(&trash_ttl_audit::audit_spec("on").unwrap()), "on");
+    assert_eq!(trash_ttl_audit::audit_spec("off"), Some(Default::default()));
 }

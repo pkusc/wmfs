@@ -188,6 +188,14 @@ impl RpcClient {
         self.start(to, fam, f, timeout)?.wait()
     }
 
+    /// 到 `to` 的连接在握手里协商出的 feature 位（3.3.2 的双方交集；还没有连接就先建，同 [`send_oneway`](Self::send_oneway)）。
+    /// 发要 feature 位门控的消息之前核对它（3.2.11 第 3 条：新的消息变体只能在对端声明支持之后发；MetaClient，ADR-0043 第 3 条）。
+    pub fn features(&self, to: &Endpoint, fam: Family, timeout: Duration) -> Result<u64, ErrCode> {
+        let deadline = clock::mono_ms() + timeout.as_millis() as u64 + 1; // +1：见文件头的实现注记 ④
+        let (s, a) = self.route(to, fam)?;
+        Ok(self.connection(&s, &a, deadline)?.features())
+    }
+
     /// 发出请求、立即返回；之后用 PendingCall::wait 等（kv bench 64 路并发等）
     pub fn start(&self, to: &Endpoint, fam: Family, f: OutFrame, timeout: Duration) -> Result<PendingCall, ErrCode> {
         let (tx, rx) = bounded(1);

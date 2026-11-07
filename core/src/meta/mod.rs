@@ -16,8 +16,7 @@
 //! - [`data_reports`]：数据节点报上来的 CheckEpochs（本地孤儿扫描）与 ReportCorrupt（scrub 修好或修不了的坏块，M11）
 //!
 //! - [`quota`]：配额的本体一侧——quantum 额度、精确检查、护栏、软限的起点（M10）
-//!
-//! 锁（M12）随里程碑加入。
+//! - [`locks`]：字节范围锁与 flock 的复制锁表（M12）
 
 pub mod attr_ops;
 pub mod attr_registry;
@@ -28,6 +27,7 @@ pub mod data_reports;
 pub mod engine;
 pub mod evict;
 pub mod gc_meta;
+pub mod locks;
 pub mod ns;
 pub mod quota;
 pub mod raft;

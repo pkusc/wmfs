@@ -1,0 +1,13 @@
+# trash-expire 后台任务插件的 manifest（design.md 3.7.1、4.12）：与 mod.rs 里的 MANIFEST 逐字段相等（tests.rs 检查）。
+name = "trash-expire"
+version = "0.1.0"
+hooks = ["bg_task"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = ["trash"]
+budget_ns = 0
+fail_points = ["plugin.trash-expire.bg_task"]
+
+[config_schema]
+# 没有部署参数：保留多久由目录属性 trash 决定；限速用 wmfs task set trash-expire

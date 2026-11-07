@@ -69,8 +69,12 @@ fn attributes_usage_status_semantics_and_settings_over_http() {
     assert!(g.semantics.starts_with("consistency=cto attr_ttl=1s"), "{}", g.semantics);
     let e = set(&a, "/proj", "chunck=4M").unwrap_err();
     assert_eq!((e.status, e.code.as_str(), e.message.as_str()), (400, "einval", "未知属性 chunck"));
-    let e = set(&a, "/proj", "consistency=strong").unwrap_err();
-    assert_eq!((e.status, e.code.as_str()), (400, "eopnotsupp"));
+    let e = set(&a, "/proj", "qos=r=100,w=10").unwrap_err();
+    assert_eq!(
+        (e.status, e.code.as_str()),
+        (400, "eopnotsupp"),
+        "M13 才实现的键（consistency=strong 在 M12 可以设了）"
+    );
     assert_eq!(set(&a, "/nope", "chunk=1M").unwrap_err().status, 404);
     let e = set(&api(&d.0, &run.mgmt_addr, "client"), "/proj", "chunk=2M").unwrap_err();
     assert_eq!(e.status, 403, "写要 admin key");

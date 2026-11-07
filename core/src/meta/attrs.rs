@@ -19,6 +19,7 @@ use wmfs_api::metrics::{self, Counter};
 
 use crate::base::{ErrCode, lock};
 use crate::data::format::{CK_BLAKE3, CK_CRC32C, CK_XXH3, CMP_LZ4, CMP_NONE, CMP_ZSTD};
+use crate::meta::attr_registry::trash_ttl_audit::{audit_spec, ms_or_off};
 use crate::meta::attr_registry::{self, AttrKind, attr_ttl_ms};
 use crate::meta::engine::txn::{KvRead, KvTxn};
 use crate::meta::ns::acl;
@@ -249,6 +250,9 @@ fn compute(v: &dyn KvRead, chain: &[u64]) -> Result<EffectiveAttrs, ErrCode> {
     eff.quotas = stacked;
     for (k, val, d) in got {
         set_typed_field(&mut eff, k, &val).ok_or(ErrCode::INTERNAL)?; // DIRATTR 里存的是规范化过的值：解不开 = 状态损坏
+        if k == "trash" {
+            eff.trash_root = d; // 回收站建在 trash 的来源目录下（第 5 章，M12）
+        }
         eff.sources.push((k, d));
     }
     Ok(eff)
@@ -267,10 +271,14 @@ fn set_typed_field(eff: &mut EffectiveAttrs, key: &str, v: &str) -> Option<()> {
         "encrypt" if v == "none" => eff.encrypt_key = 0,
         "encrypt" => eff.encrypt_key = v.parse().ok()?, // 存的是数据密钥的数字 id（attr_ops::set 换好的）
         "acl.default" => eff.acl_default = Some(acl::encode(&acl::parse_text(v).ok()?)),
+        "consistency" if v == "strong" => eff.consistency = CONSISTENCY_STRONG, // M12
         "consistency" => {
-            eff.consistency = CONSISTENCY_CTO; // strong 在 M12
+            eff.consistency = CONSISTENCY_CTO;
             eff.attr_ttl_ms = attr_ttl_ms(v).map_or(Some(DEFAULT_ATTR_TTL_MS), |ms| u32::try_from(ms).ok())?;
         }
+        "trash" => eff.trash_ms = ms_or_off(v)?,
+        "ttl" => eff.ttl_ms = ms_or_off(v)?,
+        "audit" => eff.audit = audit_spec(v)?,
         _ => return None,
     }
     Some(())

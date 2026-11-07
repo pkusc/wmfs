@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::base::types::Ts;
 use crate::meta::schema::records::LayoutV1;
+use crate::proto::features::{FEAT_LOCKS, FEAT_STRONG};
 
 /// 每个会话同时在途的修改型请求上限（3.5.2）。
 pub const DEDUP_WINDOW: u64 = 256;
@@ -149,6 +150,16 @@ impl MetaOp {
             MetaOp::Uninline { .. } => "Uninline",
             MetaOp::TruncateHandle { .. } => "TruncateHandle",
             MetaOp::ReopenHandle { .. } => "ReopenHandle",
+        }
+    }
+
+    /// 发这个请求之前对端要在握手里声明的 feature 位（3.2.11 第 3 条，ADR-0043 第 3 条）：锁 → `FEAT_LOCKS`，strong 的追加 →
+    /// `FEAT_STRONG`；其余 0。MetaClient 发之前核对这条连接协商出的交集（`RpcClient::features`），没有 → `EOPNOTSUPP`、不发。
+    pub fn feature(&self) -> u64 {
+        match self {
+            MetaOp::SetLock { .. } | MetaOp::GetLock { .. } => FEAT_LOCKS,
+            MetaOp::AppendReserve { .. } => FEAT_STRONG,
+            _ => 0,
         }
     }
 }

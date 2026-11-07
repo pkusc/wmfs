@@ -266,7 +266,7 @@ fn data_family_never_silently_downgrades_for_clients() {
 #[test]
 fn version_feature_role_and_cluster_negotiation() {
     use std::net::TcpStream;
-    use wmfs_core::proto::features::FEAT_STRONG;
+    use wmfs_core::proto::features::{FEAT_BULK_REMOTE, FEAT_STRONG, OUR_FEATURES};
     let s = tcp();
     let try_hello = |edit: &dyn Fn(&mut wmfs_core::proto::handshake::Hello)| {
         let mut h = hello(&key(2), Role::Client);
@@ -275,8 +275,12 @@ fn version_feature_role_and_cluster_negotiation() {
     };
     assert_eq!(try_hello(&|_| {}), Ok(0), "合法的 Hello 得到 Challenge（features 取交集）");
     assert_eq!(try_hello(&|h| h.proto_min = 2), Err(ErrCode::PROTO_UNSUPPORTED), "版本区间里没有 1");
-    assert_eq!(try_hello(&|h| h.required = FEAT_STRONG), Err(ErrCode::PROTO_UNSUPPORTED), "要求对方没有的特性");
-    assert_eq!(try_hello(&|h| h.features = FEAT_STRONG), Ok(0), "本端多报的特性只是不在交集里");
+    // 服务端声明 OUR_FEATURES（strong、锁、inline，ADR-0043 第 3 条），不声明 BULK_REMOTE
+    assert_eq!(try_hello(&|h| h.required = FEAT_BULK_REMOTE), Err(ErrCode::PROTO_UNSUPPORTED), "要求对方没有的特性");
+    assert_eq!(try_hello(&|h| h.required = FEAT_STRONG), Ok(0), "要求的对方有：照常（交集只看 features）");
+    let both = FEAT_BULK_REMOTE | FEAT_STRONG;
+    assert_eq!(try_hello(&|h| h.features = both), Ok(FEAT_STRONG), "本端多报的特性只是不在交集里");
+    assert_eq!(try_hello(&|h| h.features = u64::MAX), Ok(OUR_FEATURES), "交集至多是服务端声明的");
     assert_eq!(try_hello(&|h| h.role = 9), Err(ErrCode::AUTH_FAILED), "不认识的角色值");
     assert_eq!(try_hello(&|h| h.cluster_id = [9; 16]), Err(ErrCode::AUTH_FAILED), "连错了集群");
     // 未完成认证的连接只允许握手帧：第一帧是 Ping → 直接断开（不回 ERROR）

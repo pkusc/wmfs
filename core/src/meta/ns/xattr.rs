@@ -61,6 +61,30 @@ pub fn get_xattr(v: &dyn KvRead, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>
     Ok(load(v, ino)?.entries.into_iter().find(|(k, _)| k == name).map(|(_, x)| x))
 }
 
+/// 按名字有序地放进去（已有同名的就换掉值）。
+fn upsert(x: &mut XattrsV1, name: &[u8], val: Vec<u8>) {
+    let i = x.entries.partition_point(|(k, _)| k.as_slice() < name);
+    match x.entries.get_mut(i) {
+        Some((k, old)) if k == name => *old = val,
+        _ => x.entries.insert(i, (name.to_vec(), val)),
+    }
+}
+
+/// 一个 inode 的 xattr 合计多少字节（名字 + 值；上限 64 KiB）。
+fn total(x: &XattrsV1) -> usize {
+    x.entries.iter().map(|(k, val)| k.len() + val.len()).sum()
+}
+
+/// 不做权限检查地写一个 xattr（回收站记原路径用，M12）；写上之后合计超过 64 KiB 就不写。
+pub fn put_raw(v: &mut dyn KvTxn, ino: u64, name: &[u8], value: Vec<u8>) -> Result<(), ErrCode> {
+    let mut x = load(v, ino)?;
+    upsert(&mut x, name, value);
+    if total(&x) <= MAX_TOTAL {
+        store(v, ino, &x);
+    }
+    Ok(())
+}
+
 /// 新建 inode 时写它继承来的 ACL（访问 ACL 与新目录的默认 ACL；都没有就什么也不写）。
 pub fn put_acls(v: &mut dyn KvTxn, n: &mut Node, access: Option<Vec<u8>>, default: Option<Vec<u8>>) {
     let mut entries = vec![];
@@ -165,16 +189,13 @@ pub fn setxattr(
         }
     }
     match (pos, keep) {
-        (Some(i), Some(val)) => x.entries[i].1 = val,
+        (_, Some(val)) => upsert(&mut x, name, val),
         (Some(i), None) => {
             x.entries.remove(i);
         }
-        (None, Some(val)) => {
-            x.entries.insert(x.entries.partition_point(|(k, _)| k.as_slice() < name), (name.to_vec(), val))
-        }
         (None, None) => {}
     }
-    if x.entries.iter().map(|(k, val)| k.len() + val.len()).sum::<usize>() > MAX_TOTAL {
+    if total(&x) > MAX_TOTAL {
         return Err(ErrCode::ENOSPC);
     }
     store(v, ino, &x);

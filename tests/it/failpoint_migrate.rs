@@ -5,10 +5,12 @@
 //!   有 `RStatDrift`（extra 是差值；字段名与次序是金样）。
 //!
 //! - `plugin.reconciler.bg_task`、`plugin.scrub.bg_task`（框架包在每一步外层的插件 fail point）：这一步失败 → 计入
-//!   `wmfs_task_errors_total`，稍后从同一个游标重试，转换与 scrub 的一轮照样做完；
+//!   `wmfs_task_errors_total`，稍后从同一个游标重试，转换与 scrub 的一轮照样做完；M12 的 `plugin.trash-expire.bg_task`、
+//!   `plugin.ttl.bg_task` 同样（回收站里到期的、ttl 过期的文件照样被删掉）；
 //! - `chunk.sync.eio`（迁移把新布局的数据 SyncChunks 时失败）：不切换（换布局之前数据必须持久）、这一次作废，之后重做成功；
 //! - `reconciler.full_every_ms` 之下，旧 leader 留下的迁移意图在声明已经一致时也被放弃（ADR-0042 第 10 条）；
-//! - `chunk.commit.before_rename` + `clock.wall.skew_ms`：拷得久的迁移途中重签 cap，一次迁成（审查 #28）。
+//! - `chunk.commit.before_rename` + `clock.wall.skew_ms`：拷得久的迁移途中重签 cap，一次迁成（审查 #28）；
+//! - `reconciler.full_every_ms` 之下，`consistency=strong` 目录里残留的 inline 小文件被转成 chunk（M12）。
 //!
 //! fail point 是进程级的：单独一个测试程序，几个用例互斥地跑（同一时刻只有一个节点在迁移）。
 
@@ -17,6 +19,7 @@ use std::time::Duration;
 
 use wmfs_core::api::types::{NodeInfoReply, STATE_DONE};
 use wmfs_core::api::{failpoint, metrics};
+use wmfs_core::base::ErrCode;
 use wmfs_core::data::format::CMP_LZ4;
 use wmfs_core::meta::schema::keys::{self, GC_EPOCH, ROOT_INO};
 use wmfs_core::meta::schema::records::{F_INLINE, InodeV1, RStatV1, decode_v1, encode_v1};
@@ -128,6 +131,43 @@ fn a_failing_reconciler_or_scrub_step_is_retried_from_the_same_cursor() {
     run.stop();
 }
 
+/// M12：trash-expire 与 ttl 的插件 fail point（框架包在每一步外层，同上面 reconciler、scrub 的用例）：这一步失败 → 计入
+/// `wmfs_task_errors_total`，稍后重试——回收站里到期的文件、ttl 过期的文件照样被删掉。
+#[test]
+fn failing_trash_expire_and_ttl_steps_are_retried() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    set_full_bg();
+    let d = TempDir::new("fp-trash-ttl");
+    init(&d.0);
+    let run = start(&d.0);
+    let (a, c, me) = (api(&d.0, &run.mgmt_addr), client(&d.0, &run, "admin"), who(1000, 1000));
+    let count = |name: &'static str| metrics::counter(name, "", &[]).get();
+    let errors = |t: &str| metrics::counter("wmfs_task_errors_total", "", &[("task", t)]).get();
+    let (x0, t0, ex0, et0) =
+        (count("wmfs_trash_expired_total"), count("wmfs_ttl_deleted_total"), errors("trash-expire"), errors("ttl"));
+    failpoint::set("plugin.trash-expire.bg_task", "times(1,return(EIO))").unwrap();
+    failpoint::set("plugin.ttl.bg_task", "times(1,return(EIO))").unwrap();
+    let t = mkdir(&c, ROOT_INO, "t");
+    set(&a, "/t", "trash=1s").unwrap();
+    put(&c, &me, t, "gone", b"x").unwrap();
+    c.meta.write(&me, MetaOp::Unlink { parent: t, name: b"gone".to_vec() }).unwrap(); // 进回收站，1 s 后到期
+    let l = mkdir(&c, ROOT_INO, "l");
+    set(&a, "/l", "ttl=1s").unwrap();
+    put(&c, &me, l, "old", b"y").unwrap();
+    task(&a, "ttl", "run", None); // ttl 每轮隔 60 s：马上来一轮（这一步失败，10 s 后从同一个游标重试）
+    assert!(
+        wait_for(30, || errors("trash-expire") > ex0 && errors("ttl") > et0),
+        "两次失败都计入了 wmfs_task_errors_total"
+    );
+    let done = || count("wmfs_trash_expired_total") > x0 && count("wmfs_ttl_deleted_total") > t0;
+    assert!(wait_for(60, done), "重试的那一步照样删掉了");
+    let lookup = MetaOp::Lookup { parent: l, name: b"old".to_vec() };
+    assert_eq!(c.meta.read(&me, lookup).unwrap_err(), ErrCode::ENOENT, "ttl 过期的文件没了");
+    failpoint::clear("plugin.trash-expire.bg_task");
+    failpoint::clear("plugin.ttl.bg_task");
+    run.stop();
+}
+
 #[test]
 fn a_migration_whose_new_data_cannot_be_synced_does_not_switch() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -178,6 +218,31 @@ fn a_stale_migration_intent_is_abandoned_even_if_the_file_already_matches() {
     assert_eq!(inode().layout.unwrap().epoch, i.layout.unwrap().epoch, "布局没换");
     assert!(get(&c, &me, ino).unwrap() == data);
     failpoint::clear("reconciler.full_every_ms");
+    run.stop();
+}
+
+/// M12（3.10 的 M12 注记 ①）：目录改成 `consistency=strong` 之后，里面残留的 inline 小文件由协调器的全量扫描转成 chunk（strong 的写路径
+/// 不处理 inline 文件），内容不变。
+#[test]
+fn the_full_scan_converts_inline_files_left_in_a_strong_directory() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    set_full_bg();
+    let d = TempDir::new("fp-strong-inline");
+    init(&d.0);
+    let run = start(&d.0);
+    let (a, c, me) = (api(&d.0, &run.mgmt_addr), client(&d.0, &run, "admin"), who(1000, 1000));
+    let s = mkdir(&c, ROOT_INO, "s");
+    set(&a, "/s", "inline=64K").unwrap();
+    let ino = put(&c, &me, s, "small", b"tiny").unwrap().attr.ino;
+    let inode = || decode_v1::<InodeV1>(&get_raw(&run.meta, &keys::inode(ino)).unwrap().unwrap()).unwrap();
+    assert_ne!(inode().flags & F_INLINE, 0, "先是 inline");
+    set(&a, "/s", "consistency=strong").unwrap();
+    failpoint::set("reconciler.full_every_ms", "return(500)").unwrap();
+    let converted = wait_for(30, || inode().flags & F_INLINE == 0);
+    failpoint::clear("reconciler.full_every_ms");
+    assert!(converted, "全量扫描把 strong 目录里的 inline 文件转成了 chunk");
+    assert_eq!(inode().layout.unwrap().inline_max, 0);
+    assert!(get(&c, &me, ino).unwrap() == b"tiny", "内容不变");
     run.stop();
 }
 

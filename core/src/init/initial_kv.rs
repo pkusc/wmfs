@@ -5,6 +5,7 @@
 //! - default profile 的目录属性：`/home replicas=3`、`/scratch replicas=2`（理念文档第 7 章默认冗余）。
 //! - 存储类 default（id 1，`label = "*"`，replica 3，priority normal，weight 1，无 QoS 限制）与 CLASS_NAME。
 //! - 实现注记（M6）：minimal profile（3.4.3 的表）：default 类 replica = 1，不写 replicas 属性（单节点不出现降级警告）；其余相同。
+//! - 实现注记（M12）：nas-safe 阶段版的 `/home` 是 `replicas=3,trash=7d,audit=on`（9.7），并建 `CURSOR(audit-log)`（seq 0：从头保留）。
 //! - NodeRecV1(1)（voter、Active；地址来自 node.toml 的监听地址）；KEYMETA：key 1 = admin，key 2 = 默认 client。
 //! - TargetRecV1：`--target` 给的每个 target 一条，id 1..=n（实现注记（M4）：node 1、状态 Up、`last_up_ms` = init 的时刻，
 //!   `phys_devs` 空、`boot_id` 0——两者由 target 心跳在 M5 填上；容量取 `[[target]] capacity`，0 = 不限）。
@@ -18,10 +19,11 @@
 
 use crate::base::types::Ts;
 use crate::init::{Profile, initial_keymeta};
+use crate::meta::changelog::AUDIT_CURSOR;
 use crate::meta::schema::keys::{self, FIRST_INO, ROOT_INO};
 use crate::meta::schema::records::{
-    AttrMapV1, ClassIdV1, ClusterInfoV1, ClusterSettingsV1, DentryV1, FeatureSetV1, InodeV1, KIND_DIR, NodeRecV1,
-    PluginListV1, RStatV1, StorageClassV1, TargetRecV1, encode_v1,
+    AttrMapV1, ClassIdV1, ClusterInfoV1, ClusterSettingsV1, CursorV1, DentryV1, FeatureSetV1, InodeV1, KIND_DIR,
+    NodeRecV1, PluginListV1, RStatV1, StorageClassV1, TargetRecV1, encode_v1,
 };
 
 /// `/home` 与 `/scratch` 是 init 分配的头两个普通 inode。
@@ -114,7 +116,14 @@ pub fn initial_kv(i: &InitialKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         (keys::global(keys::G_SETTINGS), encode_v1(&ClusterSettingsV1::default())),
         (keys::global(keys::G_PLUGINS), encode_v1(&i.plugins)),
     ];
-    if i.profile != Profile::Minimal {
+    if i.profile == Profile::NasSafe {
+        // nas-safe 阶段版（9.7，M12 起）：/home replicas=3,trash=7d,audit=on；init 直接写 DIRATTR、不经 wmfs set，所以 audit-log 游标也在这里建
+        let week_ms = (7 * 86_400_000u64).to_string(); // trash=7d：DIRATTR 里存规范化后的毫秒数
+        let m = [("replicas", "3"), ("trash", week_ms.as_str()), ("audit", "on")];
+        let home = AttrMapV1 { entries: m.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        kv.push((keys::dirattr(HOME_INO), encode_v1(&home)));
+        kv.push((keys::cursor(AUDIT_CURSOR), encode_v1(&CursorV1 { seq: 0, updated_ms: i.created_ms })));
+    } else if i.profile != Profile::Minimal {
         kv.push((keys::dirattr(HOME_INO), encode_v1(&attr("replicas", "3"))));
     }
     if i.profile == Profile::Default {

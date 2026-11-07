@@ -255,14 +255,22 @@ pub fn status(a: StatusArgs) -> i32 {
                 (_, Some(n)) => format!("；已有文件里实际副本少于声明的 {n} 个"),
                 _ => String::new(),
             };
-            let files = match (a.files, a.mismatched_files) {
-                (Some(f), Some(m)) if a.migrates == Some(false) => format!("；{f} 个已有文件里 {m} 个不同（不迁移）"),
-                (Some(f), Some(m)) => {
+            let files = match (x.key.as_str(), a.files, a.mismatched_files) {
+                ("ttl", Some(f), Some(m)) => format!("；{f} 个已有文件里 {m} 个已经过期、还没被删"), // M12
+                ("trash", Some(f), _) => format!("；回收站里 {f} 个文件、{}", human(a.bytes.unwrap_or(0))),
+                (_, Some(f), Some(m)) if a.migrates == Some(false) => {
+                    format!("；{f} 个已有文件里 {m} 个不同（不迁移）")
+                }
+                (_, Some(f), Some(m)) => {
                     format!("；{f} 个已有文件里 {m} 个还没转换（写打开着、被跳过的 {} 个）", a.open_files.unwrap_or(0))
                 }
                 _ => String::new(),
             };
-            s += &format!("\n  {:<12} 声明 {}（{from}），实际 {}{short}{files}  {ok}", x.key, x.declared, a.new_files);
+            let lag = a.lag.map_or(String::new(), |n| format!("；审计消费者落后 {n} 条")); // M12：audit-log 游标
+            s += &format!(
+                "\n  {:<12} 声明 {}（{from}），实际 {}{short}{files}{lag}  {ok}",
+                x.key, x.declared, a.new_files
+            );
             for q in a.quotas.iter().flatten() {
                 s += &quota_line(q); // M11：quota 的实际（用量与上限）
             }

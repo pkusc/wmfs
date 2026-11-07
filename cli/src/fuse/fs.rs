@@ -1,19 +1,13 @@
 //! fuser 的 `Filesystem` 实现（design.md 8.1–8.4）：每个方法只是把内核的请求换成元数据请求或 `FileClient` 的调用，再按 8.7
 //! 映射错误码回复内核。方法取 `&self`（fuser 16 个工作线程并发调用），状态都在 `FileClient` 与 `WmfsFs` 的 Mutex 里。
 //!
-//! - **init**：协商 `FUSE_POSIX_ACL | FUSE_DONT_MASK | FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_HANDLE_KILLPRIV_V2`（内核
-//!   支持的那部分），`max_write`、`max_readahead` 1 MiB，`max_background` 64。实现注记（M6）：① `FUSE_POSIX_LOCKS`、
-//!   `FUSE_FLOCK_LOCKS` 随 M12 的集群锁一起打开——没打开时内核在本机处理 fcntl 锁与 flock（只在本节点有效），而不是把它们交给
-//!   还没实现的 getlk/setlk 回 ENOSYS。② `FUSE_HANDLE_KILLPRIV_V2`：非属主写入、截断、chown 时去掉 setuid/setgid 由服务端做
-//!   （CommitWrite、截断、chown 里已有，3.5.1）；不协商的话内核会以写者的身份先发一个去掉 suid 的 SETATTR(mode)，服务端按
-//!   chmod 的规则（只有属主或 root）回 EPERM，非属主的 write/truncate 就失败了。故意不开 `FUSE_WRITEBACK_CACHE`、
-//!   `FUSE_ATOMIC_O_TRUNC`、`FUSE_DIRECT_IO_ALLOW_MMAP`（8.1 的理由）。
-//! - **umask**（8.1）：协商了 `FUSE_DONT_MASK`，内核把原始 mode 与 umask 分开传来，由服务端决定（父目录有默认 ACL → 不用
-//!   umask，否则 `mode & !umask`）。spike：create/mkdir/mknod 在 debug 级日志里打印内核传来的 mode 与 umask（`WMFS_LOG=debug`，
-//!   `log_mode_umask`）。
-//! - **flush**（每次 close）：写句柄 → 写出脏数据并提交（cto）；只读句柄什么也不做（不替写者报告写错误）。
-//! - **open**（C2）：`FileClient::open` 说 change_id 变了 → 先 `inval_inode(ino, 0, 0)` 再回复、不带 `FOPEN_KEEP_CACHE`；
-//!   strong 或 `O_DIRECT` → `FOPEN_DIRECT_IO`。
+//! - **init**：协商 `FUSE_POSIX_ACL | FUSE_DONT_MASK | FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO | FUSE_HANDLE_KILLPRIV_V2` 与
+//!   M12 的 `FUSE_POSIX_LOCKS | FUSE_FLOCK_LOCKS`（集群锁，`locks.rs`）中内核支持的那部分，`max_write`、`max_readahead` 1 MiB，
+//!   `max_background` 64（为什么这样协商、umask 的 spike `log_mode_umask`：design.md 8.1 与它的 M6 注记 ①②）。
+//! - **flush**（每次 close）：写句柄 → 写出脏数据并提交（cto），只读句柄不写出（不替写者报告写错误）；M12 起再释放这个进程（lock owner）
+//!   在这个文件上的 POSIX 锁（所以只读打开不再回 `FOPEN_NOFLUSH`，8.7 的 M12 注记）。**release**（最后一个 close）释放记在这个句柄上的
+//!   锁（flock 与 OFD 锁，`client/locks.rs`）。**write**：strong 的 `O_APPEND` 按这次 WRITE 带的标志判断（此刻的 f_flags，F_SETFL 之后也对，8.5）。
+//! - **open**（C2）：change_id 变了 → 先 `inval_inode(ino, 0, 0)` 再回复、不带 `FOPEN_KEEP_CACHE`；strong 或 `O_DIRECT` → `FOPEN_DIRECT_IO`。
 //! - **setattr**：改长度交给 `FileClient::set_size`（带着写句柄时发 TruncateHandle，ADR-0036）；其余属性一个 `SetAttr`。
 //! - 不支持的：`ioctl` → `ENOTTY`（chattr），`copy_file_range` → `EOPNOTSUPP`（内核自动退回普通拷贝），`fallocate` 的非 0 模式
 //!   → `EOPNOTSUPP`（服务端判），`lseek`、`poll`、`bmap` 用 fuser 默认的 ENOSYS（内核改用自己的通用实现）。
@@ -26,10 +20,11 @@ use std::time::SystemTime;
 use fuser::{
     CopyFileRangeFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, IoctlFlags,
     KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
-    TimeOrNow, WriteFlags,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow, WriteFlags,
 };
 use wmfs_core::base::log;
+use wmfs_core::client::locks::{LockReq, setlock_kind};
 use wmfs_core::meta::ns::common::{MODE_MASK, kind_from_mode};
 use wmfs_core::proto::meta::{MetaOp, MetaReply, SetAttrIn};
 
@@ -43,7 +38,9 @@ impl Filesystem for WmfsFs {
             | InitFlags::FUSE_DONT_MASK
             | InitFlags::FUSE_DO_READDIRPLUS
             | InitFlags::FUSE_READDIRPLUS_AUTO
-            | InitFlags::FUSE_HANDLE_KILLPRIV_V2;
+            | InitFlags::FUSE_HANDLE_KILLPRIV_V2
+            | InitFlags::FUSE_POSIX_LOCKS
+            | InitFlags::FUSE_FLOCK_LOCKS;
         let _ = cfg.add_capabilities(want & cfg.capabilities());
         let _ = cfg.set_max_write(1 << 20);
         let _ = cfg.set_max_readahead(1 << 20);
@@ -207,12 +204,13 @@ impl Filesystem for WmfsFs {
         offset: u64,
         data: &[u8],
         write_flags: WriteFlags,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         let (who, kill) = (self.who(req), write_flags.contains(WriteFlags::FUSE_WRITE_KILL_SUIDGID));
         let r = self.fc.handle(fh.0).and_then(|h| {
+            let h = h.with_write_flags(flags.0 as u32); // 这次 WRITE 的标志（见文件头）
             if kill {
                 self.fc.commit_to_drop_suid(&who, &h)?; // 去掉 setuid/setgid 要马上看得到（M10，`commit_to_drop_suid`）
             }
@@ -224,8 +222,10 @@ impl Filesystem for WmfsFs {
         }
     }
 
-    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _lock_owner: LockOwner, reply: ReplyEmpty) {
-        self.empty(reply, self.fc.flush(fh.0)); // 每次 close：写句柄写出去并提交（cto）
+    fn flush(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, lock_owner: LockOwner, reply: ReplyEmpty) {
+        let r = self.fc.flush(fh.0); // 每次 close：写句柄写出去并提交（cto）
+        self.fc.drop_locks(fh.0, lock_owner.0); // 这个进程在这个文件上的 POSIX 锁随 close 释放（M12）
+        self.empty(reply, r);
     }
 
     fn release(
@@ -238,6 +238,7 @@ impl Filesystem for WmfsFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        self.fc.release_locks(fh.0); // 记在这个句柄上的 flock、OFD 锁随最后一个 close 释放（M12）
         self.fc.release(fh.0);
         reply.ok();
     }
@@ -273,6 +274,39 @@ impl Filesystem for WmfsFs {
 
     fn statfs(&self, req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         self.do_statfs(req, reply);
+    }
+
+    fn getlk(
+        &self,
+        req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        _pid: u32,
+        reply: ReplyLock,
+    ) {
+        let Some(kind) = setlock_kind(typ) else { return reply.error(Errno::EINVAL) };
+        self.do_getlk(req, fh.0, LockReq { owner: lock_owner.0, start, end, kind, pid: 0 }, reply);
+    }
+
+    fn setlk(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        let Some(kind) = setlock_kind(typ) else { return reply.error(Errno::EINVAL) };
+        self.do_setlk(req, ino, fh.0, LockReq { owner: lock_owner.0, start, end, kind, pid }, sleep, reply);
     }
 
     fn setxattr(

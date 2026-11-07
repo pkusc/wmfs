@@ -123,7 +123,9 @@ impl FileClient {
         let inode = self.inode(h.ino).ok_or(ErrCode::EBADF)?;
         let end = off.checked_add(data.len() as u64).ok_or(ErrCode::EFBIG)?;
         if h.direct {
-            self.ensure_quota(&inode, who, h.session, off, end)?;
+            if !h.strong_append() {
+                self.ensure_quota(&inode, who, h.session, off, end)?; // strong 的追加：AppendReserve 自己精确检查配额（M12）
+            }
             return self.write_direct(&inode, who, h, off, data);
         }
         self.uninline_if_past(&inode, who, h.session, end)?;

@@ -79,7 +79,7 @@ impl NodeFile {
 }
 
 /// init 的部署模板（3.4.3 第 3 步的表）。M6 有 default 与 minimal。实现注记（M9）：nas-safe 是阶段版（9.7：只设置已有消费者的
-/// 属性）——`/home replicas=3`（trash、audit 在 M12）；hpc-rdma 还没有实现（要 RDMA 网卡，开发机上没有，`scripts/profiles.sh` 显示 SKIP）。
+/// 属性）——`/home replicas=3`（M12 起加上 trash=7d、audit=on）；hpc-rdma 还没有实现（要 RDMA 网卡，开发机上没有，`scripts/profiles.sh` 显示 SKIP）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Default,

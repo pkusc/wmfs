@@ -134,6 +134,13 @@ pub fn changelog(seq: u64) -> Vec<u8> {
 pub fn trash_index(expire_ms: u64, ino: u64) -> Vec<u8> {
     make_key(T_TRASH_INDEX, &[&expire_ms.to_be_bytes(), &ino.to_be_bytes()])
 }
+/// [`trash_index`] 的反过来：`0F expire_ms:u64 ino:u64`（17 字节）→ (到期时刻, ino)；不是这个形状 → None。实现注记（M12）：新增（只增）。
+pub fn parse_trash_index(k: &[u8]) -> Option<(u64, u64)> {
+    if k.len() != 17 || k[0] != T_TRASH_INDEX {
+        return None;
+    }
+    Some((u64::from_be_bytes(k[1..9].try_into().ok()?), u64::from_be_bytes(k[9..17].try_into().ok()?)))
+}
 pub fn node(id: u32) -> Vec<u8> {
     make_key(T_NODE, &[&id.to_be_bytes()])
 }

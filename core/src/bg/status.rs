@@ -19,11 +19,12 @@ use crate::api::types::StatusReply;
 use crate::base::{ErrCode, clock};
 use crate::data::chain;
 use crate::data::format::CMP_ZSTD;
-use crate::meta::attrs::EffectiveAttrs;
+use crate::meta::attrs::{CONSISTENCY_STRONG, EffectiveAttrs};
 use crate::meta::cluster::chains::serving_count;
 use crate::meta::engine::txn::MetaEngine;
 use crate::meta::ns::common::Node;
 use crate::meta::ns::layout::inline_of;
+use crate::meta::ns::trash::ttl_due;
 use crate::meta::schema::records::{F_INLINE, InodeV1, KIND_FILE, LayoutV1};
 use crate::meta::sessions::Live;
 use crate::proto::peer::ClusterMap;
@@ -36,9 +37,11 @@ pub const SCAN_RATE: u64 = 200_000;
 pub const MIGRATED: [&str; 4] = ["class", "replicas", "compress", "encrypt"];
 pub const PER_FILE: [&str; 8] = ["class", "replicas", "compress", "encrypt", "chunk", "stripe", "inline", "checksum"];
 
-/// 协调器要迁移的键里有没有与声明不同的（见文件头）。
+/// 协调器要迁移的键里有没有与声明不同的（见文件头）。实现注记（M12）：`consistency=strong` 生效的目录里的 inline 文件也算不同（3.10：
+/// 迁移时转成 chunk，strong 的写路径不处理 inline 文件）。
 pub fn differs(i: &InodeV1, e: &EffectiveAttrs) -> bool {
-    i.layout.is_some() && keys_of(i, e).iter().any(|(k, d)| *d && MIGRATED.contains(k))
+    let strong_inline = i.flags & F_INLINE != 0 && e.consistency == CONSISTENCY_STRONG;
+    i.layout.is_some() && (strong_inline || keys_of(i, e).iter().any(|(k, d)| *d && MIGRATED.contains(k)))
 }
 
 /// [`PER_FILE`] 的每个键：(键, 实际与声明不同吗)。
@@ -72,7 +75,8 @@ pub struct Counts {
     pub truncated: bool,
 }
 
-/// 一个普通文件计进统计（见文件头）。
+/// 一个普通文件计进统计（见文件头）。实现注记（M12）：`ttl` 已经过期、还没被 ttl 任务删掉的另计（`ns::trash::ttl_due`；与 `files` 同一个
+/// 口径：普通文件、只在主链接那一项计）。
 fn count(c: &mut Counts, w: &Walked, map: &ClusterMap, live: &Live) {
     let i = &w.inode;
     let Some(l) = i.layout.as_ref().filter(|_| i.kind == KIND_FILE && i.nlink > 0) else { return };
@@ -80,6 +84,9 @@ fn count(c: &mut Counts, w: &Walked, map: &ClusterMap, live: &Live) {
         return; // 这是它的另一个硬链接：只在主链接那一项计
     }
     c.files += 1;
+    if ttl_due(i, w.eff.ttl_ms, clock::wall_ms()) {
+        *c.mismatched.entry("ttl").or_default() += 1;
+    }
     let open = live.is_write_open(w.ino);
     for (k, differ) in keys_of(i, &w.eff) {
         if differ {
@@ -153,6 +160,11 @@ pub fn fill(r: &mut StatusReply, c: &Counts) {
         a.actual.open_files = moves.then(|| n(&c.open));
         a.actual.migrates = Some(moves);
         a.mismatched |= mism > 0 || short.is_some_and(|x| x > 0);
+    }
+    if let Some(a) = r.attrs.iter_mut().find(|a| a.key == "ttl") {
+        let n = c.mismatched.get("ttl").copied().unwrap_or(0);
+        (a.actual.files, a.actual.mismatched_files) = (Some(c.files), Some(n)); // 已经过期、还没删的（M12）
+        a.mismatched |= n > 0;
     }
     r.scanned = c.scanned;
     r.truncated = c.truncated;

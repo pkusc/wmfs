@@ -15,13 +15,14 @@
 //! SIGTERM 叫醒 main。
 //! `wmfs umount <挂载点>` = `fusermount3 -u <挂载点>`（挂载进程看到会话结束后自己退出）。
 //!
-//! [`WmfsFs`]（fuser 的 `Filesystem` 实现在 `fs.rs`，稍长的回调在 `ops.rs`，纯函数在 `util.rs`）：
+//! [`WmfsFs`]（fuser 的 `Filesystem` 实现在 `fs.rs`，稍长的回调在 `ops.rs`，锁在 `locks.rs`，纯函数在 `util.rs`）：
 //! - **身份**：uid/gid/pid 来自内核的请求；附加组读 `/proc/<pid>/status` 的 `Groups:`（按 pid 缓存 1 s），作业 id 读
 //!   `/proc/<pid>/environ` 里 `--job-id-var` 指定的变量（默认依次试 `SLURM_JOB_ID`、`PBS_JOBID`、`WMFS_JOB_ID`，按 pid 缓存
 //!   10 s，读不到为 0；取开头的数字）。客户端声明的 uid 只在它的 key 允许的范围内被相信（服务端检查，ADR-0009）。
 //! - **TTL**（C1）：entry/attr = min(`AttrOut.ttl_ms`, `--max-attr-ttl`)。
 
 mod fs;
+mod locks;
 mod ops;
 mod util;
 

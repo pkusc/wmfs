@@ -30,7 +30,7 @@ use wmfs_core::proto::meta::{MetaOp, MetaReply, O_RDONLY, OpenOut, SetAttrIn};
 use wmfs_core::server::{self, Running};
 use wmfs_plugins::{
     aes_gcm, blake3, crc32c, fifo, gc, label_match, local_fs, lz4, path_caps, posix_acl, posix_mode, quota, reconciler,
-    replica, scrub, shared_key, tcp, xxh3, zstd,
+    replica, scrub, shared_key, tcp, trash_expire, ttl, xxh3, zstd,
 };
 
 use super::meta::admin_ctx;
@@ -72,6 +72,8 @@ pub fn plugins(cfg: &NodeConfig) -> PluginSet {
         s.bg_task(Box::new(gc::GcLocal::new()));
         s.bg_task(Box::new(reconciler::Reconciler::new()));
         s.bg_task(Box::new(scrub::Scrub::new()));
+        s.bg_task(Box::new(trash_expire::TrashExpire::new())); // M12：会改数据的任务也只在 FULL_BG 之后装
+        s.bg_task(Box::new(ttl::Ttl::new()));
     }
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST);
     s.validate(&cfg.plugin).unwrap();

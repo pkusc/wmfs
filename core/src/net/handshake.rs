@@ -8,7 +8,9 @@
 //! 角色规则由 core 强制（与 authn 插件无关）：`key_id == 0` ⇒ 角色必须是 Server；`key_id ≥ 1` ⇒ KEYMETA 里有它、未撤销、
 //! 且 `KEYMETA.role == Hello.role`；authn 插件 Accept 之后再核对 `ConnIdentity.role == Hello.role`。于是 client key
 //! 不可能冒充 server。未完成认证的连接只允许握手帧，其他帧直接断开（计数 `wmfs_conn_handshake_failed_total`）。
-//! 握手成功后两端都调用 `ConnHandle::authenticated`（传输插件从此才收带 bulk 的帧，客户端写线程从此才发保活 Ping）。
+//! 握手成功后两端都调用 `ConnHandle::authenticated`（传输插件从此才收带 bulk 的帧，客户端写线程从此才发保活 Ping），并记下协商出的
+//! feature 位（`Challenge.features` = 双方交集；客户端发要 feature 位门控的消息之前核对它，ADR-0043 第 3 条）。本端声明的位是
+//! `proto::features::OUR_FEATURES`。
 //! 实现注记（M1）：握手失败时 ERROR 帧的 `msg_type` 沿用请求的（Hello 或 Auth），`kind = Response`、flags 带 ERROR。
 
 use wmfs_api::metrics;
@@ -19,6 +21,7 @@ use crate::base::{ErrCode, rand};
 use crate::hooks::pipeline::Pipeline;
 use crate::hooks::traits::{AuthnInput, Conn, ConnIdentity, KeyLookup};
 use crate::net::conn::{ConnHandle, recv_checked};
+use crate::proto::features::OUR_FEATURES;
 use crate::proto::frame::{
     ErrorBody, FLAG_ERROR, FrameHeader, FrameKind, InFrame, MSG_AUTH, MSG_CHALLENGE, MSG_HELLO, MSG_WELCOME, OutFrame,
     PROTO_MAJOR,
@@ -28,8 +31,6 @@ use crate::proto::handshake::{
 };
 use crate::proto::{decode_body, encode_body};
 
-/// 本端支持的协议 feature 位（3.3.2；随功能实现逐个加入：M1 还一个都没有）。
-pub(crate) const OUR_FEATURES: u64 = 0;
 const SOFTWARE: &str = concat!("wmfs ", env!("CARGO_PKG_VERSION"));
 
 /// 服务端握手需要的东西。
@@ -69,7 +70,7 @@ pub(crate) fn server(h: &ConnHandle, conn: &dyn Conn, s: &ServerSide) -> Result<
     }
     let w = Welcome { key_id: hello.key_id, role: role.as_u8(), tenant: id.tenant, server_proof };
     h.send(frame(FrameKind::Response, MSG_WELCOME, f.hdr.req_id, encode_body(&w)))?;
-    h.authenticated(Some(id.clone()));
+    h.authenticated(Some(id.clone()), features);
     Ok(id)
 }
 
@@ -160,7 +161,7 @@ pub(crate) fn client(h: &ConnHandle, conn: &dyn Conn, c: &ClientSide) -> Result<
     if w.key_id != key_id || w.role != role || !proof_ok {
         return Err(ErrCode::AUTH_FAILED);
     }
-    h.authenticated(None);
+    h.authenticated(None, ch.features & OUR_FEATURES);
     Ok(())
 }
 

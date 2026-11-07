@@ -11,6 +11,8 @@
 //! 把链管理器临时改回一步移出时，这个用例实测判为不线性一致。drain 不能撤销，所以它单独一个用例、由验收最后跑（之后集群里那个节点不再
 //! 有链）。
 //!
+//! M12：再加 strong 目录里单文件当寄存器的 FUSE 版本（9.5："M12 起再加"）：经两个挂载点 pwrite / pread，`scripts/accept.d/m12.sh` 跑。
+//!
 //! 对着一个跑着的 3 节点开发集群（固定端口）：`#[ignore]`，由 `scripts/accept.d/m9.sh`、`m10.sh` 在 `wmfs dev up --nodes 3` 之后跑
 //! （环境变量 `WMFS_DEV_DIR`，`PATH` 里要有 `wmfs`）。检查器本身的单元测试照常跑。
 
@@ -190,41 +192,47 @@ fn map_delay(dir: &Path, n: &str, spec: Option<&str>) -> bool {
 fn a_register_on_one_chunk_stays_linearizable_while_nodes_die_and_freeze() {
     let (dir, seed) = (dev_dir(), seed());
     let reg = start(&dir, seed, 200, false);
+    let faults = nemesis(&dir, seed, true, &|| reg.running());
+    reg.check(seed, &faults, 50);
+}
+
+/// 捣乱（见文件头）：直到 60 s 或 `go()` 为假，每隔 1.5–4 s 随机挑一个节点 kill 再起来、（`promote` 时）"提升"、或 pause 一会儿再 resume。
+fn nemesis(dir: &Path, seed: u64, promote: bool, go: &dyn Fn() -> bool) -> Vec<String> {
     let (mut r, t0) = (XorShift64::new(seed), Instant::now());
     let mut faults = Vec::new();
-    while reg.running() && t0.elapsed() < Duration::from_secs(60) {
+    while go() && t0.elapsed() < Duration::from_secs(60) {
         std::thread::sleep(Duration::from_millis(1500 + r.below(2500)));
         let n = (1 + r.below(3)).to_string();
-        let what = r.below(3);
+        let what = if promote { r.below(3) } else { [0, 2][r.below(2) as usize] }; // 0 kill、1 提升、2 pause
         if what == 0 {
             faults.push(format!("kill {n}"));
-            assert!(wmfs(&dir, &["dev", "kill", &n]));
+            assert!(wmfs(dir, &["dev", "kill", &n]));
             std::thread::sleep(Duration::from_millis(500 + r.below(1500)));
-            assert!(wmfs(&dir, &["dev", "start", &n]), "node{n} 起不来");
+            assert!(wmfs(dir, &["dev", "start", &n]), "node{n} 起不来");
         } else if what == 1 {
             // M10（ADR-0040 第 11 条）的"提升"：别的节点换图慢一拍（fail point chain.map.delay：三成的心跳之前睡 2.5 s，租约照样有效），
             // 这个节点重启 → 以 Syncing 回链、同步完被提升为 last serving——旧的 L 还在旧图上的那一刻也进检查
             faults.push(format!("promote {n}"));
             let others: Vec<String> = (1..=3).map(|m| m.to_string()).filter(|m| *m != n).collect();
             for m in &others {
-                assert!(map_delay(&dir, m, Some("pct(30,sleep(2500))")));
+                assert!(map_delay(dir, m, Some("pct(30,sleep(2500))")));
             }
-            assert!(wmfs(&dir, &["dev", "kill", &n]));
-            assert!(wmfs(&dir, &["dev", "start", &n]), "node{n} 起不来");
-            let _ = wmfs(&dir, &["dev", "wait", "chains-serving", "--timeout", "60"]);
+            assert!(wmfs(dir, &["dev", "kill", &n]));
+            assert!(wmfs(dir, &["dev", "start", &n]), "node{n} 起不来");
+            let _ = wmfs(dir, &["dev", "wait", "chains-serving", "--timeout", "60"]);
             for m in &others {
-                let _ = map_delay(&dir, m, None);
+                let _ = map_delay(dir, m, None);
             }
         } else {
             // 偶尔停得比 target 租约（8 s）还久：它先自我隔离（6.4 s，I5）、再被移出链，恢复之后以 Syncing 回来——这些路径也进检查
             let ms = if r.below(4) == 0 { 9000 + r.below(3000) } else { 1000 + r.below(3000) };
             faults.push(format!("pause {n} {ms} ms"));
-            assert!(wmfs(&dir, &["dev", "pause", &n]));
+            assert!(wmfs(dir, &["dev", "pause", &n]));
             std::thread::sleep(Duration::from_millis(ms));
-            assert!(wmfs(&dir, &["dev", "resume", &n]));
+            assert!(wmfs(dir, &["dev", "resume", &n]));
         }
     }
-    reg.check(seed, &faults, 50);
+    faults
 }
 
 /// 见文件头：drain 持有寄存器所在链 L 的节点、同时拖住它换图（每次心跳之前睡 2.5 s，租约 6.4 s 照样续得上），链管理器两步移出这个活着
@@ -262,4 +270,51 @@ fn a_register_stays_linearizable_while_the_node_with_its_last_serving_is_drained
         std::thread::sleep(Duration::from_millis(100)); // 移出之后再跑一会儿
     }
     reg.check(seed, &faults, 50);
+}
+
+/// M12（design.md 9.5 的检查器 ⑦ 的 FUSE 版本）：strong 目录里的一个文件当寄存器——3 个线程经两个挂载点（环境变量 `WMFS_JEPSEN_FILES` =
+/// 两个挂载上这个文件的路径，逗号分隔）pwrite / pread 它的前 8 字节（strong：不缓存、读前线性一致地取长度、写同步写链并同步提交），捣乱同上
+/// （kill、pause；不做"提升"）。失败的写结果未知、失败的读不进历史（与 DataClient 的版本相同）。
+#[test]
+#[ignore = "要一个跑着的 3 节点开发集群与两个挂载点：由 scripts/accept.sh M12 跑"]
+fn a_strong_file_through_two_mounts_stays_linearizable_while_nodes_die_and_freeze() {
+    use std::os::unix::fs::FileExt;
+    let (dir, seed) = (dev_dir(), seed());
+    let files: Vec<PathBuf> =
+        std::env::var("WMFS_JEPSEN_FILES").expect("WMFS_JEPSEN_FILES").split(',').map(PathBuf::from).collect();
+    std::fs::write(&files[0], [0u8; 8]).unwrap();
+    let (history, stop, t0) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)), Instant::now());
+    let workers: Vec<JoinHandle<()>> = (0..3u64)
+        .map(|w| {
+            let (path, history, stop) = (files[w as usize % files.len()].clone(), history.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+                let (mut r, mut n) = (XorShift64::new(seed ^ (w + 1)), 0u64);
+                while !stop.load(Ordering::Relaxed) {
+                    let call = now_us(t0);
+                    let (kind, ok) = if r.below(2) == 0 {
+                        n += 1;
+                        let v = ((w + 1) << 32) | n;
+                        (Kind::Write(v), f.write_at(&v.to_le_bytes(), 0).is_ok())
+                    } else {
+                        let mut b = [0u8; 8];
+                        let ok = f.read_at(&mut b, 0).is_ok_and(|k| k == 8);
+                        (Kind::Read(u64::from_le_bytes(b)), ok)
+                    };
+                    history.lock().unwrap().push(Op { call, ret: ok.then(|| now_us(t0)), kind });
+                    std::thread::sleep(Duration::from_millis(50 + r.below(150)));
+                }
+            })
+        })
+        .collect();
+    let faults = nemesis(&dir, seed, false, &|| history.lock().unwrap().len() < 300);
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        w.join().unwrap();
+    }
+    let h = history.lock().unwrap().clone();
+    let ok = h.iter().filter(|o| o.ret.is_some()).count();
+    println!("历史：{} 个操作（{ok} 个确定的结果），捣乱：{faults:?}", h.len());
+    assert!(ok >= 50, "种子 {seed}：成功的操作太少（{ok}）");
+    assert!(linearizable(&h, 0), "种子 {seed}：经 FUSE 的 strong 寄存器的历史不是线性一致的：{h:?}");
 }

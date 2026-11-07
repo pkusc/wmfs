@@ -110,7 +110,8 @@ pub fn add(r: &mut RStatV1, d: &Delta) {
     r.per_class.sort_by_key(|(c, ..)| *c);
 }
 
-fn add_to(v: &mut dyn KvTxn, dir: u64, d: &Delta) -> Result<(), ErrCode> {
+/// 只给 `dir` 自己的计数加上 `d`，不动它的祖先（回收站里的各层用它，`ns/trash.rs`）。
+pub fn add_to(v: &mut dyn KvTxn, dir: u64, d: &Delta) -> Result<(), ErrCode> {
     let mut r = get(v, dir)?;
     add(&mut r, d);
     kv::put(v, &keys::rstat(dir), &r);

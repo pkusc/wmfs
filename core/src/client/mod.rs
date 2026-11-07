@@ -13,7 +13,8 @@
 //!   自停、被驱逐之后换新会话）。
 //!
 //! 实现注记（M6）：design.md 2.2 的文件表里没有 `inode.rs`、`flusher.rs`、`read.rs`、`session.rs`：为了每个文件 ≤ 400 行，从
-//! files.rs 与 writeback.rs 拆出来（M10 又拆出 `dirs.rs`、`lease.rs`、`slots.rs`）。锁（`locks.rs`）在 M12。
+//! files.rs 与 writeback.rs 拆出来（M10 又拆出 `dirs.rs`、`lease.rs`、`slots.rs`）。
+//! - [`locks`]（M12）：GetLock / SetLock、F_SETLKW 的 lock-wait 线程、close 时释放、锁即同步点。
 
 use std::time::Duration;
 
@@ -23,6 +24,7 @@ pub mod files;
 pub mod flusher;
 pub mod inode;
 pub mod lease;
+pub mod locks;
 pub mod meta_client;
 pub mod read;
 pub mod session;

@@ -5,6 +5,9 @@
 //!   有接收方（实现注记（M8）：见 [`Pins::export`]）就复用；
 //!   否则开一个 redb 读事务（MVCC，不阻塞写），从它读出 `applied(index, term, state_version)` 与 `conf_state`（与 KV 同事务更新，
 //!   所以与读事务里的 KV 一致），记成一个 [`PinnedSnap`]（最多 2 个、10 min 过期）。raft 消息里只有 `SnapDesc`——快照内容不进 raft 消息。
+//!   实现注记（M12）：pin 是一个 redb 读事务，它在的时候 redb 回收不了之后释放的页（leader 的 meta.redb 每次写入约涨 100 KiB）；以前过期的
+//!   pin 要等下一次导出才清理，没有下一次导出（follower 装完快照就不再要了）时就一直在。现在 snap-serve 发完（成败都算）就放掉它，
+//!   建了 60 s 还没有在途发送的由看门狗放掉（[`Pins::overdue`]）。
 //! - **报告**（坑 P11）：raft-send 发出 MsgSnapshot 时记下"向谁发了哪个快照"（[`Pins::note_sent`]）；snap-serve 流成功结束 → 报告成功，
 //!   出错 → 报告失败（[`Pins::take_sent`]）；60 s 内对方没完成下载 → 看门狗报告失败（[`Pins::overdue`]），leader 不会卡在 Snapshot 状态。
 //! - **文件**（follower 写、安装时读）：`meta/snap-recv-<index>-<term>.snap` =
@@ -131,19 +134,23 @@ impl Pins {
         s.push(Sent { to, index, term, at_ms: clock::mono_ms() });
     }
 
-    /// snap-serve 发完（或发失败）了 (index, term)：收到它的对端（报告结果用），并忘掉它们。
+    /// snap-serve 发完（或发失败）了 (index, term)：收到它的对端（报告结果用），并忘掉它们与这个 pin（正在发的流自己拿着它）。
     pub fn take_sent(&self, index: u64, term: u64) -> Vec<u64> {
         let mut s = lock(&self.sent);
         let to = s.iter().filter(|x| x.index == index && x.term == term).map(|x| x.to).collect();
         s.retain(|x| x.index != index || x.term != term);
+        lock(&self.pins).retain(|p| p.index != index || p.term != term);
         to
     }
 
-    /// 到 `now_ms`（单调时钟）为止，发给 `to` 的快照已经超过 60 s 还没下载完：忘掉它，调用方报告失败（坑 P11 的看门狗）。
+    /// 到 `now_ms`（单调时钟）为止，发给 `to` 的快照已经超过 60 s 还没下载完：忘掉它，调用方报告失败（坑 P11 的看门狗）。顺便放掉
+    /// 建了超过 60 s、又没有在途发送的 pin（实现注记（M12）：pin 是一个 redb 读事务，它在的时候 redb 回收不了之后释放的页）。
     pub fn overdue(&self, to: u64, now_ms: u64) -> bool {
         let mut s = lock(&self.sent);
         let late = s.iter().any(|x| x.to == to && now_ms.saturating_sub(x.at_ms) > SENT_TIMEOUT_MS);
         s.retain(|x| x.to != to || !late);
+        let sent = |p: &PinnedSnap| s.iter().any(|x| x.index == p.index && x.term == p.term);
+        lock(&self.pins).retain(|p| now_ms.saturating_sub(p.created_ms) <= SENT_TIMEOUT_MS || sent(p));
         late
     }
 }

@@ -94,6 +94,10 @@ fn usage_status_semantics_json_golden() {
         &a4,
         r#"{"new_files":"100B","quotas":[{"dir":"/p","class":null,"hard":100,"soft":0,"grace_ms":0,"files":0,"quantum":0,"used_bytes":3,"used_files":0,"soft_since_ms":0,"grace_left_ms":null}]}"#,
     );
+    let a5 = AttrActual { new_files: "7d".into(), files: Some(2), bytes: Some(1 << 33), ..Default::default() }; // M12：trash
+    same(&a5, r#"{"new_files":"7d","files":2,"bytes":8589934592}"#);
+    let a6 = AttrActual { new_files: "on".into(), lag: Some(5), ..Default::default() }; // M12：audit
+    same(&a6, r#"{"new_files":"on","lag":5}"#);
     let m = SemanticsReply {
         consistency: vec!["c".into()],
         relaxations: vec!["r".into()],

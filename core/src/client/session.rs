@@ -61,6 +61,7 @@ impl OpenFiles for FileClient {
             inos.push(inode.ino);
         }
         self.slots.release(dropped);
+        self.forget_locks(); // 旧会话的锁由服务端在驱逐第二阶段释放（M12）
         if dropped + flying > 0 {
             let n = dropped + flying;
             log::error(

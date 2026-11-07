@@ -2,7 +2,8 @@
 //!
 //! - `SessionOpen`（写，seq 0）：session id 由客户端随机生成，按 session 幂等——已经打开过（重试）就照常回复；被驱逐过的
 //!   session 不能再打开（驱逐是单调的事实）。写 SESSION 记录与 changelog `SessionOpen`。
-//! - `SessionClose`（写）：删掉 SESSION 记录、写 changelog `SessionClose`；之后这个会话的修改型请求一律 `SESSION_EVICTED`。
+//! - `SessionClose`（写）：释放它的全部锁（M12）、删掉 SESSION 记录、写 changelog `SessionClose`；之后这个会话的修改型请求一律
+//!   `SESSION_EVICTED`。
 //!   剩余的去重记录由 gc 任务扫描删除（M5）。
 //! - `SessionHeartbeat`（R*：只读路径，先过 ReadIndex，确认自己仍是 leader 才续租）：会话还活着就更新 leader 内存里的
 //!   `last_seen` 与打开文件集合（[`Live`]，3.5.6）；leader 换过之后（term 变了）内存状态作废，回复 `need_full_open_set = true`
@@ -24,6 +25,7 @@ use crate::base::types::{ReqCtx, Role};
 use crate::base::{ErrCode, lock};
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::txn::{KvRead, KvTxn, OpCtx};
+use crate::meta::locks;
 use crate::meta::schema::keys;
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{KeyMetaV1, SessionRecV1};
@@ -112,6 +114,7 @@ pub fn close(v: &mut dyn KvTxn, c: &OpCtx) -> Result<MetaReply, ErrCode> {
     match kv::get::<SessionRecV1>(v, &key)? {
         Some(s) if s.key_id != c.req.who.conn.key_id => return Err(ErrCode::EACCES), // 别的 key 打开的会话
         Some(s) if s.state == SESSION_ACTIVE => {
+            locks::release_session(v, c.req.session, &s.locked_inos)?; // 会话关闭：它的锁全部释放（3.5.3，M12）
             v.delete(&key);
             changelog::append(v, c, Change { op: "SessionClose", ..Default::default() })?;
         }

@@ -86,3 +86,11 @@ pub mod reconciler;
 #[cfg(feature = "scrub")]
 #[path = "scrub/mod.rs"]
 pub mod scrub;
+
+#[cfg(feature = "trash-expire")]
+#[path = "trash-expire/mod.rs"]
+pub mod trash_expire;
+
+#[cfg(feature = "ttl")]
+#[path = "ttl/mod.rs"]
+pub mod ttl;

@@ -11,7 +11,7 @@ path = "lib.rs"
 
 [features]
 # 每个插件一个 feature（design.md 2.1），默认全开；插件从 M1 起逐个加入。
-default = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc", "cache-memory", "xxh3", "blake3", "lz4", "zstd", "aes-gcm", "reconciler", "scrub"]
+default = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc", "cache-memory", "xxh3", "blake3", "lz4", "zstd", "aes-gcm", "reconciler", "scrub", "trash-expire", "ttl"]
 tcp = []
 shared-key = []
 posix-mode = []
@@ -36,6 +36,9 @@ zstd = ["dep:zstd"]
 aes-gcm = ["dep:aes-gcm"]
 reconciler = ["dep:serde"] # 游标是 postcard（serde），与 rdma 的 RdmaSetup 帧一样
 scrub = ["dep:serde"]
+# M12：回收站到期与 ttl
+trash-expire = []
+ttl = []
 # M2：RDMA 传输（sideway；rdma-mummy-sys 在运行时 dlopen libibverbs，没有 RDMA 的机器也能编译、运行；
 # 编译它要 cmake 与 libclang，design.md 2.3）。插件私有的 RdmaSetup 帧与 core 的帧一样：postcard body（serde）+ crc32c。
 rdma = ["dep:sideway", "dep:crc32c", "dep:serde"]

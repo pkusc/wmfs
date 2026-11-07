@@ -292,8 +292,7 @@ pub(super) fn failed(f: Failed) -> Reply {
     err(status, &name, msg)
 }
 
-/// `GET /api/v1/semantics`：要点与当前集群参数。这里的文字与 docs/semantics.md 第 2、3 节同步：改了那边（例如 M12 实现 strong 与
-/// 集群锁时）要一起改这里。
+/// `GET /api/v1/semantics`：要点与当前集群参数。这里的文字与 docs/semantics.md 第 2、3 节同步：改了那边要一起改这里。
 fn semantics(c: &OpCtx) -> SemanticsReply {
     let s = |x: &[&str]| x.iter().map(|t| t.to_string()).collect();
     SemanticsReply {
@@ -301,13 +300,20 @@ fn semantics(c: &OpCtx) -> SemanticsReply {
             "元数据操作在元数据 leader 上线性一致；rename 对所有观察者原子",
             "cto（默认）：写者 close() 之后，之后任何节点发起的 open() 一定看到它写的数据、长度与 mtime；\
              目录项与属性缓存最长 attr_ttl（目录属性 consistency=cto,attr_ttl=…，默认 1 s，挂载参数 --max-attr-ttl 只能调小）",
-            "strong：M12 起可设置（每次 read 先线性一致地取长度，每次 write 同步写全部副本并提交）",
+            "strong：不缓存；每次 read 先线性一致地取长度，每次 write 同步写全部副本并提交（写完别的节点立即读到）；\
+             跨节点 O_APPEND 由元数据服务分配偏移、互不覆盖（单次不超过 max_write、通常 1 MiB 的追加整条连续）；\
+             共享可写 mmap（MAP_SHARED）返回 ENODEV",
+            "锁是同步点：fcntl 锁与 flock 在所有挂载点之间互斥（目录上的锁只在本节点有效），拿到锁时丢弃本地缓存、释放锁前先提交写入",
         ]),
         relaxations: s(&[
             "atime 按 relatime，批量、尽力而为",
             "跨节点共享可写 mmap 不支持一致（strong 下 MAP_SHARED 返回 ENODEV）",
             "cto 下跨节点 O_APPEND 由各节点内核按自己缓存的长度计算偏移，不保证顺序",
-            "M12 之前 fcntl 锁与 flock 只在本节点有效；flock 与 fcntl 共用一个锁空间",
+            "flock 与 fcntl 锁共用一个锁空间（同一进程混用会互相冲突）；持锁的挂载失联时，锁要等它被驱逐（约 30–40 s）才转给别人",
+            "阻塞等锁由客户端定期重试（50 ms 起、最长每 1 s 一次），不保证先来先得；不能被有处理函数的信号打断",
+            "strong 下 O_APPEND：读者可能短暂看到已分配、尚未写完的区域为 0",
+            "回收站（trash）按文件属主分子目录（.wmfs-trash/<uid>/，只有属主与 root 看得到），仍计入子树的配额；\
+             删除目录树时文件平铺进回收站",
             "缩短截断不是崩溃原子的（先截数据、后改长度）",
             "所有副本同时掉电时，未 fsync 的数据可能丢失",
             "已打开的文件被去掉权限后：属主的句柄照常可用，其他用户之后可能 EACCES（学 NFS）",

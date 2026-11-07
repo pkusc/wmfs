@@ -42,6 +42,9 @@ impl FileClient {
     pub fn read(&self, who: &Caller, h: &Handle, off: u64, size: u32) -> Result<Vec<u8>, ErrCode> {
         let inode = self.inode(h.ino).ok_or(ErrCode::EBADF)?;
         for _ in 0..STALE_RETRIES {
+            if h.strong {
+                self.fresh_attr(&inode, who, h.session)?; // strong：每次读前线性一致地取长度与 epoch（8.5，M12）
+            }
             let s = snap(&inode, off, size)?;
             if off >= s.size {
                 return Ok(vec![]);

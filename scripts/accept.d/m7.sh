@@ -30,7 +30,7 @@ accept_m7() {
     check "金样：MetaOp::ReopenHandle 追加在 MetaOp 末尾（只增不改）" cargo test --release -p wmfs-core --test golden_proto
     check "第一步 ②（ADR-0037 第 13 条）：readdir 的 .. 是父目录（根是它自己；自己 rename 之后跟着变；另一个挂载 lookup / readdirplus 之后也对）" \
         one_test --release -p wmfs --test fuse_attrs dotdot_in_readdir_is_the_parent_directory
-    check "属性注册表：服务端切分的规则、各键的校验与规范化、显示形式、还不能设置的键（strong、trash……）明确拒绝、manifest 对账" \
+    check "属性注册表：服务端切分的规则、各键的校验与规范化、显示形式、还不能设置的键（M12 起是 qos、tier、locality 与二期的 ec、snapshot）明确拒绝、manifest 对账" \
         tests_at_least 5 --release -p wmfs-core --lib meta::attr_registry
     check "继承解析与缓存：最近的祖先值、inherit=false、来源、按 attr_epoch 失效、批次作废时 clear 丢掉没提交的结果" \
         tests_at_least 3 --release -p wmfs-core --lib meta::attrs
@@ -62,8 +62,8 @@ accept_m7() {
     check "wmfs unset proj/a chunk 之后 get proj/a/b：chunk=1M 来自 /proj" m7_unset
     check "inherit=false：proj/a 自己的值仍生效、上面的 Inherit 键被挡住（proj/a/b 的 chunk、stripe 回到默认值）；get proj/a 显示 inherit=false 来自 /proj/a" \
         m7_inherit_false
-    check "未知属性名被拒绝：wmfs set proj chunck=4M → einval「未知属性 chunck」；get/unset 的键写错也报错（unset trash 与 set 一样 eopnotsupp）" m7_unknown
-    check "后面里程碑的值被拒绝：consistency=strong、trash=7d 在 M12 之前 → eopnotsupp；属性只能挂在目录上（M11 起 xxh3 插件有了：checksum=xxh3 照常设置；\"没有插件消费\"由 meta_attrs 的单元测试覆盖）" \
+    check "未知属性名被拒绝：wmfs set proj chunck=4M → einval「未知属性 chunck」；get/unset 的键写错也报错（unset tier 与 set 一样 eopnotsupp）" m7_unknown
+    check "后面里程碑的值被拒绝：tier=hot（M13）、ec=4+2（二期功能）→ eopnotsupp（M12 起 consistency=strong、trash 能设置了）；属性只能挂在目录上（M11 起 xxh3 插件有了：checksum=xxh3 照常设置；\"没有插件消费\"由 meta_attrs 的单元测试覆盖）" \
         m7_rejects
     check "单节点上 replicas=3 设置成功但警告「当前只有 1 个故障域，新文件实际为 1 副本」" m7_replicas_warn
     check "/home（init 写的 replicas=3）：wmfs get 的 semantics 行是 replicas:声明3/实际1，前面有警告；wmfs status 的警告里有 /home" m7_home
@@ -148,14 +148,14 @@ m7_unknown() {
     expect_error einval wmfs get "$M/proj" chunck --json || return 1 # 不静默输出空行
     wmfs get "$M/proj" chunk >/dev/null || return 1                    # 写对了照常
     expect_error einval wmfs unset "$M/proj" chunck --json || return 1
-    expect_error eopnotsupp wmfs unset "$M/proj" trash --json # 与 set 的说法相同（在 M12 实现；M10 之前用 quota、M11 之前用 compress）
+    expect_error eopnotsupp wmfs unset "$M/proj" tier --json # 与 set 的说法相同（在 M13 实现；M10 之前用 quota、M11 之前用 compress、M12 之前用 trash）
 }
 
 m7_rejects() {
     wmfs set "$M/proj" checksum=xxh3 --json | jq -e '.set.checksum == "xxh3"' || return 1 # M11 起有 xxh3 插件
     wmfs unset "$M/proj" checksum --json >/dev/null || return 1
-    expect_error eopnotsupp wmfs set "$M/proj" consistency=strong --json || return 1
-    expect_error eopnotsupp wmfs set "$M/proj" trash=7d --json || return 1 # M12 的键（M10 之前用 quota=10G、M11 之前用 compress=lz4）
+    expect_error eopnotsupp wmfs set "$M/proj" ec=4+2 --json || return 1 # 二期功能（M12 之前用 consistency=strong）
+    expect_error eopnotsupp wmfs set "$M/proj" tier=hot --json || return 1 # M13 的键（M10 之前用 quota=10G、M11 之前用 compress=lz4、M12 之前用 trash=7d）
     echo x >"$M/proj/file" && expect_error einval wmfs set "$M/proj/file" chunk=1M --json
 }
 

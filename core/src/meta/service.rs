@@ -7,7 +7,7 @@
 //! 实现注记（M4）：
 //! - 命名空间操作见 `meta/ns`；会话：SessionOpen / SessionClose 一律按 seq 0 执行（不进去重表，它们本身幂等，`meta/sessions.rs`），
 //!   SessionHeartbeat 走只读路径并更新 leader 内存里的会话状态。其余修改型请求必须带会话与 seq（seq 0 → `EINVAL`：
-//!   没有 seq 就没有去重，也绕过了会话检查）。还没实现的操作回 `FEATURE_UNSUPPORTED`（不断开）。
+//!   没有 seq 就没有去重，也绕过了会话检查）。不认识的变体回 `FEATURE_UNSUPPORTED`（不断开）。
 //! - 请求头里的 uid：client 角色的 key 只在它的 uid 范围内被相信（不在范围内 → `EACCES`），`root_squash` 把 uid/gid 0
 //!   映射为 65534；admin 与 server 可以声明任意 uid（`wmfs fs --as-uid`，3.3.3）——[`req_ctx`]。会话操作（打开、心跳、
 //!   关闭）不代表任何用户、也不碰 inode：不按 uid 范围检查，身份一律记为 nobody（changelog 里的 uid/gid 是 65534）——
@@ -38,6 +38,7 @@ use crate::base::types::{Principal, ReqCtx, Role};
 use crate::base::{ErrCode, clock, log};
 use crate::client::data_client::DataClient;
 use crate::hooks::traits::ConnIdentity;
+use crate::meta::changelog::Subject;
 use crate::meta::cluster::map::filtered;
 use crate::meta::cluster::targets::{self, TargetUsage};
 use crate::meta::cluster::{chain_mgr, join};
@@ -166,7 +167,7 @@ impl MetaService {
         }
     }
 
-    fn txn(&self, ctx: ReqCtx, name: &'static str, op: TxnOp, after: AfterOk, r: Responder) {
+    fn txn(&self, ctx: ReqCtx, name: &'static str, op: TxnOp, after: AfterOk, reject: Option<Subject>, r: Responder) {
         let (stats, live, eng) = (self.stats.clone(), self.shared.live.clone(), self.eng.clone());
         let (session, seq) = (ctx.session, ctx.seq);
         let done = Box::new(move |res: Result<MetaReply, ErrCode>| {
@@ -186,7 +187,7 @@ impl MetaService {
             }
             stats.reply(r, name, res)
         });
-        self.eng.txn(TxnRequest { ctx, op, done, exclusive: false });
+        self.eng.txn(TxnRequest { ctx, op, done, exclusive: false, on_reject: reject });
     }
 
     fn node_call(&self, f: InFrame, r: Responder) {
@@ -256,7 +257,7 @@ impl Service for MetaService {
                     v.put(&keys::debug(&key), value);
                     Ok(MetaReply::Ok)
                 });
-                self.txn(ctx, name, op, AfterOk::Nothing, r);
+                self.txn(ctx, name, op, AfterOk::Nothing, None, r);
             }
             op @ MetaOp::DebugGet { .. } => match self.debug_allowed(&r) {
                 Ok(()) => self.read(ctx, ReadOp::Meta(op), r),
@@ -270,15 +271,16 @@ impl Service for MetaService {
             }
             op if ns::is_read(&op) => self.read(ctx, ReadOp::Meta(op), r),
             op => {
+                let on_reject = ns::audit_of(&op);
                 let Some(op) = ns::txn_op(op) else {
-                    return self.stats.reply(r, name, Err(ErrCode::FEATURE_UNSUPPORTED)); // 后面的里程碑实现
+                    return self.stats.reply(r, name, Err(ErrCode::FEATURE_UNSUPPORTED)); // 不会走到：每个 MetaOp 都有去处（防御）
                 };
                 if session_op {
                     ctx.seq = 0;
                 } else if ctx.seq == 0 || ctx.session == 0 {
                     return self.stats.reply(r, name, Err(ErrCode::EINVAL)); // 修改型请求必须带会话与 seq
                 }
-                self.txn(ctx, name, op, after, r);
+                self.txn(ctx, name, op, after, on_reject, r);
             }
         }
     }

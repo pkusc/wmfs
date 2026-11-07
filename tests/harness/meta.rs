@@ -69,7 +69,8 @@ pub fn sample_init() -> InitialKv {
     }
 }
 
-/// 命名空间测试用的管线：posix-mode、posix-acl、path-caps（authz）+ quota + label-match（placement），与 `wmfs server` 默认装的一样。
+/// 命名空间测试用的管线：posix-mode、posix-acl、path-caps（authz）+ quota + label-match（placement），与 `wmfs server` 默认装的一样；
+/// M12：再加 trash-expire 与 ttl（只为让 `trash`、`ttl` 属性有消费者——Ns 不跑后台任务）。
 pub fn ns_pipeline() -> Pipeline {
     let mut set = PluginSet::new(&[]);
     set.authz(Arc::new(PosixMode::new()));
@@ -77,6 +78,8 @@ pub fn ns_pipeline() -> Pipeline {
     set.authz(Arc::new(wmfs_plugins::path_caps::PathCaps::new()));
     set.quota(Arc::new(wmfs_plugins::quota::Quota::new()));
     set.placement(Arc::new(LabelMatch::new()));
+    set.bg_task(Box::new(wmfs_plugins::trash_expire::TrashExpire::new()));
+    set.bg_task(Box::new(wmfs_plugins::ttl::Ttl::new()));
     Pipeline::new(set)
 }
 

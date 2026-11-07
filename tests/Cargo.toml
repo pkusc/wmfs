@@ -11,7 +11,7 @@ path = "lib.rs"
 
 [dependencies]
 wmfs-core.workspace = true
-wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc", "xxh3", "blake3", "lz4", "zstd", "aes-gcm", "reconciler", "scrub"] }
+wmfs-plugins = { workspace = true, features = ["tcp", "shared-key", "rdma", "posix-mode", "posix-acl", "path-caps", "quota", "label-match", "local-fs", "crc32c", "replica", "fifo", "gc", "xxh3", "blake3", "lz4", "zstd", "aes-gcm", "reconciler", "scrub", "trash-expire", "ttl"] }
 plugin-mem-transport.workspace = true
 crc32c.workspace = true
 redb.workspace = true
@@ -291,3 +291,16 @@ path = "it/gc_full.rs"
 [[test]]
 name = "bg_cluster"
 path = "it/bg_cluster.rs"
+
+# M12：回收站、ttl、审计（内存 KV 视图）；锁、AppendReserve、会话关闭与驱逐释放锁（完整节点）；客户端的 strong 与锁（不经 FUSE）。
+[[test]]
+name = "meta_trash"
+path = "it/meta_trash.rs"
+
+[[test]]
+name = "meta_locks"
+path = "it/meta_locks.rs"
+
+[[test]]
+name = "client_strong"
+path = "it/client_strong.rs"

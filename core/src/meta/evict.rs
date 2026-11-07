@@ -9,8 +9,8 @@
 //!   io 线程执行时校验）。
 //! - **等待**：每个 Up 的 target 都在本任期的心跳里报过 `map_epoch_seen ≥ evict_map_epoch`，或已超过 `target_lease`（同样取 max）
 //!   没有心跳——它已自我隔离（I5），不可能再接受写；计时同样从就绪算起（`TargetUsage::caught_up`）。满足了写一行"数据节点确认"。
-//! - **第二阶段**（一个批次，CAS：还是 Evicting）：释放它的锁（`locked_inos` 里每个 inode 的 LOCKS 记录中属于它的项，点操作；M12 之前
-//!   没有集群锁，列表是空的，日志照写），删除会话记录（EVICTED 记录保留 24 h，由 gc 删除；去重记录也交给 gc）。所以日志里"第二阶段：
+//! - **第二阶段**（一个批次，CAS：还是 Evicting）：释放它的锁（`locked_inos` 里每个 inode 的 LOCKS 记录中属于它的项，点操作，
+//!   `locks::release_session`；M12 起 SetLock 维护这个列表），删除会话记录（EVICTED 记录保留 24 h，由 gc 删除；去重记录也交给 gc）。所以日志里"第二阶段：
 //!   释放锁"一定在"数据节点确认"之后（`scripts/accept.d/m10.sh` 检查这个顺序；第二阶段没提交成、下一轮重来时"数据节点确认"会再写
 //!   一行）。换了 leader 之后从 `state = Evicting` 与 `evict_map_epoch` 重新判断（3.4.1.10 的表）。
 //! - 指标 `wmfs_meta_sessions`（7.3：Active 的会话数，只有就绪的 leader 报，每 1 s 刷新）。
@@ -28,9 +28,10 @@ use crate::base::{ErrCode, clock, log};
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::EmbeddedEngine;
 use crate::meta::engine::txn::{KvTxn, MetaEngine, OpCtx, TxnOp, txn_blocking};
+use crate::meta::locks;
 use crate::meta::schema::keys::{self, G_MAP_EPOCH, T_SESSION};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::{EvictedV1, LockTableV1, SessionRecV1, decode_v1};
+use crate::meta::schema::records::{EvictedV1, SessionRecV1, decode_v1};
 use crate::proto::meta::MetaReply;
 
 /// EVICTED 记录保留多久（3.4.4 第 4 步；`wmfs session list` 列出这段时间里的，之后由 gc 删除）。
@@ -145,12 +146,7 @@ fn phase2(eng: &dyn MetaEngine, sid: u64, rec: SessionRecV1) -> Result<usize, Er
         if kv::get::<SessionRecV1>(v, &key)?.as_ref() != Some(&rec) {
             return Err(ErrCode::RETRY); // 别的批次先改了它：下一轮重新判断
         }
-        for ino in &rec.locked_inos {
-            let lk = keys::locks(*ino);
-            let Some(mut t) = kv::get::<LockTableV1>(v, &lk)? else { continue };
-            t.locks.retain(|l| l.session != sid);
-            if t.locks.is_empty() { v.delete(&lk) } else { kv::put(v, &lk, &t) }
-        }
+        locks::release_session(v, sid, &rec.locked_inos)?; // 别的客户端的锁轮询随后就能拿到（3.4.4 第 3 步）
         v.delete(&key);
         Ok(MetaReply::Ok)
     });

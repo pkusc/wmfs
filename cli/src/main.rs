@@ -334,6 +334,8 @@ mod tests {
             "bg_task:gc",
             "bg_task:reconciler",
             "bg_task:scrub",
+            "bg_task:trash-expire",
+            "bg_task:ttl",
             "codec:replica",
             "placement:label-match",
             "qos:fifo",

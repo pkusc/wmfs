@@ -8,6 +8,7 @@ mod common;
 use common::*;
 use wmfs_core::proto::cap::CapV1;
 use wmfs_core::proto::data::*;
+use wmfs_core::proto::features::OUR_FEATURES;
 use wmfs_core::proto::frame::*;
 use wmfs_core::proto::handshake::*;
 use wmfs_core::proto::meta::*;
@@ -46,6 +47,7 @@ fn golden_frame_headers() {
     g.check();
 }
 
+/// Hello 与 Challenge 的 `features` 取本端实际声明的位（ADR-0043 第 3 条：strong、锁、inline；两端同版本时交集就是它）。
 #[test]
 fn golden_handshake() {
     let mut g = Golden::new("handshake");
@@ -54,7 +56,7 @@ fn golden_handshake() {
         &Hello {
             proto_min: 1,
             proto_max: 2,
-            features: 0b1111,
+            features: OUR_FEATURES,
             required: 0b0001,
             role: 2,
             cluster_id: [0xC1; 16],
@@ -65,7 +67,7 @@ fn golden_handshake() {
     );
     g.msg(
         "Challenge",
-        &Challenge { proto: 1, features: 0b0101, cluster_id: [0xC1; 16], node_id: 1, server_nonce: [0x22; 16] },
+        &Challenge { proto: 1, features: OUR_FEATURES, cluster_id: [0xC1; 16], node_id: 1, server_nonce: [0x22; 16] },
     );
     g.msg("Auth", &Auth { proof: [0x33; 32] });
     g.msg("Welcome", &Welcome { key_id: 7, role: 2, tenant: 5, server_proof: [0x44; 32] });

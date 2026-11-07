@@ -6,10 +6,13 @@
 #           cap，锁在数据节点确认之后才释放（日志可见顺序），恢复后旧句柄 EIO、新打开正常；pjdfstest 权限子集通过。
 #
 # 开发集群与挂载点只用本次验收自己的目录（$LOGDIR/dev、$LOGDIR/mnt、$LOGDIR/mnt2，端口照常是 19n00/19n80）。无论成败，退出前都先让被冻住
-# 的挂载进程继续（只对本次验收自己挂的、命令行核对过的进程）、关掉打开着的 fd 3、停掉自己起的写者进程、wmfs dev down（先卸载挂载点、再停节点），不留挂载、
+# 的挂载进程继续（只对本次验收自己挂的、命令行核对过的进程）、停掉自己起的读者与写者进程、wmfs dev down（先卸载挂载点、再停节点），不留挂载、
 # 不留进程，并删掉写配额用的大文件（m10_cleanup）。只解析 --json 输出与退出码，例外几处检查的正是外部工具或日志：dd 的报错
 # （"Disk quota exceeded"）、getfacl 的输出、cat 的报错（"Input/output error"）、节点日志里驱逐的几行（要看先后顺序）。等待一律按条件
 # （wmfs dev wait、有上限的轮询），不用固定的 sleep。
+# 实现注记（M12）：验收脚本自己不再拿着挂载点上的 fd（以前 `exec 3<`）：M12 起只读打开不回 FOPEN_NOFLUSH（POSIX 锁要经 FLUSH 在 close 时
+# 释放，design.md 8.7 的 M12 注记），挂载进程被冻住时，继承了这个 fd 的子进程（之后的每个命令）退出时都会卡在 FLUSH 上。所以只读打开着的
+# 旧句柄放在一个单独的读者进程里（m10_start_reader），它等着、不起子进程。
 
 # shellcheck source=/dev/null
 source "$ROOT/scripts/accept.d/m6.sh"
@@ -57,6 +60,7 @@ accept_m10() {
     M2="$LOGDIR/mnt2"
     mkdir -p "$M" "$M2"
     FROZEN=""
+    READER=""
     trap m10_cleanup EXIT
     check "wmfs dev up --nodes 3（3 个元数据 voter）" wmfs dev up --nodes 3
     eval "$(wmfs dev env)"
@@ -77,11 +81,11 @@ accept_m10() {
     check "演示：setfacl -m u:2000:rx 目录、u:2000:r 文件（getfacl 看得到）→ wmfs fs --as-uid 2000 cat 读到 secret（ACL 放行）" m10_acl
     check "演示：wmfs key create q-only --role client --path /home/q；用它 ls /home/private → EACCES，/home/q 照常；它对管理 API 按路径的查询（usage/get/status）在子树外也被拒绝（403）" \
         m10_path_caps
-    check "演示：exec 3< 第二个挂载上的 s（另有一个写者进程覆盖写一段、不关，留在写回缓冲里）；kill -STOP 它的挂载进程 → wmfs dev wait session-evicted 在约 30–40 s 后成立；wmfs session list 里它是 EVICTED" \
+    check "演示：一个读者进程只读打开第二个挂载上的 s（另有一个写者进程覆盖写一段、不关，留在写回缓冲里）；kill -STOP 它的挂载进程 → wmfs dev wait session-evicted 在约 30–40 s 后成立；wmfs session list 里它是 EVICTED" \
         m10_evict
     check "驱逐的日志：leader 上\"第一阶段\" → \"数据节点确认\" → \"第二阶段：释放锁\"依次出现；3 个数据节点都记下了\"此后拒绝它的 cap\"；changelog 有 SessionEvicted" \
         m10_evict_logs
-    check "演示：kill -CONT 之后 cat <&3 → Input/output error（旧句柄不再可用）；cat 新打开 → secret（自动建立了新会话）" m10_resume
+    check "演示：kill -CONT 之后经旧的只读 fd 读 → Input/output error（旧句柄不再可用）；cat 新打开 → secret（自动建立了新会话）" m10_resume
     check "被驱逐时写回缓冲里没提交的写丢失（M10 审查）：旧的写 fd 再写 → Input/output error；挂载日志记下丢掉的写之后，两个挂载上新打开读到的都是驱逐之前提交的内容（旧数据没有在新会话里被写出）" \
         m10_lost_write
     check "Jepsen-lite：寄存器在随机 kill -9 / SIGSTOP / 提升（ADR-0040 第 11 条：别的节点换图慢一拍时重启一个节点）下线性一致" \
@@ -95,12 +99,15 @@ accept_m10() {
     check "结束：本次验收自己的挂载都已卸载（$LOGDIR 下没有 fuse.wmfs 挂载）" m6_no_own_mounts
 }
 
-# 不论成败：让被冻住的挂载进程继续（只对本次验收自己挂的）、关掉 fd 3、停开发集群（它先卸载挂载点）、删掉写配额用的大文件。
+# 不论成败：让被冻住的挂载进程继续（只对本次验收自己挂的）、停掉读者进程、停开发集群（它先卸载挂载点）、删掉写配额用的大文件。
 m10_cleanup() {
     if [ -n "${FROZEN:-}" ] && tr '\0' ' ' <"/proc/$FROZEN/cmdline" 2>/dev/null | grep -q "wmfs mount .* $M2"; then
         kill -CONT "$FROZEN" 2>/dev/null
     fi
-    exec 3<&- 2>/dev/null
+    if [ -n "${READER:-}" ]; then
+        touch "$LOGDIR/r.go" # 读者进程自己收尾退出（它是本次验收起的）
+        kill "$READER" 2>/dev/null
+    fi
     if [ -n "${WRITER:-}" ]; then
         touch "$LOGDIR/w.go" # 写者进程自己收尾退出（它是本次验收起的）
         kill "$WRITER" 2>/dev/null
@@ -271,7 +278,7 @@ m10_path_caps() {
 
 m10_evict() {
     local t0 t1
-    exec 3<"$M2/home/private/s" || return 1 # 让第二个客户端打开一个文件（fd 3 一直开到 m10_resume）
+    m10_start_reader "$M2/home/private/s" || return 1 # 让第二个客户端打开一个文件（读者进程开着它，直到 m10_resume）
     echo committed >"$M2/home/w" || return 1 # 写好、关掉：已提交
     m10_start_writer "$M2/home/w" || return 1
     SID="$(wmfs session list --json | jq -r '.sessions[] | select((.mount | endswith("/mnt2")) and .state == "active") | .id')"
@@ -304,17 +311,35 @@ m10_evict_logs() {
         wmfs changelog tail -n 200 --json
 }
 
+# 读者进程：只读打开 $1（旧句柄），等到 $LOGDIR/r.go 出现再经它读一次，把结果写进 $LOGDIR/r.result（读到的内容或错误）。它等待时不起
+# 子进程（见文件头的 M12 注记）。
+m10_start_reader() {
+    python3 -c '
+import os, sys, time
+fd = os.open(sys.argv[1], os.O_RDONLY)
+open(sys.argv[2] + "/r.ready", "w").close()
+while not os.path.exists(sys.argv[2] + "/r.go"):
+    time.sleep(0.1)
+try:
+    r = os.read(fd, 100).decode()
+except OSError as e:
+    r = os.strerror(e.errno)
+open(sys.argv[2] + "/r.result", "w").write(r)
+' "$1" "$LOGDIR" &
+    READER=$!
+    poll 100 0.1 test -e "$LOGDIR/r.ready"
+}
+
 m10_resume() {
     local got
-    kill -CONT "$(wmfs dev client-pid "$M2")" || return 1
+    kill -CONT "$FROZEN" || return 1 # 冻住时记下的 pid（冻住期间不再对这个挂载跑任何命令）
     FROZEN=""
-    if cat <&3 >"$LOGDIR/old.out" 2>"$LOGDIR/old.err"; then
-        echo "旧句柄还能读：$(cat "$LOGDIR/old.out")"
-        return 1
-    fi
-    cat "$LOGDIR/old.err"
-    grep -q "Input/output error" "$LOGDIR/old.err" || return 1
-    exec 3<&-
+    touch "$LOGDIR/r.go"
+    poll 100 0.1 test -e "$LOGDIR/r.result" || return 1
+    echo "旧句柄读到：$(cat "$LOGDIR/r.result")"
+    [ "$(cat "$LOGDIR/r.result")" = "Input/output error" ] || return 1
+    wait "$READER"
+    READER=""
     got="$(cat "$M2/home/private/s")" || return 1
     echo "新打开读到：$got"
     [ "$got" = secret ]

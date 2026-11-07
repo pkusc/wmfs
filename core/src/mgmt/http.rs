@@ -23,6 +23,7 @@ use crate::base::{ErrCode, log};
 use crate::bg::progress::TaskBoard;
 use crate::data::datakey::Wrapper;
 use crate::hooks::traits::KeyLookup;
+use crate::meta::changelog::{self, AUDIT_CURSOR};
 use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::engine::EmbeddedEngine;
 use crate::meta::sessions::Live;
@@ -137,6 +138,7 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
             if let Some(f) = &ctx.role {
                 (h.meta_role, h.leader) = f();
             }
+            h.audit_lag = ctx.meta.as_ref().and_then(|m| audit_lag(m)); // M12：审计消费者落后的条数（本节点已应用的状态）
             json(200, &h)
         }
         (_, "/api/v1/failpoints") => failpoints(ctx, method, url, auth, body),
@@ -145,6 +147,16 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
         (_, p) if api::handles(p) => api::serve(ctx, method, url, auth, body),
         _ => err(404, "enoent", format!("没有这个接口：{method} {path}")),
     }
+}
+
+/// `audit-log` 游标落后最新 changelog 的条数（3.8 变更通知 ⑥：`audit` 第一次启用时才有这个游标；没有 → None）。
+fn audit_lag(m: &EmbeddedEngine) -> Option<u64> {
+    let mut lag = None;
+    let _ = m.local_scan(&mut |v| {
+        lag = changelog::cursor_lag(v, AUDIT_CURSOR)?;
+        Ok(())
+    });
+    lag
 }
 
 fn failpoints(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]) -> Reply {

@@ -62,7 +62,7 @@ fn req(key: &str, value: Vec<u8>, exclusive: bool, out: &Sender<Result<MetaReply
     let done = Box::new(move |r| {
         let _ = out.send(r);
     });
-    TxnRequest { ctx: ctx(0, 0), op: put_op(key.as_bytes().to_vec(), value), done, exclusive }
+    TxnRequest { ctx: ctx(0, 0), op: put_op(key.as_bytes().to_vec(), value), done, exclusive, on_reject: None }
 }
 
 /// 在 `reqs` 上跑一次 fill：返回执行了几个、留在队列里几个、写集字节数。
@@ -116,7 +116,13 @@ fn ops_are_sorted_last_write_wins_and_bytes_count_the_final_value() {
         Ok(MetaReply::Ok)
     });
     let (dtx, _drx) = bounded(1);
-    let d = TxnRequest { ctx: ctx(0, 0), op: del, done: Box::new(move |r| drop(dtx.send(r))), exclusive: false };
+    let d = TxnRequest {
+        ctx: ctx(0, 0),
+        op: del,
+        done: Box::new(move |r| drop(dtx.send(r))),
+        exclusive: false,
+        on_reject: None,
+    };
     let reqs = vec![
         req("b", vec![1; 10], false, &out),
         req("a", vec![2; 5], false, &out),
@@ -162,25 +168,25 @@ fn failed_ops_roll_back_and_final_results_are_deduped() {
         v.put(b"half", b"written".to_vec());
         Err(ErrCode::EEXIST)
     });
-    assert_eq!(run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 1), fails), Err(ErrCode::EEXIST));
+    assert_eq!(run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 1), fails, None), Err(ErrCode::EEXIST));
     assert_eq!(v.get(b"half"), Ok(None), "失败的操作整体丢弃（原子性）");
     assert!(v.get(&keys::dedup(9, 1)).unwrap().is_some(), "错误也写去重记录：批次写集必然非空");
     let again = put_op(b"x".to_vec(), vec![1]);
     assert_eq!(
-        run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 1), again),
+        run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 1), again, None),
         Err(ErrCode::EEXIST),
         "同 seq 重放得到原结果，不再执行"
     );
     assert_eq!(v.get(b"x"), Ok(None));
     let ok = put_op(b"y".to_vec(), vec![2]);
-    assert_eq!(run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 2), ok), Ok(MetaReply::Ok));
+    assert_eq!(run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 2), ok, None), Ok(MetaReply::Ok));
     assert_eq!(
-        run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 2), put_op(b"y".to_vec(), vec![3])),
+        run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 2), put_op(b"y".to_vec(), vec![3]), None),
         Ok(MetaReply::Ok)
     );
     assert_eq!(v.get(b"y"), Ok(Some(vec![2])), "重试不会再改一次");
     let busy: TxnOp = Box::new(|_v, _c| Err(ErrCode::BUSY));
-    assert_eq!(run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 3), busy), Err(ErrCode::BUSY));
+    assert_eq!(run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 3), busy, None), Err(ErrCode::BUSY));
     assert_eq!(v.get(&keys::dedup(9, 3)), Ok(None), "集群类错误码（≥ 1000）= 没有执行：不写去重表");
 }
 
@@ -191,17 +197,17 @@ fn dedup_window_deletes_seq_minus_256_and_evicted_sessions_are_rejected() {
     v.put(&keys::dedup(9, 44), vec![1]);
     v.commit_op();
     assert_eq!(
-        run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 300), put_op(b"k".to_vec(), vec![1])),
+        run_one(&mut v, &e, &ClusterMap::default(), &ctx(9, 300), put_op(b"k".to_vec(), vec![1]), None),
         Ok(MetaReply::Ok)
     );
     assert_eq!(v.get(&keys::dedup(9, 44)), Ok(None), "写入 seq 300 的结果时点删 seq 44（规则 4）");
-    let r = run_one(&mut v, &e, &ClusterMap::default(), &ctx(8, 1), put_op(b"k".to_vec(), vec![2]));
+    let r = run_one(&mut v, &e, &ClusterMap::default(), &ctx(8, 1), put_op(b"k".to_vec(), vec![2]), None);
     assert_eq!(r, Err(ErrCode::SESSION_EVICTED), "没有（或已驱逐的）会话：驱逐是单调的事实");
-    let r = run_one(&mut v, &e, &ClusterMap::default(), &ctx_of_key(9, 301, 2), put_op(b"k".to_vec(), vec![4]));
+    let r = run_one(&mut v, &e, &ClusterMap::default(), &ctx_of_key(9, 301, 2), put_op(b"k".to_vec(), vec![4]), None);
     assert_eq!(r, Err(ErrCode::EACCES), "会话是 key 1 打开的：别的 key 不能用它");
     assert_eq!(v.get(&keys::dedup(9, 301)), Ok(None), "也不进去重表（不会污染会话主人的 seq）");
     assert_eq!(
-        run_one(&mut v, &e, &ClusterMap::default(), &ctx(8, 0), put_op(b"k".to_vec(), vec![3])),
+        run_one(&mut v, &e, &ClusterMap::default(), &ctx(8, 0), put_op(b"k".to_vec(), vec![3]), None),
         Ok(MetaReply::Ok),
         "seq 0 不查会话"
     );
@@ -320,7 +326,7 @@ fn run_model(seed: u64) {
             fail.map_or(Ok(MetaReply::DebugValue { value: seen }), Err)
         });
         assert_eq!(
-            run_one(&mut view, &env, &ClusterMap::default(), &ctx(session, seq), op),
+            run_one(&mut view, &env, &ClusterMap::default(), &ctx(session, seq), op, None),
             want,
             "{at}：回复与模型不同"
         );

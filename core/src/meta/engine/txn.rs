@@ -11,6 +11,7 @@ use crate::base::types::ReqCtx;
 use crate::hooks::manifest::Manifest;
 use crate::hooks::pipeline::Pipeline;
 use crate::meta::attrs::AttrResolver;
+use crate::meta::changelog::Subject;
 use crate::meta::schema::records::ClusterSettingsV1;
 use crate::proto::meta::MetaReply;
 use crate::proto::peer::ClusterMap;
@@ -77,7 +78,7 @@ fn blocking(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp, exclusive: bool) -> Re
     let done = Box::new(move |r| {
         let _ = tx.try_send(r);
     });
-    eng.txn(TxnRequest { ctx, op, done, exclusive });
+    eng.txn(TxnRequest { ctx, op, done, exclusive, on_reject: None });
     rx.recv().unwrap_or(Err(ErrCode::NOT_LEADER))
 }
 
@@ -104,6 +105,7 @@ pub struct TxnRequest {
     pub op: TxnOp,
     pub done: Box<dyn FnOnce(Result<MetaReply, ErrCode>) + Send>, // RPC 层：编码后经 Responder 回复（只 try_send，不碰 socket）；内部调用者：发进 bounded(1)
     pub exclusive: bool,                                          // 集群拓扑类内部操作：必须是本批最后一个（规则 5）
+    pub on_reject: Option<Subject>, // 实现注记（M12，只增）：客户端的修改被拒绝时 changelog 里记成什么（audit 生效时才写，`changelog::rejected`）
 }
 
 // ---- 3.12 ----

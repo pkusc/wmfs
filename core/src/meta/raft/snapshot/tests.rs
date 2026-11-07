@@ -78,6 +78,25 @@ fn sent_snapshots_are_reported_once_and_time_out() {
     assert!(pins.take_sent(12, 3).is_empty(), "snap-serve 之后发完也不再报告");
 }
 
+/// 实现注记（M12）：pin 是一个 redb 读事务，留着它 leader 的 meta.redb 就回收不了页——发完就放掉，导出了没人来取的 60 s 后放掉。
+#[test]
+fn pins_are_released_after_serving_or_when_nobody_fetches_them() {
+    let db = db();
+    let pins = Pins::default();
+    pins.export(&db, 0, 2, 1, 7).unwrap();
+    pins.note_sent(2, 1, 1);
+    let now = clock::mono_ms();
+    assert!(!pins.overdue(3, now + SENT_TIMEOUT_MS + 1000));
+    assert!(pins.find(1, 1).is_some(), "还有在途的发送：留着");
+    assert_eq!(pins.take_sent(1, 1), vec![2]);
+    assert!(pins.find(1, 1).is_none(), "发完了：放掉");
+    pins.export(&db, 0, 2, 1, 7).unwrap(); // 导出了、没人来取
+    assert!(!pins.overdue(2, now));
+    assert!(pins.find(1, 1).is_some(), "刚建的：留着");
+    assert!(!pins.overdue(2, now + SENT_TIMEOUT_MS + 1000));
+    assert!(pins.find(1, 1).is_none(), "60 s 没人来取：放掉");
+}
+
 #[test]
 fn snapshot_files_round_trip_and_damage_is_detected() {
     let db = db();

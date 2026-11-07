@@ -19,6 +19,10 @@
 //!
 //!   经句柄（同步写、ftruncate、fallocate）的请求只在句柄的会话里发（M10 审查，`files.rs` 的文件头）；被驱逐的会话里打开的句柄 → `EIO`。
 //!
+//! - **strong**（M12，8.5）：读之前先线性一致地 `GetAttr`（长度与 epoch；epoch 变了先刷新 layout，[`FileClient::fresh_attr`]）；`O_APPEND`
+//!   的写不用内核给的偏移：`AppendReserve` 原子地分到偏移（配额在那里精确检查）→ 按它写链 → `CommitWrite`；`STALE_LAYOUT` 重来时沿用
+//!   已经分到的偏移，不再分一次。同一个 inode 的追加在本客户端一个一个来（io 权）。
+//!
 //!   实现注记（M6）：内核对 `open(O_TRUNC)` 发的 SETATTR 不带 fh（6.17 的 `fuse_do_setattr` 遇到 ATTR_OPEN 把 file 置空），与按路径的
 //!   truncate 分不出来，所以它发的是 `SetAttr`——刚做完的 Open 已经按当前权限检查过写权限，结果相同（ADR-0036 第 3 条的偏离，
 //!   design.md 8.1 的注记）。
@@ -45,15 +49,21 @@ impl FileClient {
     ) -> Result<u32, ErrCode> {
         let _io = inode.io();
         self.flush_held(inode, false, false)?;
-        let end = off + data.len() as u64;
+        let (end, append) = (off + data.len() as u64, h.strong_append());
+        let mut at = None; // strong 的 O_APPEND：AppendReserve 分到的偏移（见文件头）
         for _ in 0..STALE_RETRIES {
             let (inline, imax, cs) = lock(&inode.st).layout_view()?;
-            let r = if inline && end <= imax {
+            let r = if inline && end <= imax && !append {
                 self.commit(inode, who, h.session, end, vec![(off, data.to_vec())], false, false)
             } else {
                 if inline {
                     self.uninline(inode, who, h.session)?;
                 }
+                let off = match (append, at) {
+                    (false, _) => off,
+                    (true, Some(o)) => o,
+                    (true, None) => *at.insert(self.reserve(inode, who, h.session, data.len() as u64)?),
+                };
                 self.write_through(inode, who, h, off, data, cs)
             };
             match r {
@@ -62,6 +72,33 @@ impl FileClient {
             }
         }
         Err(ErrCode::ESTALE)
+    }
+
+    /// `AppendReserve`（见文件头）：回分到的偏移；`STALE_LAYOUT`（layout 变了）由调用方重新取 layout 再来。
+    fn reserve(&self, inode: &Inode, who: &Caller, sid: u64, len: u64) -> Result<u64, ErrCode> {
+        let epoch = lock(&inode.st).layout.as_ref().ok_or(ErrCode::EINVAL)?.epoch;
+        let MetaReply::Offset { offset, attr } =
+            self.meta.write_in(sid, who, MetaOp::AppendReserve { ino: inode.ino, epoch, len })?
+        else {
+            return Err(ErrCode::INTERNAL);
+        };
+        lock(&inode.st).mine(&attr);
+        Ok(offset)
+    }
+
+    /// strong 的读之前（见文件头）：线性一致地取属性；layout 的 epoch 变了 → 经读句柄重新取 layout。
+    pub(super) fn fresh_attr(&self, inode: &Inode, who: &Caller, sid: u64) -> Result<(), ErrCode> {
+        let MetaReply::Entry { attr } = self.meta.read_in(sid, who, MetaOp::GetAttr { ino: inode.ino })? else {
+            return Err(ErrCode::INTERNAL);
+        };
+        let stale = {
+            let mut st = lock(&inode.st);
+            if attr.change_id >= st.attr.change_id {
+                st.attr = attr;
+            }
+            st.layout.as_ref().is_some_and(|l| l.epoch != st.attr.epoch)
+        };
+        if stale { self.reopen(inode, who, sid, Reopen::Read) } else { Ok(()) }
     }
 
     /// 经句柄 `h` 按 chunk 把 `data` 写进链（每段拷进一个池缓冲）→（`O_SYNC` 时）SyncChunks → 提交长度。

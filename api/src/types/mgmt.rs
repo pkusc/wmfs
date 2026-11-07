@@ -127,6 +127,10 @@ pub struct AttrActual {
     pub migrates: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quotas: Option<Vec<QuotaUsage>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>, // 实现注记（M12，只增）：trash——回收站里的字节数（files 是文件数）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag: Option<u64>, // 实现注记（M12，只增）：audit——audit-log 游标落后最新 changelog 的条数（还没有游标 → 没有）
 }
 
 /// `GET /api/v1/status` 里一个属性的声明 vs 实际。

@@ -47,6 +47,7 @@ struct Inner {
     peer: String,
     identity: OnceLock<ConnIdentity>, // 服务端：握手完成后才有
     authed: AtomicBool,               // 握手已完成（两端都有）：写线程从此才发保活 Ping
+    features: AtomicU64,              // 握手协商出的 feature 位（双方交集，3.3.2）
     closed: AtomicBool,
 }
 
@@ -131,14 +132,20 @@ impl ConnHandle {
         self.tx.len()
     }
 
-    /// 握手完成（在读线程上调用）：记下对端身份（只有服务端有）；告诉传输插件（`Conn::mark_authenticated`：
+    /// 握手完成（在读线程上调用）：记下对端身份（只有服务端有）与协商出的 feature 位；告诉传输插件（`Conn::mark_authenticated`：
     /// 从此才收带 bulk 的帧、单边传输才允许 READ/WRITE）；写线程从此才发保活 Ping。
-    pub(crate) fn authenticated(&self, id: Option<ConnIdentity>) {
+    pub(crate) fn authenticated(&self, id: Option<ConnIdentity>, features: u64) {
         if let Some(id) = id {
             let _ = self.inner.identity.set(id);
         }
+        self.inner.features.store(features, Ordering::SeqCst);
         self.inner.conn.mark_authenticated();
         self.inner.authed.store(true, Ordering::SeqCst);
+    }
+
+    /// 握手协商出的 feature 位（双方交集；握手完成之前是 0）。
+    pub fn features(&self) -> u64 {
+        self.inner.features.load(Ordering::SeqCst)
     }
 }
 
@@ -158,6 +165,7 @@ pub(crate) fn spawn(
         conn: conn.clone(),
         identity: OnceLock::new(),
         authed: AtomicBool::new(false),
+        features: AtomicU64::new(0),
         closed: AtomicBool::new(false),
     });
     let h = ConnHandle { inner: inner.clone(), tx };

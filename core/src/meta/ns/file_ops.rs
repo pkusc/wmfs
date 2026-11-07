@@ -163,6 +163,32 @@ pub fn fallocate(
     Ok(MetaReply::Entry { attr: attr_out(v, c, &n)? })
 }
 
+/// `AppendReserve`（strong 的 O_APPEND，3.5.5；实现注记（M12））：经写句柄（`AuthzOp::Handle`）；`epoch` 与当前 layout 不符、或文件还是
+/// inline（写打开 strong 文件时客户端已先转出，8.5）→ `STALE_LAYOUT`；原子地分到 `offset = size` 并 `size += len`——超过最大长度 → `EFBIG`，
+/// 配额**精确**检查（3.9 第 5 条：`EDQUOT` 时长度不变），祖先 RSTAT、mtime 与 changelog `SetSize`（`via=AppendReserve`）同批。客户端随后写
+/// `[offset, offset + len)` 并 `CommitWrite`（长度已经够了，只更新 mtime）。回 `Offset { offset, attr }`。
+pub fn append_reserve(v: &mut dyn KvTxn, c: &OpCtx, ino: u64, epoch: u32, len: u64) -> Result<MetaReply, ErrCode> {
+    let mut n = get(v, ino)?;
+    writable_file(v, c, &n)?;
+    let l = n.rec.layout.clone().ok_or(ErrCode::EINVAL)?;
+    if epoch != l.epoch || n.rec.flags & F_INLINE != 0 {
+        return Err(ErrCode::STALE_LAYOUT);
+    }
+    let offset = n.rec.size;
+    let end = offset.checked_add(len).filter(|e| *e <= max_file_size(&l)).ok_or(ErrCode::EFBIG)?;
+    if len > 0 {
+        quota::admit_size(v, c, &n, end)?;
+        let before = Delta::of(v, &n)?;
+        n.rec.size = end;
+        touch_data(&mut n, c);
+        save(v, &n);
+        rstat::changed(v, c, &before, &n)?;
+        let extra = vec![("via".to_string(), "AppendReserve".to_string())];
+        changelog::append(v, c, Change { op: "SetSize", ino, size: end, extra, ..Default::default() })?;
+    }
+    Ok(MetaReply::Offset { offset, attr: attr_out(v, c, &n)? })
+}
+
 /// 普通文件 `ino`：目录 → `EISDIR`，别的种类 → `EINVAL`（GetInline、RenewCap、ReopenHandle）。
 fn file_node(v: &dyn KvRead, ino: u64) -> Result<Node, ErrCode> {
     let n = get(v, ino)?;

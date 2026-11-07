@@ -21,9 +21,8 @@
 //!   返回的原结果，日志写"超时重试 seq=… → 去重命中"（判断用两边的墙钟，跨机器时要求时钟误差远小于一个 RPC 超时，
 //!   只影响这一行提示；协议里没有"去重命中"的标志，3.3.4）。
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use super::lease::{Lease, OpenDelta, OpenFiles};
@@ -31,9 +30,12 @@ use crate::base::{ErrCode, clock, lock, log, rand, sys};
 use crate::net::client::{Endpoint, Family, RpcClient};
 use crate::net::retry::{BACKOFF_MAX_MS, BACKOFF_START_MS, retryable};
 use crate::proto::frame::{FrameHeader, FrameKind, InFrame, MSG_META_CALL, MSG_NODE_CALL, OutFrame};
-use crate::proto::meta::{DEDUP_WINDOW, MetaCall, MetaOp, MetaReply, ReqHead};
+use crate::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
 use crate::proto::peer::{ClusterMap, NodeOp, NodeReply};
 use crate::proto::{decode_body, encode_body};
+
+mod window;
+use window::Window;
 
 /// 连续跟随 `leader_hint` 的次数上限（之后照常退避，防止两个节点互相指来指去）。
 const MAX_HINT_HOPS: u32 = 3;
@@ -73,48 +75,6 @@ struct Peers {
     leader: Endpoint,
     known: Vec<Endpoint>,
     next: usize,
-}
-
-/// 在途的修改型请求：下一个要分配的 seq，与还没结束的请求的 seq。
-struct Inflight {
-    next: u64,
-    seqs: BTreeSet<u64>,
-}
-
-/// 按 seq 计的在途窗口（见文件头）：分配 seq 时，新 seq 必须 < 最小的在途 seq + `DEDUP_WINDOW`，否则等。
-struct Window {
-    m: Mutex<Inflight>,
-    cv: Condvar,
-}
-
-/// 占着一个在途的 seq；Drop 时（请求成功或最终失败）把它从在途集合里去掉，并唤醒等待者。
-struct Slot<'a> {
-    w: &'a Window,
-    seq: u64,
-}
-
-impl Window {
-    fn new() -> Window {
-        Window { m: Mutex::new(Inflight { next: 1, seqs: BTreeSet::new() }), cv: Condvar::new() }
-    }
-
-    fn acquire(&self) -> Slot<'_> {
-        let mut g = lock(&self.m);
-        while g.seqs.first().is_some_and(|min| g.next >= min + DEDUP_WINDOW) {
-            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-        let seq = g.next;
-        g.next += 1;
-        g.seqs.insert(seq);
-        Slot { w: self, seq }
-    }
-}
-
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        lock(&self.w.m).seqs.remove(&self.seq);
-        self.w.cv.notify_all(); // 最小的在途 seq 可能变大了：等待者都重新看一遍
-    }
 }
 
 pub struct MetaClient {
@@ -241,7 +201,7 @@ impl MetaClient {
     /// 心跳 map_epoch 变大、或 STALE_CHAIN/NOT_SERVING 时；返回换上之后手上的图（只装不旧于它的：ADR-0041 第 17 条）
     pub fn refresh_map(&self) -> Result<Arc<ClusterMap>, ErrCode> {
         let body = encode_body(&NodeOp::GetClusterMap { since_epoch: 0 });
-        let (f, _) = self.exchange(MSG_NODE_CALL, body, "GetClusterMap", 0)?;
+        let (f, _) = self.exchange(MSG_NODE_CALL, body, "GetClusterMap", 0, 0)?;
         match decode_body::<NodeReply>(&f.body)? {
             NodeReply::Map(m) => {
                 let mut cur = lock(&self.map);
@@ -299,7 +259,7 @@ impl MetaClient {
             job_id: who.job_id,
         };
         let body = encode_body(&MetaCall { head, op: op.clone() });
-        let (f, retried_at) = self.exchange(MSG_META_CALL, body, op.name(), seq)?;
+        let (f, retried_at) = self.exchange(MSG_META_CALL, body, op.name(), seq, op.feature())?;
         let reply: MetaReply = decode_body(&f.body)?;
         if let Some(sent_ms) = retried_at {
             log_timeout_retry(seq, sent_ms, &reply);
@@ -309,8 +269,16 @@ impl MetaClient {
 
     /// 发一个控制族请求，跟随 leader、按 3.3.8 重试（见文件头）；返回成功的回复帧，以及"超时之后重试"时最后一次发送的墙钟时刻。
     /// 不用 `net::retry::retry`：这里的重试日志是 INFO 级（`wmfs fs --verbose` 才看得到，retry 写 WARN），带 hint 的
-    /// `NOT_LEADER` 不退避、立即换到 leader，没有 hint 时还要换下一个认识的节点——retry 只会原地退避。
-    fn exchange(&self, msg_type: u16, body: Vec<u8>, what: &str, seq: u64) -> Result<(InFrame, Option<u64>), ErrCode> {
+    /// `NOT_LEADER` 不退避、立即换到 leader，没有 hint 时还要换下一个认识的节点——retry 只会原地退避。`need`：对端要在握手里声明的
+    /// feature 位（`MetaOp::feature`），没声明 → `EOPNOTSUPP`、不发（ADR-0043 第 3 条）。
+    fn exchange(
+        &self,
+        msg_type: u16,
+        body: Vec<u8>,
+        what: &str,
+        seq: u64,
+        need: u64,
+    ) -> Result<(InFrame, Option<u64>), ErrCode> {
         let deadline = clock::mono_ms().saturating_add(self.opts.op_timeout.as_millis() as u64);
         let trace_id = rand::random_u64(); // 同一个操作的重试用同一个 trace_id
         let (mut backoff, mut hops, mut attempt) = (BACKOFF_START_MS, 0, 0);
@@ -320,7 +288,13 @@ impl MetaClient {
             let hdr = FrameHeader::new(FrameKind::Request, msg_type, 0, trace_id);
             let f = OutFrame { hdr, body: body.clone(), bulk: vec![], recv_into: None };
             let sent = clock::wall_ms();
-            let (code, hint) = match self.rpc.call(&ep, Family::Control, f, self.opts.rpc_timeout) {
+            let have = if need == 0 { Ok(0) } else { self.rpc.features(&ep, Family::Control, self.opts.rpc_timeout) };
+            let r = match have {
+                Ok(h) if h & need != need => return Err(ErrCode::EOPNOTSUPP), // 对端没在握手里声明：不发（见上）
+                Ok(_) => self.rpc.call(&ep, Family::Control, f, self.opts.rpc_timeout),
+                Err(e) => Err(e), // 建连失败等：照常按下面的规则重试
+            };
+            let (code, hint) = match r {
                 Ok(f) => match f.error() {
                     None => return Ok((f, timed_out.then_some(sent))), // sent = 这一次（重试）发出的时刻
                     Some(e) => (ErrCode(e.code), e.leader_hint),

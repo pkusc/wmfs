@@ -98,9 +98,23 @@ LIMIT=38000
 # core/src/server/ 算成了不存在的模块"core/server"，现在算进 core；余下 M14 的 mgr 装配约 50）、cli 5200 → 5500（已约 4,954；按 7.2 的命令
 # 清单重估 M12–M14 余下约 540，含 roadmap 没排进里程碑的 feature list|enable 约 30）、plugins 5100 → 5270（已约 4,117；按 design 2.2 的表余下
 # 约 1,150，含 M10 下调时漏算的 label-match 完整版约 140）。Σ max ≈ 36,370（上限 38,000；超过 37,000 要上报）。
-MODULES="wmfs-api:1170 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1270 core/hooks:1120
-core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2000 core/meta:2850 core/meta/cluster:1340
-core/data:3120 core/client:2430 core/bg:1170 core/mgmt:1340 core:965 plugins:5270 cli:5500 dashboard:880
+# M12（design.md 2.2 的 M12 注记）：新增约 1,070 行（预算约 850）。超出、已达 90% 或余下的工作已经装不下的按剩余工作重估，共九个：wmfs-api
+# 1170 → 1175（已约 1,065；余下约 110）、core/hooks 1120 → 1130（已约 973；余下 M14 的 cabi.rs 约 150、M13 的 TierCondition 约 5）、core/meta/ns
+# 2000 → 2040（已约 2,009：trash.rs、AppendReserve、audit_of；余下 M13 新建文件的放置与存储类约 30）、core/meta 2850 → 2880（已约 2,839：locks.rs、
+# trash/ttl/audit 的解析、审计标记、status 的实际；余下 M13 的 qos/tier 属性与实际约 40）、core/client 2430 → 2460（已约 2,427：locks.rs、strong 的
+# 读与追加；余下 M13 的 read_order、qos 标记约 20、M14 的 trace 约 10）、core/bg 1170 → 1195（已约 1,128；余下约 65）、core/mgmt 1340 → 1360（已约
+# 1,156；余下约 200）、core 965 → 970（已约 920；余下 M14 的 mgr 装配约 50）、plugins 5270 → 5290（已约 4,299：trash-expire 与 ttl 实际约 180，
+# 原估 160；余下 mclock、cache-local-nvme、tiering、rebalance、label-match 约 990）。Σ max ≈ 36,555。
+# M12 审查修复（design.md 2.2 的 M12 审查修复注记）：再新增约 70 行。余下的工作已经装不下的四个按剩余工作重估：core/hooks 1130 → 1145
+# （已约 989：默认审计的操作写成名字表；余下 M14 的 cabi.rs 约 150、M13 的 TierCondition 约 5）、core/meta/ns 2040 → 2060（已约 2,028：
+# trash_or_unlink、ttl_due、rename 的重新读；余下 M13 约 30）、core/meta 2880 → 2895（已约 2,854；余下 M13 的 qos/tier 约 40）、core/client
+# 2460 → 2465（已约 2,434：release 按句柄解锁；余下约 30）。Σ max ≈ 36,610。
+# M12 落实 ADR-0043（design.md 2.2 的注记）：再新增约 57 行。余下的工作已经装不下的三个按剩余工作重估：core/net 1270 → 1285（已约 1,261：
+# 握手协商出的 feature 位记在连接上、`RpcClient::features`；余下小改约 20）、core/meta/ns 2060 → 2075（已约 2,045：回收站按文件属主分子目录；
+# 余下 M13 约 30）、core/client 2465 → 2480（已约 2,452：发锁与追加之前核对 feature 位；余下约 30）。Σ max ≈ 36,655。
+MODULES="wmfs-api:1175 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1285 core/hooks:1145
+core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2075 core/meta:2895 core/meta/cluster:1340
+core/data:3120 core/client:2480 core/bg:1195 core/mgmt:1360 core:970 plugins:5290 cli:5500 dashboard:880
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

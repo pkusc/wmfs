@@ -13,12 +13,17 @@
 //! 并写 `RECONCILE_Q(dir, 2)`（同一个目录里改名也算：3.8"任何目录 rename"；由 M11 的协调器消费）。实现注记（M10）：跨配额域的检查——换了
 //! 目录的那一份计数先在新祖先链一侧过配额（`quota::admit_move`）；M10 审查：被覆盖的目标先扣掉再查（否则装得下的覆盖也被误拒），
 //! RENAME_EXCHANGE 按两份计数对调之后的净增量查；有多个链接的非目录把一个链接搬进配额范围不同的目录 → `EXDEV`（对调的两边各看
-//! 各的，[`links_stay`]，ADR-0041 第 1 条）。
+//! 各的，[`links_stay`]，ADR-0041 第 1 条）。实现注记（M12）：回收站（`trash.rs`）——被覆盖的文件目标在 `trash` 生效时移进回收站（另写一条
+//! changelog `Unlink`，`extra` 的 `trash=` 是它在回收站里的名字）；文件被移出回收站目录 = 恢复（清掉到期时间与 TRASH_INDEX）。回收站可能
+//! 刚建在某个父目录下，也可能就是其中一个（例如用回收站里的旧版本覆盖恢复）：处理完被覆盖的目标之后再重新读两个父目录、改最新的那份
+//! （实现注记（M12 审查）：以前在移进回收站之前读，回收站自己是源父时它的 size 被旧副本盖掉、少了一项）。Rename 的 changelog 在
+//! `attr_epoch += 1` 之前写（它要解析属性；3.8 的缓存规则）。
 
 use super::common::{
-    Node, authz, bump_ctime, check_name, child, link_dentry, relink, save, searchable_dir, update_dir,
+    Node, authz, bump_ctime, check_name, child, get, link_dentry, relink, save, searchable_dir, update_dir,
 };
-use super::remove::{delete_dir_records, unlink_file};
+use super::remove::delete_dir_records;
+use super::trash;
 use crate::base::ErrCode;
 use crate::hooks::traits::AuthzOp;
 use crate::meta::attrs::{bump_attr_epoch, queue_reconcile};
@@ -68,6 +73,14 @@ impl Parents {
     fn to(&self) -> &Node {
         self.to.as_ref().unwrap_or(&self.from)
     }
+    /// 重新读两个父目录（回收站刚建在其中一个下面时，见文件头）。
+    fn refresh(&mut self, v: &dyn KvRead) -> Result<(), ErrCode> {
+        self.from = get(v, self.from.ino)?;
+        if let Some(t) = self.to.as_mut() {
+            *t = get(v, t.ino)?;
+        }
+        Ok(())
+    }
     /// 按增量 (size, nlink) 改两个父目录并写回（同一个目录时两份增量加在一起）。
     fn apply(mut self, v: &mut dyn KvTxn, c: &OpCtx, from: (i64, i64), to: (i64, i64)) {
         match self.to.as_mut() {
@@ -105,7 +118,7 @@ pub fn rename(
     let across = new_parent != parent;
     let from = searchable_dir(v, c, parent)?;
     let to = if across { Some(searchable_dir(v, c, new_parent)?) } else { None };
-    let ps = Parents { from, to };
+    let mut ps = Parents { from, to };
     let mut src = child(v, parent, name)?.ok_or(ErrCode::ENOENT)?;
     let mut victim = child(v, new_parent, new_name)?; // 目标名字现在指向的 inode（要被覆盖或对调的）
     authz(v, c, AuthzOp::RenameFrom, None, Some(&ps.from), Some(&src))?;
@@ -138,50 +151,56 @@ pub fn rename(
     if across {
         links_stay(v, c, &src, new_parent)?;
     }
+    let bin = match &victim {
+        Some(d) if !d.is_dir() => trash::dir_for(v, c, ps.to(), d)?,
+        _ => None,
+    };
+    let trashing = bin.is_some();
     let moving = if across && primary(&src, parent, name) { Some(Delta::of(v, &src)?) } else { None };
     v.delete(&keys::dentry(parent, name));
     link_dentry(v, new_parent, new_name, &src);
     relink(&mut src, (parent, name), (new_parent, new_name));
     bump_ctime(&mut src, c);
-    save(v, &src);
-    // 被覆盖的目标先从计数里扣掉（目录：空的，dirs − 1；文件：按 unlink），跨 scope 的检查才看得到覆盖之后的用量（M10 审查）
+    // 被覆盖的目标先从计数里扣掉（目录：空的，dirs − 1；文件：按 unlink，trash 生效就进回收站），跨 scope 的检查才看得到覆盖之后的
+    // 用量（M10 审查）
     match victim.as_mut() {
         Some(d) if d.is_dir() => {
             let gone = Delta::of(v, d)?.neg();
             rstat::apply(v, c, new_parent, &gone)?;
         }
-        Some(d) => unlink_file(v, c, d, new_parent, new_name)?,
+        Some(d) => {
+            if let Some(e) = trash::trash_or_unlink(v, c, d, (new_parent, new_name), bin)? {
+                let (ino, size, extra) = (d.ino, d.rec.size, vec![e]);
+                let ch =
+                    Change { op: "Unlink", ino, parent: new_parent, name: new_name, size, extra, ..Default::default() };
+                changelog::append(v, c, ch)?;
+            }
+        }
         None => {}
     }
+    if trashing {
+        ps.refresh(v)?; // 回收站可能刚建在其中一个父目录下，或者就是其中一个（见文件头）
+    }
+    trash::restore(v, &mut src, ps.to());
+    save(v, &src);
     if let Some(d) = &moving {
         quota::admit_move(v, c, parent, new_parent, d)?; // 跨 scope：新祖先链一侧先过配额（3.9，M10）
         rstat::transfer(v, c, parent, new_parent, d)?; // 计数从旧祖先链搬到新祖先链（到最近公共祖先为止，3.9）
     }
     // 父目录的增量 (size, nlink)：源父少一项；目标父多一项（覆盖了目标就抵掉）；目录换了父目录，它的 .. 跟着走
     let dir_moves = (across && src.is_dir()) as i64;
-    let (mut dsize, mut dnlink) = (1, dir_moves);
-    if let Some(d) = &victim {
-        dsize -= 1;
-        if d.is_dir() {
-            dnlink -= 1;
-            delete_dir_records(v, d.ino)?; // 有 DIRATTR 时 attr_epoch += 1：之后不再解析属性（attrs.rs）
-        }
-    }
+    let gone_dir = victim.as_ref().filter(|d| d.is_dir());
+    let (dsize, dnlink) = (1 - victim.is_some() as i64, dir_moves - gone_dir.is_some() as i64);
     ps.apply(v, c, (-1, -dir_moves), (dsize, dnlink));
+    let size = src.rec.size;
+    let ch = Change { op: "Rename", ino: src.ino, parent, name, new_parent, new_name, size, ..Default::default() };
+    changelog::append(v, c, ch)?; // 要解析属性：在下面 attr_epoch 加一之前写（之后不再解析，attrs.rs）
+    if let Some(d) = gone_dir {
+        delete_dir_records(v, d.ino)?; // 有 DIRATTR 时 attr_epoch += 1
+    }
     if src.is_dir() {
         note_dir_moved(v, src.ino)?;
     }
-    let ch = Change {
-        op: "Rename",
-        ino: src.ino,
-        parent,
-        name,
-        new_parent,
-        new_name,
-        size: src.rec.size,
-        ..Default::default()
-    };
-    changelog::append(v, c, ch)?;
     Ok(MetaReply::Ok)
 }
 
@@ -206,6 +225,8 @@ fn exchange(v: &mut dyn KvTxn, c: &OpCtx, ps: Parents, mut a: Side, mut b: Side)
     link_dentry(v, b.parent, b.name, &a.node);
     relink(&mut a.node, (a.parent, a.name), (b.parent, b.name));
     relink(&mut b.node, (b.parent, b.name), (a.parent, a.name));
+    trash::restore(v, &mut a.node, ps.to());
+    trash::restore(v, &mut b.node, &ps.from);
     for n in [&mut a.node, &mut b.node] {
         bump_ctime(n, c);
         save(v, n);
@@ -224,12 +245,12 @@ fn exchange(v: &mut dyn KvTxn, c: &OpCtx, ps: Parents, mut a: Side, mut b: Side)
     if let Some(d) = &db {
         rstat::transfer(v, c, b.parent, a.parent, d)?;
     }
-    for n in [&a.node, &b.node].into_iter().filter(|n| n.is_dir()) {
-        note_dir_moved(v, n.ino)?;
-    }
     let (ino, size) = (a.node.ino, a.node.rec.size);
     let (parent, name, new_parent, new_name) = (a.parent, a.name, b.parent, b.name);
     let ch = Change { op: "Rename", ino, parent, name, new_parent, new_name, size, ..Default::default() };
-    changelog::append(v, c, ch)?;
+    changelog::append(v, c, ch)?; // 在 attr_epoch 加一之前（见 rename）
+    for n in [&a.node, &b.node].into_iter().filter(|n| n.is_dir()) {
+        note_dir_moved(v, n.ino)?;
+    }
     Ok(MetaReply::Ok)
 }

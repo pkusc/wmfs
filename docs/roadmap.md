@@ -388,13 +388,17 @@ wmfs fs --as-uid 2000 cat /home/private/s           # 预期：secret（ACL 放�
 wmfs key create q-only --role client --path /home/q --out /tmp/q.key
 wmfs fs --key-file /tmp/q.key ls /home/private      # 预期：Permission denied（这把 key 只能访问 /home/q）
 exec 3< ~/wmfs-mnt2/home/private/s                  # 让第二个客户端打开一个文件
-kill -STOP $(wmfs dev client-pid ~/wmfs-mnt2)
-wmfs dev wait session-evicted ~/wmfs-mnt2 --timeout 90 && wmfs session list   # 预期：该会话显示 EVICTED
-kill -CONT $(wmfs dev client-pid ~/wmfs-mnt2); cat <&3    # 预期：Input/output error（旧句柄不再可用）
+P=$(wmfs dev client-pid ~/wmfs-mnt2)                # 第二个挂载进程的 pid
+kill -STOP $P; wmfs dev wait session-evicted ~/wmfs-mnt2 --timeout 90 3<&- && wmfs session list 3<&-; kill -CONT $P   # 预期：该会话显示 EVICTED（冻住、等驱逐、恢复写在同一行，见下）
+cat <&3; exec 3<&-                                  # 预期：Input/output error（旧句柄不再可用）
 cat ~/wmfs-mnt2/home/private/s                      # 预期：secret（自动建立新会话后，新打开正常）
 wmfs dev down
 scripts/accept.sh M10
 ```
+
+  （M12 起：关掉一个 fd 时内核要等挂载进程回复——close 时要经它释放这个进程的锁——所以挂载进程被冻住期间，继承了 fd 3 的进程退出时会卡住。
+  冻住期间跑的命令加上 `3<&-`，不让它们继承 fd 3；交互式 shell 的提示符程序（starship、oh-my-zsh 等）每画一次提示符也会 fork 一个继承
+  fd 3 的进程，所以冻住到恢复写在同一行、中间不出提示符。）
 
 - **本阶段你需要理解的概念**：
   - **ACL**：比 rwx 更细的权限表，可以单独给某个用户或组开权限（`setfacl -m u:2000:r`）。
@@ -446,7 +450,7 @@ scripts/accept.sh M11
 ### M12 锁 + strong + O_APPEND + 回收站 / ttl（约 850 行）
 
 - **目标**：跨挂载点的 flock/fcntl 互斥；`consistency=strong` 的目录里写完另一边立刻可见、并发追加不丢不乱；共享可写 mmap 被诚实拒绝；回收站与 ttl 按属性生效。
-- **包含**：`meta/locks`（复制的锁表；`SetLock` 永远非阻塞；"到文件尾"= `i64::MAX`）、客户端锁处理（F_SETLKW 交给 lock-wait 线程轮询，不占 FUSE 线程）、strong 模式（direct_io、读前 GetAttr、每次写同步提交、strong 目录里新文件不 inline、写打开 inline 文件前先转出）、`AppendReserve`、回收站（unlink 路径、`.wmfs-trash`、mv 恢复）、`plugins/{trash-expire, ttl}`、内置策略求值器、`audit` 标记（第一次启用时创建 `audit-log` 游标）、relatime；一个确认 F_GETLK 行为的小 spike。对应理念文档：第 3 章"事务与锁原语"（字节范围锁、跨节点原子操作）、"一致性：cto 与 strong"、5.2 `consistency`/`trash`/`ttl`/`audit`、8.2 的 mmap 与 O_APPEND 条目。（分层 `tier` 需要先能创建存储类，放到 M13。）
+- **包含**：`meta/locks`（复制的锁表；`SetLock` 永远非阻塞；"到文件尾"= `i64::MAX`）、客户端锁处理（F_SETLKW 交给 lock-wait 线程轮询，不占 FUSE 线程）、strong 模式（direct_io、读前 GetAttr、每次写同步提交、strong 目录里新文件不 inline、写打开 inline 文件前先转出）、`AppendReserve`、回收站（unlink 路径、`.wmfs-trash/<uid>/`、mv 恢复）、`plugins/{trash-expire, ttl}`、内置策略求值器、`audit` 标记（第一次启用时创建 `audit-log` 游标）、relatime；一个确认 F_GETLK 行为的小 spike。对应理念文档：第 3 章"事务与锁原语"（字节范围锁、跨节点原子操作）、"一致性：cto 与 strong"、5.2 `consistency`/`trash`/`ttl`/`audit`、8.2 的 mmap 与 O_APPEND 条目。（分层 `tier` 需要先能创建存储类，放到 M13。）
 - **开工前确认**：批次 4（0013）。
 - **验收标准**：两个挂载点在 strong 目录并发追加 2 × 1000 行 → 正好 2000 行且格式完整；strong 目录里两个挂载点并发追加同一个**小文件**也正确；strong 下写后另一挂载点立即读到；flock/fcntl 跨挂载点互斥（计数器测试结果恰好 2000）；**17 个进程同时 F_SETLKW 等同一把锁时，挂载点上的 `ls` 仍立即返回**；F_GETLK 能看到 `l_len = 0`（到文件尾）的冲突锁；strong 文件上 `mmap(MAP_SHARED)` 得到 `ENODEV`；rm 后能从回收站 mv 回来；ttl 用短时长按预期删除；在锁回调里调用内核通知不出问题。
 - **演示命令**：
@@ -464,8 +468,8 @@ for i in $(seq 17); do flock ~/mntA/home/shared/lk -c true & done; time ls ~/mnt
 wait
 python3 -c "import mmap,os; f=os.open(os.path.expanduser('~/mntA/home/shared/x'),os.O_RDWR); mmap.mmap(f,0)"   # 预期：OSError: [Errno 19] No such device
 wmfs set ~/mntA/home trash=7d && echo important > ~/mntA/home/doc && rm ~/mntA/home/doc
-ls ~/mntA/home/.wmfs-trash/                         # 预期：<时间>-<ino>-doc
-mv ~/mntA/home/.wmfs-trash/*-doc ~/mntA/home/doc && cat ~/mntA/home/doc   # 预期：important
+ls ~/mntA/home/.wmfs-trash/$(id -u)/                # 预期：<时间>-<ino>-doc（回收站按文件属主分子目录，只有你自己看得到，ADR-0043 第 1 条）
+mv ~/mntA/home/.wmfs-trash/$(id -u)/*-doc ~/mntA/home/doc && cat ~/mntA/home/doc   # 预期：important
 wmfs dev down
 scripts/accept.sh M12
 ```
@@ -474,7 +478,7 @@ scripts/accept.sh M12
   - **字节范围锁与 flock**：程序可以锁住文件的一段（fcntl）或整个文件（flock），别的程序要等它释放。在 wmfs 里锁存在元数据服务里，所以不同机器之间也互斥。拿到锁时客户端会丢掉旧缓存，放锁前会先把数据写出去——"锁就是同步点"。等锁是客户端自己隔一会儿问一次（不保证先来先得），这样等锁的程序再多也不会把挂载点卡住。
   - **strong 一致性**：在设了 `consistency=strong` 的目录里，客户端不缓存任何东西，每次读都先问最新长度，每次写都同步提交。代价是慢，好处是任何两台机器之间"写完立刻可见"。
   - **O_APPEND 偏移分配**：多个机器同时往一个文件末尾追加时，由元数据服务原子地分配"你写在哪个位置"，所以不会互相覆盖。
-  - **回收站 / ttl**：`trash` 让 rm 变成"移进回收站"，到期才真删；`ttl` 让过期文件自动删除。它们都只是目录属性，由后台任务执行。
+  - **回收站 / ttl**：`trash` 让 rm 变成"移进回收站"（按文件的属主分开放，每个人只看得到自己的），到期才真删；`ttl` 让过期文件自动删除。它们都只是目录属性，由后台任务执行。
 
 ### M13 存储类 + 放置 + QoS + 分层（约 1,350 行）
 

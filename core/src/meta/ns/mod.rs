@@ -15,7 +15,12 @@
 //! - [`file_ops`]：CommitWrite、Fallocate、GetInline、RenewCap，以及服务端 uninline 的只读前半段（M5）；SetAtime（M6，relatime 批量）；
 //!   ReopenHandle（M7，ADR-0037 第 4 条：经句柄重新取 layout）
 //!
-//! 实现注记（M4）：`GetLock`/`SetLock`/`AppendReserve`（M12）还没有实现，回 `FEATURE_UNSUPPORTED`；回收站（M12）、递归计数（M7）、
+//! - [`trash`]：回收站（M12：unlink 与被覆盖的 rename 目标移进 `.wmfs-trash/<文件属主的 uid>/`（ADR-0043 第 1 条）、mv 出来即恢复、
+//!   trash-expire 与 ttl 任务的删除）
+//!
+//! 实现注记（M12）：`GetLock`/`SetLock` 在 `meta/locks.rs`，`AppendReserve` 在 `file_ops.rs`；[`audit_of`] 给执行器"被拒绝的修改在
+//! audited 时也写一条 changelog"用（3.4.1.4 的 run_one）。
+//! 实现注记（M4）：`GetLock`/`SetLock`/`AppendReserve` 与回收站（M12 已实现，见上）、递归计数（M7）、
 //! 配额（M10）、目录属性的继承（M7）随各自的里程碑加入（M7 已实现递归计数与属性继承：见 `meta/rstat.rs`、`meta/attrs.rs`；M10 已实现
 //! 配额：`meta/quota.rs`——open/create/CommitWrite 的 `quota_end`、精确检查与护栏）。实现注记（M5）：`StatFs`（要心跳报上来的 target
 //! 容量，`meta/cluster/targets.rs`）与 `Uninline`（要经数据面写 chunk，`meta/uninline.rs`）由元数据服务另外处理。实现注记（M6）：
@@ -31,10 +36,13 @@ pub mod read_ops;
 pub mod remove;
 pub mod rename;
 pub mod setattr;
+pub mod trash;
 pub mod xattr;
 
 use crate::base::ErrCode;
+use crate::meta::changelog::Subject;
 use crate::meta::engine::txn::{KvScan, OpCtx, TxnOp};
+use crate::meta::locks::{self, SetLockIn};
 use crate::meta::sessions::{self, OpenInfo};
 use crate::proto::meta::{MetaOp, MetaReply};
 
@@ -87,6 +95,13 @@ pub fn txn_op(op: MetaOp) -> Option<TxnOp> {
         MetaOp::Fallocate { ino, offset, len, mode } => {
             Box::new(move |v, c| file_ops::fallocate(v, c, ino, offset, len, mode))
         }
+        MetaOp::AppendReserve { ino, epoch, len } => {
+            Box::new(move |v, c| file_ops::append_reserve(v, c, ino, epoch, len))
+        }
+        MetaOp::SetLock { ino, owner, pid, start, end, kind } => {
+            let r = SetLockIn { ino, owner, pid, start, end, kind };
+            Box::new(move |v, c| locks::set_lock(v, c, &r))
+        }
         _ => return None,
     })
 }
@@ -106,6 +121,7 @@ pub fn is_read(op: &MetaOp) -> bool {
             | MetaOp::GetInline { .. }
             | MetaOp::RenewCap { .. }
             | MetaOp::ReopenHandle { .. }
+            | MetaOp::GetLock { .. }
     )
 }
 
@@ -123,6 +139,37 @@ pub fn read(v: &dyn KvScan, c: &OpCtx, op: &MetaOp) -> Result<MetaReply, ErrCode
         MetaOp::GetInline { ino } => file_ops::get_inline(v, c, *ino),
         MetaOp::RenewCap { ino, write } => file_ops::renew_cap(v, c, *ino, *write),
         MetaOp::ReopenHandle { ino, write } => file_ops::reopen_handle(v, c, *ino, *write),
+        MetaOp::GetLock { ino, owner, start, end, write } => locks::get_lock(v, c, *ino, *owner, *start, *end, *write),
         _ => Err(ErrCode::FEATURE_UNSUPPORTED),
+    }
+}
+
+/// 一个客户端的修改型请求被拒绝时，changelog 里记成什么（`audit` 生效时被拒绝的修改也写一条，3.4.1.4 的 run_one；实现注记（M12））：
+/// 操作名（ADR-0029 的表）、对象与它所在的目录（rename 还有目标目录与名字）。不审计的请求（会话、锁、atime）→ None。
+pub fn audit_of(op: &MetaOp) -> Option<Subject> {
+    let s = |op, ino, parent, name: &[u8]| Some(Subject { op, ino, parent, name: name.to_vec(), ..Default::default() });
+    match op {
+        MetaOp::Create { parent, name, .. } => s("Create", 0, *parent, name),
+        MetaOp::Mkdir { parent, name, .. } => s("Mkdir", 0, *parent, name),
+        MetaOp::Mknod { parent, name, .. } => s("Mknod", 0, *parent, name),
+        MetaOp::Symlink { parent, name, .. } => s("Symlink", 0, *parent, name),
+        MetaOp::Link { ino, new_parent, new_name } => s("Link", *ino, *new_parent, new_name),
+        MetaOp::Unlink { parent, name } => s("Unlink", 0, *parent, name),
+        MetaOp::Rmdir { parent, name } => s("Rmdir", 0, *parent, name),
+        MetaOp::Rename { parent, name, new_parent, new_name, .. } => Some(Subject {
+            op: "Rename",
+            parent: *parent,
+            name: name.clone(),
+            new_parent: *new_parent,
+            new_name: new_name.clone(),
+            ..Default::default()
+        }),
+        MetaOp::SetAttr { ino, .. } | MetaOp::TruncateHandle { ino, .. } => s("SetAttr", *ino, 0, b""),
+        MetaOp::SetXattr { ino, .. } => s("SetXattr", *ino, 0, b""),
+        MetaOp::RemoveXattr { ino, .. } => s("RemoveXattr", *ino, 0, b""),
+        MetaOp::CommitWrite { ino, .. } | MetaOp::Fallocate { ino, .. } | MetaOp::AppendReserve { ino, .. } => {
+            s("SetSize", *ino, 0, b"")
+        }
+        _ => None,
     }
 }

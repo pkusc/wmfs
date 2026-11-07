@@ -12,7 +12,7 @@ use wmfs_core::buf::PoolConfig;
 use wmfs_core::init::{JoinOpts, Profile, join_node, read_master};
 use wmfs_mgr::api::ApiClient;
 
-use super::{admin_key, dev_target, health, mgmt_addr, node_dir, nodes, ports, running_pid, start, stop};
+use super::{admin_key, dev_target, health, log_path, mgmt_addr, node_dir, nodes, ports, running_pid, start, stop};
 use crate::registry;
 
 /// 等元数据成员齐、等一个重启的节点追上的期限。
@@ -76,6 +76,9 @@ pub fn wait_members(d: &Path, count: u32) -> Result<String, String> {
             Ok(r) => format!("voter {:?}，learner {:?}", r.voters, r.learners),
             Err(e) => e.to_string(),
         };
+        if let Some(n) = (1..=count).find(|n| running_pid(d, *n).is_none()) {
+            return Err(exited(d, n)); // 不用等满期限（例如旧里程碑建的开发集群：插件清单不一致，节点以退出码 3 退出）
+        }
         if clock::mono_ms() > deadline {
             return Err(format!(
                 "{} s 内元数据成员没有到齐（要 {want} 个 voter，元数据成员都追上；现在：{last}）",
@@ -139,9 +142,21 @@ pub fn restart_all(d: &Path) -> Result<Vec<String>, String> {
     let deadline = clock::mono_ms() + 1500; // 清单不一致的节点在启动后约 1.2 s 退出（3.7.2：1 s 后退出）
     while clock::mono_ms() < deadline {
         if let Some(n) = all.iter().find(|n| running_pid(d, **n).is_none()) {
-            return Err(format!("node{n} 起来之后又退出了（插件配置与集群插件清单不一致？看 wmfs dev logs {n}）"));
+            return Err(exited(d, *n));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(lines)
+}
+
+/// 第 n 个节点起来之后又退出了：日志最后说插件清单不一致 → 给出修法（旧里程碑建的开发集群多了新插件时也是这样，roadmap §0 第 3 条）。
+fn exited(d: &Path, n: u32) -> String {
+    let log = std::fs::read_to_string(log_path(d, n)).unwrap_or_default();
+    if log.lines().rev().take(50).any(|l| l.contains("与集群插件清单不一致")) {
+        return format!(
+            "node{n} 因插件清单与集群插件清单不一致退出了（wmfs dev logs {n}）：开发集群是旧里程碑建的 → wmfs dev down --purge 之后\
+             重新 wmfs dev up；改过 wmfs cluster plugins → 先改好各节点的 node.toml，再 wmfs dev restart-all"
+        );
+    }
+    format!("node{n} 起来之后又退出了（看 wmfs dev logs {n}）")
 }

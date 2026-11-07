@@ -1,10 +1,12 @@
 //! 连接故障的组件测试：发送队列满就断开；body / bulk 的 CRC 不对就断开；冒充的服务端（server_proof 不对）被客户端拒绝；
+//! 对端在握手里没声明 feature 位时，要它的请求不发、回 `EOPNOTSUPP`（ADR-0043 第 3 条）；
 //! OneWay 帧也过角色权限表；回复的 bulk 被丢弃时这次调用按 BUSY 结束；回复超过上限时只让这一个请求失败；
-//! 流式回复中途被丢弃或显式报错时，客户端的流立即结束（design.md 3.3.1、3.3.2、3.3.3、3.3.8、3.6.3、3.6.4）。
+//! 流式回复中途被丢弃或显式报错时，客户端的流立即结束（design.md 3.2.11、3.3.1、3.3.2、3.3.3、3.3.8、3.6.3、3.6.4）。
 
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::mpsc::{Sender, channel};
 use std::time::{Duration, Instant};
 
 use wmfs_core::api::metrics;
@@ -12,13 +14,16 @@ use wmfs_core::base::ErrCode;
 use wmfs_core::base::config::NetConfig;
 use wmfs_core::base::types::Role;
 use wmfs_core::buf::Lane;
+use wmfs_core::client::meta_client::{Caller, MetaClient, SessionInfo};
 use wmfs_core::net::client::{Endpoint, Family, RpcClient, check_reply};
 use wmfs_core::net::server::{Responder, Service};
 use wmfs_core::proto::frame::{
-    FLAG_HAS_BULK, FrameHeader, FrameKind, InFrame, MAX_BODY, MSG_META_CALL, MSG_PING, MSG_RAFT, MSG_SNAPSHOT_FETCH,
-    OutFrame,
+    FLAG_HAS_BULK, FrameHeader, FrameKind, InFrame, MAX_BODY, MSG_META_CALL, MSG_NODE_CALL, MSG_PING, MSG_RAFT,
+    MSG_SNAPSHOT_FETCH, OutFrame,
 };
 use wmfs_core::proto::handshake::{Hello, PingBody};
+use wmfs_core::proto::meta::{MetaCall, MetaOp, MetaReply};
+use wmfs_core::proto::peer::NodeReply;
 use wmfs_core::proto::{decode_body, encode_body};
 use wmfs_testkit::harness::net::*;
 
@@ -88,6 +93,62 @@ fn client_rejects_a_server_with_a_wrong_server_proof() {
     let r = c.call(&ep, Family::Data, frame(MSG_PING, b""), T);
     assert_eq!(r.err(), Some(ErrCode::AUTH_FAILED), "server_proof 不对 = 冒充的服务端（双向认证）");
     fake.join().unwrap();
+}
+
+/// 假的元数据服务端：握手时回 `Challenge.features = 0`（`fake_server_finish`：什么 feature 也不声明），之后 GetClusterMap 回一张空的
+/// 集群图、SessionOpen 回会话、别的元数据请求回 Ok，并把收到的元数据请求的名字交给 `seen`。每条连接一个线程（本机别的程序也可能连上来）。
+fn featureless_meta_server(l: TcpListener, seen: Sender<String>) {
+    for s in l.incoming() {
+        let (Ok(mut s), seen) = (s, seen.clone()) else { continue };
+        std::thread::spawn(move || {
+            let Ok((h, body)) = raw_recv(&mut s) else { return };
+            let Ok(hello) = decode_body::<Hello>(&body) else { return };
+            if fake_server_finish(&mut s, &key(2), &hello, h.req_id, true).is_err() {
+                return;
+            }
+            while let Ok((h, body)) = raw_recv(&mut s) {
+                let reply = match h.msg_type {
+                    MSG_NODE_CALL => encode_body(&NodeReply::Map(Box::default())),
+                    MSG_META_CALL => {
+                        let Ok(call) = decode_body::<MetaCall>(&body) else { return };
+                        let _ = seen.send(call.op.name().to_string());
+                        match call.op {
+                            MetaOp::SessionOpen { .. } => {
+                                encode_body(&MetaReply::Session { lease_ms: 30_000, map_epoch: 0 })
+                            }
+                            _ => encode_body(&MetaReply::Ok),
+                        }
+                    }
+                    _ => continue, // 保活 Ping：不用回
+                };
+                if raw_send(&mut s, FrameKind::Response, h.msg_type, h.req_id, &reply).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// 对端在握手里没声明 `FEAT_LOCKS` / `FEAT_STRONG`：setlk（SetLock）、getlk（GetLock）、strong 的追加（AppendReserve）不发、回
+/// `EOPNOTSUPP`；别的请求照常发（3.2.11 第 3 条：新的消息变体只能在对端声明支持之后发，ADR-0043 第 3 条）。
+#[test]
+fn lock_and_append_requests_are_not_sent_to_a_peer_without_the_feature() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let (tx, rx) = channel();
+    std::thread::spawn(move || featureless_meta_server(l, tx));
+    let ep = Endpoint { node: 1, addrs: vec![("tcp".into(), addr)] };
+    let meta = MetaClient::connect(client("tcp", key(2), Role::Client), &[ep], SessionInfo::default()).unwrap();
+    let who = Caller { uid: 1000, gid: 1000, groups: vec![], pid: 1, job_id: 0 };
+    let setlk = MetaOp::SetLock { ino: 18, owner: 1, pid: 1, start: 0, end: 9, kind: 2 };
+    assert_eq!(meta.write(&who, setlk), Err(ErrCode::EOPNOTSUPP), "对端没声明 FEAT_LOCKS：setlk 回 EOPNOTSUPP");
+    let getlk = MetaOp::GetLock { ino: 18, owner: 1, start: 0, end: 9, write: true };
+    assert_eq!(meta.read(&who, getlk), Err(ErrCode::EOPNOTSUPP));
+    let append = MetaOp::AppendReserve { ino: 18, epoch: 1, len: 10 };
+    assert_eq!(meta.write(&who, append), Err(ErrCode::EOPNOTSUPP), "对端没声明 FEAT_STRONG");
+    assert_eq!(meta.read(&who, MetaOp::GetAttr { ino: 18 }), Ok(MetaReply::Ok), "别的请求照常发");
+    // 同一条连接上的请求按顺序处理：GetAttr 回来了，之前发出的都已经被看到
+    assert_eq!(rx.try_iter().collect::<Vec<_>>(), ["SessionOpen", "GetAttr"], "要 feature 位的三个请求一个也没发出去");
 }
 
 #[test]

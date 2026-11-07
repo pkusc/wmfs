@@ -61,6 +61,10 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     s.bg_task(Box::new(wmfs_plugins::reconciler::Reconciler::new()));
     #[cfg(feature = "scrub")]
     s.bg_task(Box::new(wmfs_plugins::scrub::Scrub::new()));
+    #[cfg(feature = "trash-expire")]
+    s.bg_task(Box::new(wmfs_plugins::trash_expire::TrashExpire::new()));
+    #[cfg(feature = "ttl")]
+    s.bg_task(Box::new(wmfs_plugins::ttl::Ttl::new()));
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST); // embedded-kv：代码在 core（元数据 Raft 是契约，4.10）
     if !cfg.plugins.dylib.is_empty() {
         return Err("node.toml 的 [plugins] dylib：动态库插件 M14 才支持".into());

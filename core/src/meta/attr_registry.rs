@@ -3,7 +3,8 @@
 //! 知道注册表）：按逗号切成片段；`k=v` 且 k 是顶层属性名 → 开始一个新属性；k 是当前属性的子键 → 归到当前属性；其他 → "未知属性 k"。
 //!
 //! M7 的键：class、replicas、chunk、stripe、inline、checksum、consistency（`cto` 与子键 `attr_ttl`；`strong` 在 M12 之前回
-//! `EOPNOTSUPP`）、inherit；M10 的 quota、`quota.<类>`、acl.default；M11 的 compress、encrypt（存成数据密钥的数字 id）。
+//! `EOPNOTSUPP`）、inherit；M10 的 quota、`quota.<类>`、acl.default；M11 的 compress、encrypt（存成数据密钥的数字 id）；M12 的 trash、ttl、
+//! audit（`attr_registry/trash_ttl_audit.rs`）与 `consistency=strong`。
 //! 后面里程碑才实现的键（[`LATER`]）与二期功能（ec、snapshot）设置时回 `EOPNOTSUPP`；`wasm:` 开头的值回
 //! `FEATURE_UNSUPPORTED`（"二期功能"，3.7.7）——都不静默接受。
 //!
@@ -21,6 +22,9 @@ use crate::base::{ErrCode, Failed};
 use crate::data::format::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::meta::ns::acl;
 use crate::meta::quota;
+
+pub mod trash_ttl_audit;
+use trash_ttl_audit::{parse_audit, parse_trash, parse_ttl, show_ms};
 
 /// Inherit：取最近的祖先值；Stacked：所有祖先同时生效（配额，M10）；Local：只作用于设置它的目录（inherit）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,8 +88,8 @@ const fn spec(
 const QUOTA_SUBKEYS: &[&str] = &["soft", "grace", "files", "quantum"];
 
 /// 全部键（顺序就是 `wmfs get` 的显示顺序）：M7 的 8 个，M10 的 quota、`quota.<类>`（注册表里写成 `quota.*`，按前缀匹配）、acl.default，
-/// M11 的 compress、encrypt（加在最后：前面的键的位置不变）。
-pub static REGISTRY: [AttrSpec; 13] = [
+/// M11 的 compress、encrypt，M12 的 trash、ttl、audit（加在最后：前面的键的位置不变）。
+pub static REGISTRY: [AttrSpec; 16] = [
     spec(
         "class",
         parse_class,
@@ -119,11 +123,13 @@ pub static REGISTRY: [AttrSpec; 13] = [
     },
     spec("compress", parse_compress, show_as_is, Effect::NewDataAndReconcile, &["lz4", "zstd", "reconciler"]),
     spec("encrypt", parse_encrypt, show_encrypt, Effect::NewDataAndReconcile, &["aes-gcm", "reconciler"]),
+    spec("trash", parse_trash, show_ms, Effect::Immediate, &["trash-expire"]), // 移进回收站是 core 做的，到期真删要有它
+    spec("ttl", parse_ttl, show_ms, Effect::Reconciler, &["ttl"]),
+    AttrSpec { subkeys: &["ops", "uids"], ..spec("audit", parse_audit, show_as_is, Effect::Immediate, &["core"]) },
 ];
 
 /// 后面的里程碑才实现的键：设置 → `EOPNOTSUPP`（`quota.<类>` 按前缀 `quota.` 匹配）。
-pub const LATER: &[(&str, &str)] =
-    &[("trash", "M12"), ("ttl", "M12"), ("audit", "M12"), ("qos", "M13"), ("tier", "M13"), ("locality", "M13")];
+pub const LATER: &[(&str, &str)] = &[("qos", "M13"), ("tier", "M13"), ("locality", "M13")];
 /// 二期功能的键（第 5 章）：设置 → `EOPNOTSUPP`"二期功能"。
 const PHASE2: &[&str] = &["ec", "snapshot"];
 
@@ -206,12 +212,6 @@ fn parse_one(s: &'static AttrSpec, key: String, v: &str, subs: &[(String, String
     if v.starts_with("wasm:") {
         return Err(Failed::new(ErrCode::FEATURE_UNSUPPORTED, format!("{}={v}：wasm: 策略是二期功能", s.key)));
     }
-    if s.key == "consistency" && v == "strong" {
-        return Err(Failed::new(
-            ErrCode::EOPNOTSUPP,
-            "consistency=strong 在 M12 实现，现在只能设 cto（可带 attr_ttl）",
-        ));
-    }
     let shown = || {
         let rest: Vec<String> = subs.iter().map(|(k, x)| format!(",{k}={x}")).collect();
         format!("{key}={v}{}", rest.concat())
@@ -282,10 +282,13 @@ fn parse_checksum(v: &str, subs: &[(String, String)]) -> Result<String, String> 
     }
 }
 
-/// `cto[,attr_ttl=<0–10s>]` → `cto` 或 `cto,attr_ttl=<毫秒>`（strong 在 `parse_one` 里先挡掉了）。
+/// `cto[,attr_ttl=<0–10s>]` → `cto` 或 `cto,attr_ttl=<毫秒>`；`strong`（M12）不带子键（它不缓存属性）。
 fn parse_consistency(v: &str, subs: &[(String, String)]) -> Result<String, String> {
+    if v == "strong" && subs.is_empty() {
+        return Ok("strong".into());
+    }
     if v != "cto" {
-        return Err("应是 cto 或 strong".into());
+        return Err("应是 cto 或 strong（strong 不缓存属性，不带 attr_ttl）".into());
     }
     match subs {
         [] => Ok("cto".into()),
