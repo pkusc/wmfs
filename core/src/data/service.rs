@@ -25,6 +25,8 @@
 //! 4 MiB 计（conn 线程上不 stat 盘；偶尔的 16/32 MiB chunk 少算一点）。
 //! 实现注记（M13 收尾）：排队位置除了整个节点 4096 个，每个 QoS 队列（后台请求算一个）最多 512 个，超了只对这个请求回 `BUSY`
 //! （ADR-0044 第 6 条，`slots.rs`）；设了 `latency_target` 的类的客户端请求在回复成功发出时记下从到达到完成的时长（第 5 条，`latency.rs`）。
+//! 实现注记（M14 收尾，ADR-0045 第 9 条）：慢日志的各阶段耗时——入队前"decode"、出队时"排队"（QoS 队列）、校验完"authz"、读盘或本地
+//! 写完"磁盘"；写的其余阶段在 write.rs（等这个 chunk、磁盘）与 forward.rs（转发、提交）里记。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
@@ -43,6 +45,7 @@ use crate::hooks::traits::{BG_QUEUE, CODEC_REPLICA, QosItem, QosSpec, QueueKey, 
 use crate::meta::cluster::chains::SERVING;
 use crate::meta::cluster::classes::{PRIORITY_LOW, cost, per_node};
 use crate::net::server::{Responder, Service};
+use crate::obs::stages::Stage;
 use crate::proto::cap::{self, CapV1, RIGHT_ADMIN, RIGHT_READ, RIGHT_WRITE};
 use crate::proto::data::{DataCall, DataOp, DataReply};
 use crate::proto::frame::InFrame;
@@ -149,6 +152,7 @@ impl Service for DataService {
             Ok(c) => c,
             Err(e) => return r.error(e, 0),
         };
+        r.set_op(call.op.name()); // span 里的操作名（M14）
         let peek = match cap::peek(&call.cap) {
             Ok(c) => c,
             Err(e) => return r.error(e, 0),
@@ -168,6 +172,7 @@ impl Service for DataService {
             r.on_done(Box::new(move |d| node.latency.record(key.class_id, clock::mono_ms(), us(d))));
         }
         let queue = if background { BG_QUEUE } else { key };
+        r.mark(Stage::Decode);
         let job = Job { work: Work::Data(call), bulk: f.bulk, r, queue };
         self.enqueue(job, key, peek.job_id, bytes, background, spec);
     }
@@ -223,6 +228,7 @@ enum Done {
 
 fn handle(node: &Arc<DataNode>, job: Job) {
     let Job { work, bulk, r, .. } = job;
+    r.mark(Stage::Queue); // 在 QoS 队列里等的时间（见文件头）
     let call = match work {
         Work::Data(c) => c,
         Work::Peer(op) => {
@@ -232,19 +238,26 @@ fn handle(node: &Arc<DataNode>, job: Job) {
             };
         }
     };
-    match exec(node, call, bulk) {
-        Ok(Done::Reply(body, bulk)) => r.reply(body, bulk.map(|b| vec![b.freeze().whole()]).unwrap_or_default()),
+    match exec(node, call, bulk, &r) {
+        Ok(Done::Reply(body, bulk)) => {
+            r.mark(Stage::Disk);
+            r.reply(body, bulk.map(|b| vec![b.freeze().whole()]).unwrap_or_default())
+        }
         Ok(Done::Write(mut w)) => {
+            r.mark(Stage::Authz);
             w.reply = Some(r);
             write::submit(node, w);
         }
-        Ok(Done::Relay(op, succ, ok)) => forward::relay(node, op, succ, r, ok),
+        Ok(Done::Relay(op, succ, ok)) => {
+            r.mark(Stage::Disk);
+            forward::relay(node, op, succ, r, ok)
+        }
         Err(Fail(e, extra)) => r.error(e, extra),
     }
 }
 
-/// 校验并执行一个请求（见文件头）。
-fn exec(node: &Arc<DataNode>, call: DataCall, bulk: Option<Buf>) -> Result<Done, Fail> {
+/// 校验并执行一个请求（见文件头）；校验完、读写盘之前在回复句柄 `r` 上记"authz"（回复由调用者发）。
+fn exec(node: &Arc<DataNode>, call: DataCall, bulk: Option<Buf>, r: &Responder) -> Result<Done, Fail> {
     let cap = cap::verify(&node.cap_key, &call.cap)?;
     let map = node.map.get().ok_or(ErrCode::NOT_READY)?; // 还没拉到集群图（刚启动）
     if cap.session != 0 && map.evicted.iter().any(|(s, _)| *s == cap.session) {
@@ -262,6 +275,7 @@ fn exec(node: &Arc<DataNode>, call: DataCall, bulk: Option<Buf>) -> Result<Done,
                 node.craq.dirty_reads.inc(); // 正忙或有未提交版本、本成员不是 last serving：改问 L（3.4.2.5、ADR-0041 第 15 条）
                 return Err(Fail(ErrCode::CHUNK_DIRTY, l.unwrap_or(0) as u64));
             }
+            r.mark(Stage::Authz);
             let (buf, n, version) = read::read(node, t, &chunk, off, len)?;
             Ok(Done::Reply(encode_body(&DataReply::Read { len: n, version }), (n > 0).then_some(buf)))
         }
@@ -280,6 +294,7 @@ fn exec(node: &Arc<DataNode>, call: DataCall, bulk: Option<Buf>) -> Result<Done,
             for c in &chunks {
                 cap.allows(c, RIGHT_READ | RIGHT_WRITE, now)?;
             }
+            r.mark(Stage::Authz);
             node.store(|| t.store.sync(&chunks))?;
             let op = PeerOp::ForwardSync { chain, chain_ver, from_target: t.id, chunks };
             Ok(relay_or_reply(&map, chain, op, encode_body(&DataReply::Ok)))
@@ -293,6 +308,7 @@ fn exec(node: &Arc<DataNode>, call: DataCall, bulk: Option<Buf>) -> Result<Done,
             if t.read_only() {
                 return Err(ErrCode::EROFS.into()); // 只读的 target 不写盘（启动时就只读的与运行中坏了的都是，见文件头）
             }
+            r.mark(Stage::Authz);
             replica::drop_epoch(node, chain, ino, epoch);
             let files = node.store(|| t.store.delete_epoch(chain, ino, epoch))?;
             let op = PeerOp::ForwardDeleteEpoch { chain, chain_ver, from_target: t.id, ino, epoch };

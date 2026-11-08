@@ -1,7 +1,7 @@
 //! 金样：M11 管理端点（后台任务、本节点进度、数据密钥）的 JSON 逐字固定。
 
 use super::*;
-use crate::types::same;
+use crate::types::{NodeInfoReply, same};
 
 #[test]
 fn tasks_and_datakeys_json_golden() {
@@ -33,15 +33,18 @@ fn tasks_and_datakeys_json_golden() {
         node_id: 2,
         controlled: true,
         tasks: vec![TaskInfo { runs_on: RUNS_ON_EVERY_NODE.into(), node: 2, ..t }],
+        ..Default::default()
     };
     assert!(serde_json::to_string(&n).unwrap().starts_with(
         r#"{"node_id":2,"controlled":true,"tasks":[{"kind":"reconciler","runs_on":"every-node","node":2,"#
     ));
-    // 只做数据的节点（M11 审查，ADR-0042 第 12 条）；线上的取值（ADR-0042 第 4 条）
+    // 只做数据的节点（M11 审查，ADR-0042 第 12 条）；线上的取值（ADR-0042 第 4 条）；M14 只增的四个字段（老的回复里没有也能解出来）
     same(
-        &NodeInfoReply { node_id: 4, controlled: false, tasks: vec![] },
-        r#"{"node_id":4,"controlled":false,"tasks":[]}"#,
+        &NodeInfoReply { node_id: 4, controlled: false, ..Default::default() },
+        r#"{"node_id":4,"controlled":false,"tasks":[],"boot_id":"","targets":[],"pool":[],"threads":0}"#,
     );
+    let old: NodeInfoReply = serde_json::from_str(r#"{"node_id":4,"controlled":false,"tasks":[]}"#).unwrap();
+    assert_eq!(old, NodeInfoReply { node_id: 4, ..Default::default() });
     assert_eq!((RUNS_ON_LEADER, RUNS_ON_EVERY_NODE), ("leader", "every-node"));
     assert_eq!((STATE_RUNNING, STATE_PAUSED, STATE_DONE), ("running", "paused", "done"));
     same(&DataKeyCreateReq { name: "k1".into(), tenant: 0 }, r#"{"name":"k1","tenant":0}"#);

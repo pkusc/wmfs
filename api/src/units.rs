@@ -1,8 +1,10 @@
-//! 尺寸与时长的解析和显示（design.md 第 5 章："尺寸单位二进制（K = 1024）；时长 s/m/h/d"）。
+//! 尺寸、时长与时刻的解析和显示（design.md 第 5 章："尺寸单位二进制（K = 1024）；时长 s/m/h/d"）。
 //!
-//! 属性、node.toml、命令行参数都用这里的函数：`4M`、`64K`、`1G`、`16MiB` → 字节数；
+//! 属性、node.toml、命令行参数、告警规则都用这里的函数：`4M`、`64K`、`1G`、`16MiB` → 字节数；
 //! `30s`、`500ms`、`7d`、`500us` → 时长（不带单位的整数按秒）。显示时取能整除的最大单位，
-//! 例如 4194304 → `4M`（目录属性的值存规范化后的数字，显示时再换回来）。
+//! 例如 4194304 → `4M`（目录属性的值存规范化后的数字，显示时再换回来）。[`utc_string`]：日志与 CLI 显示的 UTC 时刻。
+//! 实现注记（M14）：从 core/base 挪进 wmfs-api——wmfs-mgr（不依赖 core）的告警规则时长、日志时刻、审计文件的日期与 core 用同一套
+//! 写法（core 里 `base::units`、`base::log::utc_string` 照旧可用，是重新导出）。
 
 use std::time::Duration;
 
@@ -83,6 +85,24 @@ pub fn fmt_duration(d: Duration) -> String {
     format!("{us}us")
 }
 
+/// Unix 毫秒 → `YYYY-MM-DDTHH:MM:SS.mmmZ`（UTC；按 Howard Hinnant 的 civil_from_days 算法）。
+/// 思路：公历每 400 年（146 097 天）完全重复一次；把"一年"看成从 3 月 1 日开始，闰日 2 月 29 日就落在年末，
+/// 于是每个月的起始天数可以用一个线性公式算出来。
+pub fn utc_string(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400)); // 1970-01-01 起的天数、当天的第几秒
+    let z = days + 719_468; // 改成从 0000-03-01 起算的天数
+    let era = z.div_euclid(146_097); // 第几个 400 年周期
+    let doe = z.rem_euclid(146_097); // 周期内的第几天（0..=146 096）
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // 周期内的第几年（0..=399），已扣掉闰日
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // 这一年（从 3 月 1 日起）的第几天（0..=365）
+    let mp = (5 * doy + 2) / 153; // 从 3 月起算的月份（0 = 3 月 …… 11 = 次年 2 月）
+    let day = doy - (153 * mp + 2) / 5 + 1; // 当月第几天（1..=31）
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // 换回 1..=12
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 }; // 1、2 月属于"下一年"
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z", sod / 3600, sod % 3600 / 60, sod % 60, ms % 1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +147,14 @@ mod tests {
         for bad in ["", "s", "5x", "5 sec", "1.5s"] {
             assert!(parse_duration(bad).is_err(), "应拒绝 {bad:?}");
         }
+    }
+
+    #[test]
+    fn utc_formatting() {
+        assert_eq!(utc_string(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(utc_string(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
+        assert_eq!(utc_string(951_782_400_000), "2000-02-29T00:00:00.000Z", "闰日");
+        assert_eq!(utc_string(1_792_454_400_000), "2026-10-20T00:00:00.000Z");
     }
 
     #[test]

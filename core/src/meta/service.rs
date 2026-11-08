@@ -28,6 +28,8 @@
 //! 原因（例如插件清单的差异）放在 ERROR 帧的 `ErrorBody.msg` 里（`Responder::error_with`）。
 //! 实现注记（M11）：NodeCall 加了 `CheckEpochs`（数据节点的本地孤儿扫描问 (ino, epoch) 死了没有）与 `ReportCorrupt`（scrub 修好或修不了
 //! 一个坏块，leader 写 changelog），都在 `meta/data_reports.rs`。
+//! 实现注记（M14 收尾，ADR-0045 第 9 条）：慢日志的各阶段耗时——解出请求记"decode"；修改型请求的其余阶段在执行器里记（`TxnRequest`）；
+//! 只读请求在 meta-read 线程上记"排队"与"执行"（后者含 ReadIndex 与 authz：要分开就得改 `MetaEngine::read` 的接口，最小方案不分）。
 
 use std::sync::{Arc, OnceLock};
 
@@ -49,6 +51,7 @@ use crate::meta::schema::keys;
 use crate::meta::sessions::{self, Live};
 use crate::meta::uninline::{self, InFlight};
 use crate::net::server::{Responder, Service};
+use crate::obs::stages::{Stage, Stages};
 use crate::proto::frame::{InFrame, MSG_NODE_CALL};
 use crate::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
 use crate::proto::peer::{NodeOp, NodeReply};
@@ -125,6 +128,7 @@ impl MetaService {
                 .name(format!("meta-read-{i}"))
                 .spawn(move || {
                     while let Ok(j) = rx.recv() {
+                        j.r.mark(Stage::Queue); // 等 meta-read 线程的时间（慢日志的各阶段耗时，ADR-0045 第 9 条）
                         let name = j.op.name();
                         if let ReadOp::Node(NodeOp::Join(req)) = j.op {
                             match join::join(&*shared.eng, &j.ctx, req) {
@@ -136,7 +140,9 @@ impl MetaService {
                             }
                             continue;
                         }
-                        stats.reply_raw(j.r, name, read_job(&shared, &j.ctx, j.op));
+                        let out = read_job(&shared, &j.ctx, j.op);
+                        j.r.mark(Stage::Exec); // 只读请求的"执行"含 ReadIndex 与 authz（见文件头）
+                        stats.reply_raw(j.r, name, out);
                     }
                 })
                 .map_err(|e| format!("起 meta-read 线程失败：{e}"))?;
@@ -172,10 +178,12 @@ impl MetaService {
         }
     }
 
-    fn txn(&self, ctx: ReqCtx, name: &'static str, op: TxnOp, after: AfterOk, reject: Option<Subject>, r: Responder) {
+    fn txn(&self, ctx: ReqCtx, name: &'static str, op: TxnOp, after: AfterOk, rej: Option<Subject>, mut r: Responder) {
         let (stats, live, eng) = (self.stats.clone(), self.shared.live.clone(), self.eng.clone());
         let (session, seq) = (ctx.session, ctx.seq);
-        let done = Box::new(move |res: Result<MetaReply, ErrCode>| {
+        let stages = r.take_stages(); // 各阶段耗时带进执行器（它拿不到回复句柄），随 done 交回（ADR-0045 第 9 条）
+        let done = Box::new(move |res: Result<MetaReply, ErrCode>, stages: Stages| {
+            r.set_stages(stages);
             if res.is_ok() {
                 match after {
                     AfterOk::Nothing => {}
@@ -192,14 +200,16 @@ impl MetaService {
             }
             stats.reply(r, name, res)
         });
-        self.eng.txn(TxnRequest { ctx, op, done, exclusive: false, on_reject: reject });
+        self.eng.txn(TxnRequest { ctx, op, done, exclusive: false, on_reject: rej, stages });
     }
 
-    fn node_call(&self, f: InFrame, r: Responder) {
+    fn node_call(&self, f: InFrame, mut r: Responder) {
         let op = match decode_body::<NodeOp>(&f.body) {
             Ok(op) => op,
             Err(e) => return r.error(e, 0),
         };
+        r.set_op(op.name()); // span 里的操作名（M14；客户端取集群图带 trace_id）
+        r.mark(Stage::Decode);
         match op {
             NodeOp::GetClusterMap { since_epoch } => {
                 let id = r.identity();
@@ -228,7 +238,7 @@ impl ReadOp {
 }
 
 impl Service for MetaService {
-    fn call(&self, f: InFrame, r: Responder) {
+    fn call(&self, f: InFrame, mut r: Responder) {
         if f.hdr.msg_type == MSG_NODE_CALL {
             return self.node_call(f, r);
         }
@@ -237,6 +247,7 @@ impl Service for MetaService {
             Err(e) => return r.error(e, 0), // 不认识的变体 → FEATURE_UNSUPPORTED，不断开（3.3.2）
         };
         let name = call.op.name();
+        r.set_op(name); // span 里的操作名（M14）
         let after = match call.op {
             MetaOp::SessionOpen { .. } => AfterOk::SessionOpened,
             MetaOp::SessionClose => AfterOk::SessionClosed,
@@ -252,6 +263,7 @@ impl Service for MetaService {
                 Err(e) => return self.stats.reply(r, name, Err(e)),
             }
         };
+        r.mark(Stage::Decode);
         match call.op {
             MetaOp::DebugPut { key, value } => {
                 if let Err(e) = self.debug_allowed(&r) {

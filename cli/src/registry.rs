@@ -75,8 +75,8 @@ pub fn build_plugins(cfg: &NodeConfig) -> Result<PluginSet, String> {
     #[cfg(feature = "rebalance")]
     s.bg_task(Box::new(wmfs_plugins::rebalance::Rebalance::new()));
     s.meta_engine(&wmfs_core::meta::engine::MANIFEST); // embedded-kv：代码在 core（元数据 Raft 是契约，4.10）
-    if !cfg.plugins.dylib.is_empty() {
-        return Err("node.toml 的 [plugins] dylib：动态库插件 M14 才支持".into());
+    for path in &cfg.plugins.dylib {
+        s.authz(Arc::new(wmfs_core::hooks::cabi::load(path, &cfg.plugin)?)); // 3.7.6：首发只覆盖 authz；加载失败 = 拒绝启动
     }
     s.validate(&cfg.plugin)?;
     Ok(s)
@@ -154,9 +154,10 @@ pub fn client_transports() -> Result<Vec<Arc<dyn Transport>>, String> {
 
 /// init 写进 GLOBAL plugins 的集群插件清单（3.4.3 第 3 步、3.7.2）= 按 init 写出的 node.toml 装出来的插件清单：init 写的
 /// node.toml 只改了监听地址等部署参数与 profile 停用的插件（`disable`），清单里也不含传输插件（`plugin_list` 只列会影响策略的
-/// 钩子），所以用默认配置加上 `disable` 算就是对的。`wmfs init` 与 `wmfs dev up` 都用它。
-pub fn init_plugin_list(disable: &[String]) -> Result<PluginListV1, String> {
+/// 钩子），所以用默认配置加上 `disable` 算就是对的。`wmfs init` 与 `wmfs dev up` 都用它。`wmfs join` 另带上要加载的动态库插件
+/// （`dylib`，M14：集群清单里有 `authz:deny-uid` 时新节点也要装上它，否则被拒绝加入）。
+pub fn init_plugin_list(disable: &[String], dylib: &[String]) -> Result<PluginListV1, String> {
     let mut cfg = NodeConfig::default();
-    cfg.plugins.disable = disable.to_vec();
+    (cfg.plugins.disable, cfg.plugins.dylib) = (disable.to_vec(), dylib.to_vec());
     build_plugins(&cfg).map(|s| s.plugin_list())
 }

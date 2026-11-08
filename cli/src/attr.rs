@@ -98,7 +98,7 @@ pub fn run<T: Serialize>(
     let r = t.and_then(|t| Ok((client(api, t.cluster)?, t.path)));
     let (c, p) = match r {
         Ok(x) => x,
-        Err(e) => return failed(api.json, &ApiError { status: 0, code: "einval".into(), message: e }),
+        Err(e) => return failed(api.json, &ApiError::new(0, "einval", e)),
     };
     match call(&c, &p) {
         Ok(r) if api.json => out(serde_json::to_string(&r).unwrap_or_default()),
@@ -171,9 +171,7 @@ pub fn get(a: GetArgs) -> i32 {
 /// `wmfs get <path> <key>` 的 key 不在回复里：回复列着全部能查的键，所以它不是能查的键。
 fn no_such_key(k: &str, r: &AttrGetReply) -> ApiError {
     let have: Vec<&str> = r.attrs.iter().map(|e| e.key.as_str()).collect();
-    ApiError {
-        status: 0, code: "einval".into(), message: format!("没有属性 {k}（能查的有 {}）", have.join("、"))
-    }
+    ApiError::new(0, "einval", format!("没有属性 {k}（能查的有 {}）", have.join("、")))
 }
 
 pub fn unset(a: UnsetArgs) -> i32 {

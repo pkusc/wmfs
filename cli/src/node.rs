@@ -1,8 +1,8 @@
 //! `wmfs init`、`wmfs join`、`wmfs server`、`wmfs debug gen-key`（design.md 3.4.3、7.2）。
 //!
 //! 实现注记（M8）：`wmfs join <任一节点的 rpc 地址> --cluster-key F --data-dir D [--addr A] [--rpc-port P] [--mgmt-port M]
-//! [--meta auto|none] [--target PATH[:labels]]… [--disable 插件]… [--no-start]`：按本节点的 node.toml（`--disable` 写进
-//! `[plugins] disable`）装出插件清单，向集群发 Join；插件清单与集群不一致被拒绝时打印差异并以**退出码 3** 结束（与运行中的节点发现
+//! [--meta auto|none] [--target PATH[:labels]]… [--disable 插件]… [--dylib F]… [--no-start]`：按本节点的 node.toml（`--disable` 写进
+//! `[plugins] disable`，M14 的 `--dylib` 写进 `[plugins] dylib`）装出插件清单，向集群发 Join；插件清单与集群不一致被拒绝时打印差异并以**退出码 3** 结束（与运行中的节点发现
 //! 不一致时退出的码相同，3.7.2）。成功后像 init 一样前台运行 server。`wmfs server --adopt-local-plugins` 是 3.7.2 第 5 条的逃生口。
 
 use std::path::{Path, PathBuf};
@@ -73,6 +73,9 @@ pub struct JoinArgs {
     /// 停用一个插件（写进 node.toml 的 [plugins] disable；插件清单与集群不一致会被拒绝加入）
     #[arg(long)]
     disable: Vec<String>,
+    /// 加载一个动态库插件（.so，写进 node.toml 的 [plugins] dylib；集群插件清单里有它时必须带上，否则被拒绝加入）
+    #[arg(long)]
+    dylib: Vec<String>,
     /// 只加入，不在前台运行 server
     #[arg(long)]
     pub no_start: bool,
@@ -93,7 +96,7 @@ pub fn join(a: JoinArgs) -> i32 {
         "none" => false,
         m => return fail(format!("--meta {m:?}：只能是 auto 或 none")),
     };
-    let plugins = match registry::init_plugin_list(&a.disable) {
+    let plugins = match registry::init_plugin_list(&a.disable, &a.dylib) {
         Ok(p) => p,
         Err(e) => return fail(e),
     };
@@ -114,6 +117,7 @@ pub fn join(a: JoinArgs) -> i32 {
         host_id: None,
         plugins,
         disable: a.disable,
+        dylib: a.dylib,
         targets,
         meta_auto,
         transports,
@@ -150,7 +154,7 @@ pub fn init(a: InitArgs) -> i32 {
         failpoints_api: false,
         debug_ops: false,
         host_id: None,
-        plugins: match registry::init_plugin_list(&profile.disabled_plugins()) {
+        plugins: match registry::init_plugin_list(&profile.disabled_plugins(), &[]) {
             Ok(p) => p,
             Err(e) => return fail(e),
         },

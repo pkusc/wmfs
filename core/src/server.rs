@@ -83,6 +83,7 @@ pub fn start(
 ) -> Result<Running, String> {
     let log_path = data_dir.join("logs/server.log");
     log::set_file(&log_path).map_err(|e| format!("打开日志 {} 失败：{e}", log_path.display()))?;
+    crate::obs::trace::set_slow_ms(cfg.obs.slow_meta_ms, cfg.obs.slow_data_ms); // 慢请求日志的阈值（node.toml [obs]，M14 审查）
     let node = NodeFile::read(data_dir)?;
     let cluster_id = node.cluster_id_bytes()?;
     let master = read_master(data_dir)?;
@@ -161,7 +162,8 @@ pub fn start(
     let wrapper =
         Arc::new(Wrapper { pipeline: pipeline.clone(), pool: pool.clone(), key: wrap_key(&master), cluster_id });
     data_side.node.keys.set_wrap(wrapper.clone()); // 数据节点解包数据密钥用（M11）
-    let bg = Bg { tasks, board: board.clone(), run_dir: data_dir.join("run") };
+    let (boot_id, data_node) = (rand::random_u64().max(1), data_side.node.clone()); // boot_id 0 = 不核对 I5（data/chain.rs）
+    let bg = Bg { tasks, board: board.clone(), run_dir: data_dir.join("run"), boot_id };
     start_background(cfg, &meta, &svc, on_keys, me.clone(), data_side, bg)?;
     let (eng, mine, scheme) = (meta.clone(), me.clone(), cfg.net.control_scheme.clone());
     rpc.set_leader_hint(Arc::new(move || {
@@ -194,6 +196,8 @@ pub fn start(
         wrapper: Some(wrapper),
         live: Some(svc.live()),
         qos: pipeline.qos_call().map(|(q, _)| q.clone()),
+        data: Some(data_node),
+        boot_id,
     };
     if let Err(e) = mgmt.start(Arc::new(ctx)) {
         let _ = std::fs::remove_file(&pid_file);
@@ -204,11 +208,13 @@ pub fn start(
     Ok(Running { node_id: node.node_id, addrs, mgmt_addr, rpc, meta, pid_file })
 }
 
-/// 后台调度器要的本节点的东西（M11）：后台任务、进度板（管理 API 也看它）、本地任务的游标目录。
+/// 后台调度器要的本节点的东西（M11）：后台任务、进度板（管理 API 也看它）、本地任务的游标目录；本次启动的 boot_id（心跳报它，
+/// `GET /api/v1/node` 也显示它，M14）。
 struct Bg {
     tasks: Vec<Box<dyn BgTask>>,
     board: Arc<TaskBoard>,
     run_dir: PathBuf,
+    boot_id: u64,
 }
 
 /// 数据面里监听之前就建好的东西（[`open_data`]）。
@@ -267,7 +273,7 @@ fn start_background(
     });
     let machine_id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default().trim().to_string();
     let host_id = cfg.debug.host_id.clone().unwrap_or_else(|| machine_id.clone());
-    let (boot_id, pipeline) = (rand::random_u64().max(1), side.node.pipeline.clone()); // 0 = 不核对 I5（data/chain.rs）
+    let (boot_id, pipeline) = (bg.boot_id, side.node.pipeline.clone());
     let eng = meta.clone();
     let on_map: Arc<dyn Fn(&ClusterMap) + Send + Sync> = Arc::new(move |m| {
         on_keys(m);

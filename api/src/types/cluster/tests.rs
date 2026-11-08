@@ -39,11 +39,17 @@ fn cluster_json_golden() {
         voters_outgoing: vec![],
         nodes: vec![node()],
         warnings: vec!["w".into()],
+        targets: vec![ClusterTarget { id: 4, node: 2, state: "offline".into() }],
+        chains: 3,
+        sessions: 1 << 33,
     };
     let want = format!(
-        r#"{{"leader":1,"term":7,"commit":17179869184,"applied":9,"voters":[1,2,3],"learners":[4],"voters_outgoing":[],"nodes":[{NODE}],"warnings":["w"]}}"#
+        r#"{{"leader":1,"term":7,"commit":17179869184,"applied":9,"voters":[1,2,3],"learners":[4],"voters_outgoing":[],"nodes":[{NODE}],"warnings":["w"],"targets":[{{"id":4,"node":2,"state":"offline"}}],"chains":3,"sessions":8589934592}}"#
     );
     same(&c, &want);
+    let old = r#"{"leader":1,"term":7,"commit":1,"applied":1,"voters":[1],"learners":[],"voters_outgoing":[],"nodes":[],"warnings":[]}"#;
+    let r: ClusterReply = serde_json::from_str(old).unwrap();
+    assert_eq!((r.targets.len(), r.chains, r.sessions), (0, 0, 0), "M14 之前的回复也解得出来（只增）");
     same(&NodeOpReply { node: node(), message: "m".into() }, &format!(r#"{{"node":{NODE},"message":"m"}}"#));
     let h = MetaHashReply { node_id: 3, applied: 1 << 35, state_version: 5, keys: 12, hash: "ab".repeat(16) };
     let want =
@@ -72,4 +78,17 @@ fn chains_json_golden() {
         &format!(r#"{{"chains":[{one}],"warnings":["w"]}}"#),
     );
     same(&ForceServingReq { i_accept_data_loss: true }, r#"{"i_accept_data_loss":true}"#);
+}
+
+#[test]
+fn features_json_golden() {
+    let f = FeaturesReply {
+        enabled: vec!["chunk.snapshots".into()],
+        nodes: vec![
+            NodeFeatures { node_id: 2, features: vec!["chunk.snapshots".into(), "meta.ec-layout".into()] },
+            NodeFeatures { node_id: 3, features: vec![] },
+        ],
+    };
+    let want = r#"{"enabled":["chunk.snapshots"],"nodes":[{"node_id":2,"features":["chunk.snapshots","meta.ec-layout"]},{"node_id":3,"features":[]}]}"#;
+    same(&f, want);
 }

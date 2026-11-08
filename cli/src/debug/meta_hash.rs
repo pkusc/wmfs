@@ -26,7 +26,7 @@ struct Report {
 }
 
 pub fn meta_hash(api: &ApiArgs) -> i32 {
-    let bad = |message| failed(api.json, &wmfs_mgr::api::ApiError { status: 0, code: "einval".into(), message });
+    let bad = |message| failed(api.json, &wmfs_mgr::api::ApiError::new(0, "einval", message));
     let cluster = match cluster_addrs(&api.cluster) {
         Ok(c) => c,
         Err(e) => return bad(e),

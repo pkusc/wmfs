@@ -8,6 +8,8 @@
 //! 每个批次开始时从批次的读事务里取一份集群图快照（`OpCtx.map`，按 map_epoch 缓存）：placement 读它，所以生成了新链的
 //! 操作之后本批结束（规则 5），下一批的快照里就有新链。实现注记（M7）：批次没有成功应用（作废、丢失、没进日志、fail point）时清空
 //! 目录属性的解析缓存——它可能装着按这一批的覆盖层算出的项（`meta/attrs.rs` 的文件头）。
+//! 实现注记（M14 收尾，ADR-0045 第 9 条）：每个请求的各阶段耗时（`TxnRequest.stages`）在这里记三段——取到它时"排队"（等执行器，含同一批
+//! 里排在前面的请求）、闭包跑完"执行"（其中 authz、quota 由闭包经 `OpCtx::mark` 单记）、批次有了结局"raft 提交"——随 `done` 交回。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,7 +20,7 @@ use wmfs_api::failpoint::fail_point;
 
 use super::dedup;
 use super::engine::{EngineShared, OpEnv};
-use super::txn::{TxnOp, TxnRequest};
+use super::txn::{TxnDone, TxnOp, TxnRequest};
 use super::view::{BatchView, ReadView};
 use crate::base::ErrCode;
 use crate::base::types::ReqCtx;
@@ -27,6 +29,7 @@ use crate::meta::raft::driver::ProposeOutcome;
 use crate::meta::raft::{or_abort, storage};
 use crate::meta::schema::records::WriteBatchV1;
 use crate::meta::sessions;
+use crate::obs::stages::{Stage, Stages};
 use crate::proto::meta::{DEDUP_WINDOW, MetaReply};
 use crate::proto::peer::ClusterMap;
 
@@ -34,12 +37,11 @@ use crate::proto::peer::ClusterMap;
 const MAX_BATCH_OPS: usize = 256;
 const MAX_BATCH_BYTES: usize = 768 << 10;
 
-type Done = Box<dyn FnOnce(Result<MetaReply, ErrCode>) + Send>;
-
 /// 一个已经执行、等批次结果的请求。
 struct Executed {
-    done: Done,
+    done: TxnDone,
     result: Result<MetaReply, ErrCode>,
+    stages: Stages,
 }
 
 /// 执行器线程本体：没有请求就一直睡（没有定时工作要做）；请求通道断开就退出。
@@ -49,9 +51,9 @@ pub(crate) fn run(rx: Receiver<TxnRequest>, shared: Arc<EngineShared>) {
         if !role.ready {
             // 非 leader、新 leader 尚未应用本 term 的空条目、或插件清单不一致（3.4.1.4 规则 3）
             let code = if role.role == StateRole::Leader { ErrCode::NOT_READY } else { ErrCode::NOT_LEADER };
-            (first.done)(Err(code));
+            (first.done)(Err(code), first.stages);
             while let Ok(r) = rx.try_recv() {
-                (r.done)(Err(code));
+                (r.done)(Err(code), r.stages);
             }
             continue;
         }
@@ -62,12 +64,12 @@ pub(crate) fn run(rx: Receiver<TxnRequest>, shared: Arc<EngineShared>) {
         let (results, trace_ids) = fill(&mut view, first, &rx, &shared.env, &map);
         if view.is_empty() {
             // 只可能全是"已提交的事实"：去重命中、会话已驱逐、内部 CAS 前提不成立
-            results.into_iter().for_each(|e| (e.done)(e.result));
+            results.into_iter().for_each(|e| (e.done)(e.result, e.stages));
             continue;
         }
         if let Err(c) = fail_point("meta.exec.before_propose") {
             shared.env.attrs.clear(); // 这一批的覆盖层作废：按它算出的属性缓存也作废（meta/attrs.rs 的文件头）
-            results.into_iter().for_each(|e| (e.done)(Err(ErrCode(c))));
+            results.into_iter().for_each(|e| (e.done)(Err(ErrCode(c)), e.stages));
             continue;
         }
         let (n, bytes) = (results.len(), view.encoded_len());
@@ -80,7 +82,8 @@ pub(crate) fn run(rx: Receiver<TxnRequest>, shared: Arc<EngineShared>) {
             shared.env.attrs.clear(); // 批次没有（或不确定有没有）应用：按它的覆盖层算出的属性缓存作废
         }
         for e in results {
-            (e.done)(settle(outcome, e.result));
+            e.stages.mark(Stage::Raft);
+            (e.done)(settle(outcome, e.result), e.stages);
         }
     }
 }
@@ -107,12 +110,14 @@ fn fill(
     let (mut out, mut traces) = (Vec::new(), Vec::new());
     let mut next = Some(first);
     while let Some(req) = next.take() {
+        req.stages.mark(Stage::Queue); // 等执行器的时间（见文件头）
         let end_here = req.exclusive; // 集群拓扑类内部操作：必须是本批最后一个（规则 5）
         if req.ctx.trace_id != 0 {
             traces.push(req.ctx.trace_id);
         }
-        let result = run_one(view, env, map, &req.ctx, req.op, req.on_reject.as_ref());
-        out.push(Executed { done: req.done, result });
+        let result = run_one(view, env, map, &req.ctx, req.op, req.on_reject.as_ref(), &req.stages);
+        req.stages.mark(Stage::Exec);
+        out.push(Executed { done: req.done, result, stages: req.stages });
         if end_here || view.topology_changed() || out.len() >= MAX_BATCH_OPS || view.encoded_len() >= MAX_BATCH_BYTES {
             break;
         }
@@ -132,6 +137,7 @@ fn run_one(
     ctx: &ReqCtx,
     op: TxnOp,
     on_reject: Option<&Subject>,
+    stages: &Stages,
 ) -> Result<MetaReply, ErrCode> {
     if ctx.seq != 0 {
         sessions::usable(view, ctx.session, ctx.who.conn.key_id)?; // 驱逐是单调的事实；会话不能借给别的 key
@@ -140,7 +146,7 @@ fn run_one(
         }
     }
     view.begin_op();
-    let res = op(view, &env.op_ctx(ctx, map)); // 内部调用 authz / quota / placement 钩子
+    let res = op(view, &env.op_ctx(ctx, map, Some(stages))); // 内部调用 authz / quota / placement 钩子
     if res.is_err() {
         view.rollback_op();
     }
@@ -150,7 +156,7 @@ fn run_one(
             dedup::delete(view, ctx.session, ctx.seq - DEDUP_WINDOW); // 点删除，无需扫描
         }
         if let (Err(e), Some(s)) = (&res, on_reject) {
-            let _ = changelog::rejected(view, &env.op_ctx(ctx, map), s, *e); // 尽力而为：读不出属性就不记
+            let _ = changelog::rejected(view, &env.op_ctx(ctx, map, None), s, *e); // 尽力而为：读不出属性就不记
         }
     }
     // 与伪代码"成功 commit_op、失败 rollback_op"等价：失败时操作层已经清空，这里并入批次的只有去重记录

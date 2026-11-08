@@ -25,6 +25,7 @@ use crate::base::types::ChunkId;
 use crate::base::{ErrCode, lock};
 use crate::data::write::WriteJob;
 use crate::net::server::Responder;
+use crate::obs::stages::Stage;
 use crate::proto::data::DataReply;
 use crate::proto::encode_body;
 use crate::proto::peer::PeerReply;
@@ -54,6 +55,18 @@ impl Upstream {
             Upstream::Client(r) | Upstream::Peer(r) => r,
         }
     }
+    /// 上游请求的 (trace_id, span_id)：转发给后继时带上（M14，3.11）。
+    pub fn trace(&self) -> (u64, u16) {
+        match self {
+            Upstream::Client(r) | Upstream::Peer(r) => r.trace(),
+        }
+    }
+    /// 在上游请求的回复句柄上记一个阶段（慢日志的各阶段耗时，ADR-0045 第 9 条）。
+    pub fn mark(&self, s: Stage) {
+        match self {
+            Upstream::Client(r) | Upstream::Peer(r) => r.mark(s),
+        }
+    }
 }
 
 /// 已写好 pending 文件、等后继确认的版本（3.4.2.2 的 PendingWrite）。
@@ -67,6 +80,15 @@ pub struct PendingWrite {
     pub sync: bool,             // O_SYNC：提交前 fdatasync
     pub clean: bool,            // 新版本没有从旧版本原样复制任何块：提交之后可以清除 Corrupt 标记
     pub committed: bool,        // 已在本地提交（3.4.2.6 规则 2：新的 last serving），还要推给后面的成员
+}
+
+impl PendingWrite {
+    /// 在等着回复的上游上记一个阶段（已回过 RETRY、没有上游时什么也不做）。
+    pub fn mark(&self, s: Stage) {
+        if let Some(up) = &self.upstream {
+            up.mark(s);
+        }
+    }
 }
 
 #[derive(Default)]

@@ -1,51 +1,47 @@
-//! RPC 服务端（design.md 1.2、3.3.3、3.12）：accept、每连接读/写线程、握手、角色权限表、分发，以及回复句柄 `Responder`。
+//! RPC 服务端（design.md 1.2、3.3.3、3.12）：accept、每连接读/写线程、握手、角色权限表、分发；回复句柄 `Responder` 在 `server/responder.rs`。
 //!
 //! 每个传输插件 `listen` 交出的连接都由 core 起读线程 `conn-<id>` 与写线程 `conn-w-<id>`（`net/conn.rs`）。读线程先跑
 //! 3.3.2 握手，之后循环收帧 → 核对角色权限（请求与 OneWay 都查：不符的请求回 `EACCES`，不符的 OneWay 丢弃，都计数
 //! `wmfs_rpc_denied_total`）→ 按 msg_type 分发：Ping 由 core 自己原样回显；其他族交给注册的 [`Service`]（M1 还没有；
 //! 没有服务的族 → `FEATURE_UNSUPPORTED`，不断开）。读线程**自己从不执行请求**：服务只把请求连同 `Responder` 交给别的线程。
-//!
-//! `Responder` 按值传递、恰好用一次；回复只是 `try_send` 进连接的发送队列（队列满就断开这条连接，对端会重试），
-//! 所以回复永远不会阻塞执行器或 io 线程。被 Drop 而没有回复时自动回 `EIO` 并计数 `wmfs_req_dropped_total`；
-//! 流式回复的 [`StreamTx`] 没发最后一帧就被 Drop 时也一样。回复超过协议上限时改回 `FEATURE_UNSUPPORTED`（只让这一个请求失败）。
+//! 流式回复的 [`StreamTx`] 没发最后一帧就被 Drop 时也自动回 `EIO`（同 `Responder`）。
 //! 实现注记（M4）：回 `NOT_LEADER` 的 ERROR 帧由 core 自动填 `leader_hint`（[`RpcServer::set_leader_hint`] 登记的函数给出
-//! leader 在 control_scheme 上的 rpc 地址，例如 "127.0.0.1:19100"；不知道 leader 时为 None）；[`Responder::drop_reply`]
-//! 什么也不回、Drop 时也不自动回 EIO（fail point `meta.reply.drop` 用它"弄丢"一次回复）。
+//! leader 在 control_scheme 上的 rpc 地址，例如 "127.0.0.1:19100"；不知道 leader 时为 None）。
 //! 实现注记（M8）：OneWay 帧（RaftMsg）交给 [`RpcServer::add_oneway`] 登记的处理函数（在连接读线程上调用，不得阻塞；bulk 被丢弃的
-//! OneWay 直接丢掉，raft 会重发）；[`Responder::error_with`] 带一句给人看的原因（`ErrorBody.msg`，例如 join 被拒时的插件差异；`NOT_LEADER` 时
-//! 照样自动填 leader_hint——join 发给 follower 也能跟到 leader）；
+//! OneWay 直接丢掉，raft 会重发）；`NOT_LEADER` 时 `Responder::error_with` 照样自动填 leader_hint——join 发给 follower 也能跟到 leader；
 //! [`StreamTx::wait_room`] 让流的发送方（snap-serve）等发送队列腾出地方，不会把整个快照一下子塞进队列。
 //! 实现注记（M10，ADR-0009"已建立的连接在集群图更新时关闭"）：hb 线程每拿到一张集群图就把其中已撤销的 key 交给
 //! [`RpcServer::set_revoked`]；读线程收到下一帧时（只在名单变过之后查一次）发现自己这条连接的 key 已撤销 → 不处理、关闭连接。
-//! 实现注记（M13 收尾，ADR-0044 第 5 条）：[`Responder::on_done`] 登记"回复成功发出之后"的回调（时长从收到请求算起，与每个消息族的
-//! 耗时直方图同一个起点）：数据节点按存储类统计客户端请求的延迟；消息族的指标拆到 `server/stats.rs`。
+//! 实现注记（M13 收尾）：消息族的指标拆到 `server/stats.rs`。实现注记（M14 收尾）：`Responder` 拆到 `server/responder.rs`
+//! （它要带上各阶段耗时，ADR-0045 第 9 条）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Duration, Instant};
 
 use wmfs_api::metrics;
 
 use crate::base::config::NetConfig;
 use crate::base::types::Role;
 use crate::base::{ErrCode, log};
-use crate::buf::{BufSlice, MemPool};
+use crate::buf::MemPool;
 use crate::hooks::manifest::Hook;
 use crate::hooks::pipeline::{HookCall, Pipeline};
 use crate::hooks::traits::{Conn, ConnIdentity, KeyLookup, Transport};
 use crate::net::conn::{self, ConnHandle, ConnOpts, recv_checked};
 use crate::net::handshake::{self, ServerSide};
+use crate::proto::decode_body;
 use crate::proto::frame::{
-    ErrorBody, FLAG_ERROR, FrameHeader, FrameKind, InFrame, MSG_DATA_CALL, MSG_META_CALL, MSG_NODE_CALL, MSG_PEER_CALL,
-    MSG_PING, MSG_RAFT, MSG_SNAPSHOT_FETCH, OutFrame, msg_name,
+    FrameKind, InFrame, MSG_DATA_CALL, MSG_META_CALL, MSG_NODE_CALL, MSG_PEER_CALL, MSG_PING, MSG_RAFT,
+    MSG_SNAPSHOT_FETCH, msg_name,
 };
 use crate::proto::handshake::PingBody;
 use crate::proto::peer::NodeOp;
-use crate::proto::{decode_body, encode_body};
 
+mod responder;
 mod stats;
 mod stream;
+pub use responder::{DoneFn, Responder};
 use stats::FamilyStats;
 pub use stream::StreamTx;
 
@@ -207,7 +203,8 @@ impl RpcServer {
         if !allowed(id.role, hdr.msg_type, &f.body) {
             denied(id.role, family);
             if hdr.kind == FrameKind::Request {
-                Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type), hint).error(ErrCode::EACCES, 0);
+                Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type), hint, self.id.node_id)
+                    .error(ErrCode::EACCES, 0);
             }
             return;
         }
@@ -218,7 +215,7 @@ impl RpcServer {
             }
             return;
         }
-        let r = Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type), hint);
+        let r = Responder::new(h.clone(), &hdr, self.stats(hdr.msg_type), hint, self.id.node_id);
         if f.bulk_dropped {
             return r.error(ErrCode::BUSY, 0); // 内存池 100 ms 内没有空槽：bulk 已读出丢弃，让对端退避重试
         }
@@ -264,104 +261,4 @@ fn ping(f: InFrame, r: Responder) {
     }
     let bulk = f.bulk.map(|b| vec![b.freeze().whole()]).unwrap_or_default();
     r.reply(f.body, bulk);
-}
-
-/// 回复成功发出之后调一次，参数是从收到请求到回复发出的时长（数据节点按存储类统计延迟，ADR-0044 第 5 条）。
-pub type DoneFn = Box<dyn FnOnce(Duration) + Send>;
-
-/// 服务端对一个请求的回复句柄：按值传递，恰好用一次
-pub struct Responder {
-    conn: ConnHandle,
-    req_id: u64,
-    msg_type: u16,
-    trace_id: u64,
-    span_id: u16,
-    done: bool,
-    stats: Arc<FamilyStats>, // 指标句柄（第一次用到这个族时注册好的）
-    t0: Instant,
-    hint: Option<HintFn>,
-    on_done: Option<DoneFn>,
-}
-
-impl Responder {
-    fn new(conn: ConnHandle, req: &FrameHeader, stats: Arc<FamilyStats>, hint: Option<HintFn>) -> Responder {
-        let (req_id, msg_type, trace_id, span_id) = (req.req_id, req.msg_type, req.trace_id, req.span_id);
-        let (done, t0, on_done) = (false, Instant::now(), None);
-        Responder { conn, req_id, msg_type, trace_id, span_id, done, stats, t0, hint, on_done }
-    }
-    /// 登记回复成功发出之后要调的 [`DoneFn`]（回 ERROR 帧、被 Drop 而没有回复时不调）。
-    pub fn on_done(&mut self, f: DoneFn) {
-        self.on_done = Some(f);
-    }
-    /// 编成 Response 帧，ConnHandle::send（try_send，不阻塞）
-    pub fn reply(mut self, body: Vec<u8>, bulk: Vec<BufSlice>) {
-        let f = OutFrame { hdr: self.header(), body, bulk, recv_into: None };
-        self.finish(f, ErrCode(0));
-    }
-    /// ERROR 帧；leader_hint 由 core 自动填（`NOT_LEADER` 时问 [`RpcServer::set_leader_hint`] 登记的函数）
-    pub fn error(self, code: ErrCode, extra: u64) {
-        self.error_body(ErrorBody::new(code, extra));
-    }
-    /// ERROR 帧，带一句给人看的原因（`ErrorBody.msg`；默认是错误码名）；leader_hint 与 [`Responder::error`] 一样自动填。
-    pub fn error_with(self, code: ErrCode, msg: String) {
-        self.error_body(ErrorBody { msg, ..ErrorBody::new(code, 0) });
-    }
-    fn error_body(mut self, mut body: ErrorBody) {
-        let code = ErrCode(body.code);
-        body.leader_hint = self.hint.as_ref().filter(|_| code == ErrCode::NOT_LEADER).and_then(|f| f());
-        let f = error_frame(self.header(), body);
-        self.finish(f, code);
-    }
-    /// 什么也不回（Drop 时也不自动回 EIO）：对端等到超时后用同一个 seq 重试。只给 fail point `meta.reply.drop` 用。
-    pub fn drop_reply(mut self) {
-        self.done = true;
-    }
-    pub fn identity(&self) -> &ConnIdentity {
-        self.conn.identity()
-    }
-    /// 改成流式回复（SnapshotFetch，3.4.1.7）：之后用 [`StreamTx`] 发若干 StreamChunk 帧，最后一帧带 LAST_CHUNK。
-    /// 这个请求在流结束时（最后一帧、`StreamTx::error`，或 StreamTx 被丢弃）才计入指标。
-    pub fn into_stream(mut self) -> StreamTx {
-        self.done = true;
-        StreamTx::new(self.conn.clone(), self.header(), self.stats.clone(), self.t0)
-    }
-
-    fn header(&self) -> FrameHeader {
-        let mut h = FrameHeader::new(FrameKind::Response, self.msg_type, self.req_id, self.trace_id);
-        h.span_id = self.span_id;
-        h
-    }
-
-    fn finish(&mut self, f: OutFrame, code: ErrCode) {
-        self.done = true;
-        let code = match self.conn.send(f) {
-            // 回复超过协议上限（body > 1 MiB，或 bulk > 16 MiB + 128 KiB）：改回一个 ERROR 帧，只让这一个请求失败（3.3.8）
-            Err(ErrCode::FEATURE_UNSUPPORTED) => {
-                let _ = self.conn.send(error_frame(self.header(), ErrorBody::new(ErrCode::FEATURE_UNSUPPORTED, 0)));
-                ErrCode::FEATURE_UNSUPPORTED
-            }
-            _ => code, // 其他失败 = 连接已断，对端会重连重试
-        };
-        self.stats.record(code, self.t0);
-        if let Some(f) = self.on_done.take().filter(|_| code == ErrCode(0)) {
-            f(self.t0.elapsed());
-        }
-    }
-}
-
-impl Drop for Responder {
-    fn drop(&mut self) {
-        if !self.done {
-            // 没回复过 → 回 EIO，计数 wmfs_req_dropped_total
-            conn::counters().req_dropped.inc();
-            let f = error_frame(self.header(), ErrorBody::new(ErrCode::EIO, 0));
-            self.finish(f, ErrCode::EIO);
-        }
-    }
-}
-
-/// 一个 ERROR 帧（flags 带 ERROR，body 是 ErrorBody）；`hdr` 是这个请求的回复帧头。
-fn error_frame(mut hdr: FrameHeader, body: ErrorBody) -> OutFrame {
-    (hdr.kind, hdr.flags) = (FrameKind::Response, FLAG_ERROR);
-    OutFrame { hdr, body: encode_body(&body), bulk: vec![], recv_into: None }
 }

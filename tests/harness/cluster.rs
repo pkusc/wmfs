@@ -95,6 +95,7 @@ impl Cluster {
             host_id: Some(format!("host-{i}")),
             plugins: plugins(&cfg).plugin_list(),
             disable: cfg.plugins.disable.clone(),
+            dylib: vec![],
             targets: self.target(i),
             meta_auto: true,
             transports: vec![Arc::new(tcp::TcpTransport::new(&Default::default(), 5000).unwrap())],

@@ -150,6 +150,7 @@ impl Ns {
             settings: &m.settings,
             cap_key: &CAP_KEY,
             usage: &self.usage,
+            stages: None,
         };
         let r = f(&mut v, &c);
         if r.is_ok() {
@@ -176,6 +177,7 @@ impl Ns {
             settings: &m.settings,
             cap_key: &CAP_KEY,
             usage: &self.usage,
+            stages: None,
         };
         f(&self.kv, &c)
     }

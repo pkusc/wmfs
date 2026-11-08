@@ -5,6 +5,10 @@
 //! 判定与修改之间没有 TOCTOU 窗口。执行器闭包里只允许按已知 key 点查（没有 scan），不得做网络 IO、不得睡眠。
 //!
 //! 接口骨架（M0）：签名以这里为准；实现（M3）在同目录的 engine.rs、executor.rs、view.rs、read_gate.rs、dedup.rs。
+//! 实现注记（M14 收尾，ADR-0045 第 9 条，只增）：`TxnRequest.stages` 带着这个请求的各阶段耗时（`obs::stages`）进执行器，执行器记排队、
+//! 执行、raft 提交，随 `done` 交回；闭包里的 authz、quota 经 `OpCtx::mark` 记（只读请求与内部调用的 `OpCtx` 没有它，什么也不记）。
+
+use std::time::Instant;
 
 use crate::base::ErrCode;
 use crate::base::types::ReqCtx;
@@ -14,6 +18,7 @@ use crate::meta::attrs::AttrResolver;
 use crate::meta::changelog::Subject;
 use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::schema::records::ClusterSettingsV1;
+use crate::obs::stages::{Stage, Stages};
 use crate::proto::meta::MetaReply;
 use crate::proto::peer::ClusterMap;
 
@@ -76,10 +81,11 @@ pub fn txn_blocking_exclusive(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp) -> R
 
 fn blocking(eng: &dyn MetaEngine, ctx: ReqCtx, op: TxnOp, exclusive: bool) -> Result<MetaReply, ErrCode> {
     let (tx, rx) = crossbeam_channel::bounded(1);
-    let done = Box::new(move |r| {
+    let done = Box::new(move |r, _stages: Stages| {
         let _ = tx.try_send(r);
     });
-    eng.txn(TxnRequest { ctx, op, done, exclusive, on_reject: None });
+    let stages = Stages::new(Instant::now()); // 内部调用不写慢日志：各阶段耗时丢掉
+    eng.txn(TxnRequest { ctx, op, done, exclusive, on_reject: None, stages });
     rx.recv().unwrap_or(Err(ErrCode::NOT_LEADER))
 }
 
@@ -92,6 +98,16 @@ pub struct OpCtx<'a> {
     pub settings: &'a ClusterSettingsV1,
     pub cap_key: &'a [u8; 32], // 实现注记（M5）：K_cap——Open/Create/改长度的 SetAttr 的回复与后台任务的管理 cap 都在闭包里签
     pub usage: &'a TargetUsage, // 实现注记（M13，只增）：leader 内存里各 target 心跳报的用量（按用量放置、rebalance）
+    pub stages: Option<&'a Stages>, // 实现注记（M14 收尾，只增）：这个请求的各阶段耗时（执行器里的客户端修改才有，见文件头）
+}
+
+impl OpCtx<'_> {
+    /// 走完阶段 `s`（慢日志的各阶段耗时，ADR-0045 第 9 条；没有 `stages` 时什么也不做）。
+    pub fn mark(&self, s: Stage) {
+        if let Some(st) = self.stages {
+            st.mark(s);
+        }
+    }
 }
 
 // ---- 3.4.1.4 串行执行器的请求 ----
@@ -105,10 +121,14 @@ pub type TxnOp = Box<dyn FnOnce(&mut OpView, &OpCtx) -> Result<MetaReply, ErrCod
 pub struct TxnRequest {
     pub ctx: ReqCtx, // principal、session、seq（内部操作为 0）、trace_id、now（leader 墙钟，写进写集）
     pub op: TxnOp,
-    pub done: Box<dyn FnOnce(Result<MetaReply, ErrCode>) + Send>, // RPC 层：编码后经 Responder 回复（只 try_send，不碰 socket）；内部调用者：发进 bounded(1)
-    pub exclusive: bool,                                          // 集群拓扑类内部操作：必须是本批最后一个（规则 5）
+    pub done: TxnDone,
+    pub exclusive: bool,            // 集群拓扑类内部操作：必须是本批最后一个（规则 5）
     pub on_reject: Option<Subject>, // 实现注记（M12，只增）：客户端的修改被拒绝时 changelog 里记成什么（audit 生效时才写，`changelog::rejected`）
+    pub stages: Stages,             // 实现注记（M14 收尾，只增）：各阶段耗时（见文件头），随 done 交回
 }
+
+/// `TxnRequest.done`：RPC 层交回各阶段耗时、编码后经 Responder 回复（只 try_send，不碰 socket）；内部调用者：结果发进 bounded(1)。
+pub type TxnDone = Box<dyn FnOnce(Result<MetaReply, ErrCode>, Stages) + Send>;
 
 // ---- 3.12 ----
 
@@ -232,6 +252,7 @@ mod tests {
             settings: &settings,
             cap_key: &[0; 32],
             usage: &usage,
+            stages: None,
         };
 
         let mut kv = BTreeMap::new();

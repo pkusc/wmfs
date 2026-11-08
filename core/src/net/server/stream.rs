@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::error_frame;
+use super::responder::error_frame;
 use super::stats::FamilyStats;
 use crate::base::ErrCode;
 use crate::buf::BufSlice;

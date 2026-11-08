@@ -103,7 +103,7 @@ fn list(api: &ApiArgs, only: Option<String>) -> i32 {
     let addrs = crate::cluster_addrs(&api.cluster).unwrap_or_default();
     let key = crate::load_key(&api.key_file);
     let call = move |c: &ApiClient, _: &str| {
-        let key = key.map_err(|message| ApiError { status: 0, code: "einval".into(), message })?;
+        let key = key.map_err(|message| ApiError::new(0, "einval", message))?;
         let (mut r, nodes) = all_tasks(c, &addrs, &key)?;
         let mut unreachable = vec![];
         for (addr, n) in nodes {
@@ -115,9 +115,7 @@ fn list(api: &ApiArgs, only: Option<String>) -> i32 {
         if let Some(kind) = &only {
             r.tasks.retain(|t| t.kind == *kind);
             if r.tasks.is_empty() {
-                return Err(ApiError {
-                    status: 404, code: "enoent".into(), message: format!("没有后台任务 {kind}")
-                });
+                return Err(ApiError::new(404, "enoent", format!("没有后台任务 {kind}")));
             }
         }
         Ok(Listed { reply: r, unreachable })
@@ -193,7 +191,7 @@ pub fn run_task(cmd: TaskCmd) -> i32 {
         TaskCmd::Run { kind, api } => send_action(&api, kind, "run", None),
         TaskCmd::Set { kind, spec, api } => match parse_set(&spec) {
             Ok(b) => send_action(&api, kind, "set", Some(b)),
-            Err(m) => crate::attr::failed(api.json, &ApiError { status: 0, code: "einval".into(), message: m }),
+            Err(m) => crate::attr::failed(api.json, &ApiError::new(0, "einval", m)),
         },
     }
 }

@@ -101,7 +101,7 @@ fn upload(api: &ApiArgs, file: &PathBuf, call: impl FnOnce(&ApiClient, &[u8]) ->
         Ok(b) => b,
         Err(e) => {
             let message = format!("读 {} 失败：{e}", file.display());
-            return failed(api.json, &ApiError { status: 0, code: "einval".into(), message });
+            return failed(api.json, &ApiError::new(0, "einval", message));
         }
     };
     let shown = |r: &ClassReply| {
@@ -141,8 +141,7 @@ pub fn run_class(cmd: ClassCmd) -> i32 {
         ClassCmd::Show { name, api } => {
             let call = move |c: &ApiClient, _: &str| {
                 let r = c.get::<ClassesReply>("/api/v1/classes")?;
-                let none =
-                    || ApiError { status: 404, code: "enoent".into(), message: format!("没有存储类 {name}") };
+                let none = || ApiError::new(404, "enoent", format!("没有存储类 {name}"));
                 r.classes.into_iter().find(|k| k.name == name).ok_or_else(none)
             };
             run(&api, None, call, show)

@@ -7,9 +7,9 @@
 //! - [`pipeline`]：按 altitude 排好的插件与统一的调用包装（3.7.4、3.12）
 //! - [`policy`]：策略求值点（3.7.7，为二期 WASM 预留）
 //! - [`registry`]：`PluginSet`，即本节点装上的插件与启动校验（3.7.2）；"有哪些插件"的注册表本身在 `cli/src/registry.rs`
-//!
-//! 动态库 C ABI（cabi.rs，3.7.6）在 M14。
+//! - [`cabi`]：动态库插件的稳定 C ABI v1（3.7.6，M14；首发只覆盖 authz，头文件 `core/include/wmfs_plugin.h`）
 
+pub mod cabi;
 pub mod manifest;
 pub mod pipeline;
 pub mod policy;

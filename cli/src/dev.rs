@@ -21,31 +21,33 @@
 //! 全部启动。`dev start n` 最后等这个节点追上（有 leader 时）。`dev leader` 打印就绪 leader 的节点号。
 //! M9：`dev stop n`（SIGTERM）、`dev pause|resume n`（SIGSTOP/SIGCONT，模拟卡死）、`dev restart-all`（`dev/cluster.rs`，3.7.2 第 4 条：
 //! 按各节点当前的 node.toml 依次重启全部节点）、`dev wait chains-serving`（`dev/wait.rs`）、`up --profile nas-safe`。
+//! M14：`dev mgr`（`dev/mgr.rs`；`up --profile nas-safe` 最后自动调用，`down` 先停它）、`dev restart <n> [--dylib F]…` 与
+//! `dev restart-all [--dylib F]…`（先用给出的列表改写 node.toml 的 `[plugins] dylib`，不给 = 清空）、`dev wait alert|audit-caught-up`；
+//! `up` 拆到 `dev/up.rs`（每个文件 ≤ 400 行）。
 
 use std::ffi::OsStr;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use wmfs_core::api::types::{Health, KeyFile};
-use wmfs_core::base::config::{NodeConfig, TargetConfig};
+use wmfs_core::base::config::NodeConfig;
 use wmfs_core::base::sys;
-use wmfs_core::buf::PoolConfig;
-use wmfs_core::client::meta_client::fetch_map;
-use wmfs_core::init::{InitOpts, NodeFile, Profile, init_node};
+use wmfs_core::init::{NodeFile, Profile};
 use wmfs_mgr::api::ApiClient;
 
 use crate::{fail, home, out};
 
 mod cluster;
 mod info;
+mod mgr;
 mod mount;
 mod proc;
 mod rdma;
+mod up;
 mod wait;
 
 use proc::{live_pid, spawn_logged, wait_exit, wait_ready};
-use rdma::set_rdma;
+use up::dev_target;
 
 #[derive(clap::Subcommand)]
 pub enum DevCmd {
@@ -84,8 +86,22 @@ pub enum DevCmd {
     Pause { n: u32 },
     /// 让冻住的第 n 个节点继续运行（SIGCONT）
     Resume { n: u32 },
-    /// 按各节点当前的 node.toml 依次重启全部节点（先 follower、最后 leader，每个都等它追上）：改了插件配置之后用
-    RestartAll,
+    /// 重启第 n 个节点：先用 --dylib 给出的列表改写它 node.toml 的 [plugins] dylib（不给 = 清空列表），再停、再起；起来之后又退出了
+    /// （例如插件集合与集群清单不一致、动态库加载失败）就报错并给出原因
+    Restart {
+        n: u32,
+        /// 动态库插件（.so），可以写多个
+        #[arg(long)]
+        dylib: Vec<String>,
+    },
+    /// 用 --dylib 给出的列表改写每个节点 node.toml 的 [plugins] dylib（不给 = 清空），再依次重启全部节点（先 follower、最后 leader，
+    /// 每个都等它追上）：改了插件配置（wmfs cluster plugins add|remove）之后用
+    RestartAll {
+        #[arg(long)]
+        dylib: Vec<String>,
+    },
+    /// 后台起一个 wmfs mgr（dashboard、告警、审计日志……；监听 127.0.0.1:19090），等它就绪，最后一行打印带 token 的 dashboard 网址
+    Mgr,
     /// 打印第 n 个节点的日志
     Logs { n: u32 },
     /// 打印就绪的元数据 leader 是第几个节点（例如 L=$(wmfs dev leader); wmfs dev kill $L）
@@ -109,7 +125,8 @@ pub enum DevCmd {
     ClientPid { mountpoint: PathBuf },
     /// 等某个条件成立（满足立即返回 0；超时返回 1 并打印当前状态）：leader（有就绪的元数据 leader）、chains-serving（每条链都达到
     /// 期望长度且全部 Serving；等的过程中状态变了就打印一行）、session-evicted <挂载点>（这个挂载的会话被驱逐完）、task-idle <任务>
-    /// （这个后台任务这一轮做完、积压为 0）
+    /// （这个后台任务这一轮做完、积压为 0）、alert <规则> firing|resolved（问 wmfs dev mgr 起的 mgr）、audit-caught-up（audit-log
+    /// 游标追上开始等时最新的 changelog）
     Wait {
         /// 条件（及其参数），例如 leader、chains-serving
         #[arg(required = true, num_args = 1..)]
@@ -134,7 +151,7 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
     }
     let d = std::fs::canonicalize(&d).unwrap_or(d);
     let r = match cmd {
-        DevCmd::Up { nodes, rdma, profile } => Profile::parse(&profile).and_then(|p| up(&d, nodes, rdma, p)),
+        DevCmd::Up { nodes, rdma, profile } => Profile::parse(&profile).and_then(|p| up::up(&d, nodes, rdma, p)),
         DevCmd::Down { purge } => down(&d, purge),
         DevCmd::Env => info::env(&d),
         DevCmd::Status { json } => info::status(&d, json),
@@ -143,7 +160,9 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
         DevCmd::Stop { n } => stop_cmd(&d, n),
         DevCmd::Pause { n } => signal(&d, n, sys::SIGSTOP, "已冻住（SIGSTOP）"),
         DevCmd::Resume { n } => signal(&d, n, sys::SIGCONT, "继续运行（SIGCONT）"),
-        DevCmd::RestartAll => cluster::restart_all(&d),
+        DevCmd::Restart { n, dylib } => cluster::restart(&d, n, &dylib),
+        DevCmd::RestartAll { dylib } => cluster::restart_all(&d, &dylib),
+        DevCmd::Mgr => mgr::start(&d),
         DevCmd::Logs { n } => std::fs::read_to_string(log_path(&d, n))
             .map(|t| vec![t])
             .map_err(|e| format!("读 {} 失败：{e}", log_path(&d, n).display())),
@@ -209,87 +228,6 @@ fn health(d: &Path, n: u32) -> Result<Health, String> {
         return Err(format!("{} 上是别的集群（{}），不是 {}", h.node.mgmt_addr, h.cluster_id, nd.display()));
     }
     Ok(h)
-}
-
-fn up(d: &Path, want: u32, rdma: Option<Ipv4Addr>, profile: Profile) -> Result<Vec<String>, String> {
-    if !(1..=9).contains(&want) {
-        return Err("--nodes 只能是 1–9（第 n 个节点的端口是 19n00、19n80）".into());
-    }
-    std::fs::create_dir_all(d).map_err(|e| format!("建目录 {} 失败：{e}", d.display()))?;
-    let marker = d.join(MARKER);
-    sys::atomic_write(&marker, "wmfs dev 的开发目录（wmfs dev down --purge 只删除带这个标记的目录）\n".as_bytes())
-        .map_err(|e| format!("写 {} 失败：{e}", marker.display()))?;
-    let mut lines = Vec::new();
-    let count = want.max(nodes(d).last().copied().unwrap_or(0)); // 已有更多节点的开发集群：全部启动
-    for n in 1..=count {
-        let nd = node_dir(d, n);
-        if nd.join("NODE").exists() {
-            check_profile(&nd, profile)?;
-        } else if n > 1 {
-            cluster::join(d, n, profile)?; // node1 已经在运行（上一轮起的）
-        } else {
-            let (rpc_port, mgmt_port) = ports(n);
-            let o = InitOpts {
-                data_dir: nd.clone(),
-                addr: "127.0.0.1".into(),
-                rpc_port,
-                mgmt_port,
-                mem: PoolConfig::dev_server(),
-                failpoints_api: true,
-                debug_ops: true, // wmfs debug kv（M3 演示）
-                host_id: Some(format!("host-{n}")),
-                plugins: crate::registry::init_plugin_list(&profile.disabled_plugins())?,
-                targets: vec![dev_target(&nd)],
-                profile,
-            };
-            init_node(&o)?;
-        }
-        if set_rdma(&nd, n, rdma)? && running_pid(d, n).is_some() {
-            lines.push(format!(
-                "node{n} 已在运行：node.toml 里的 RDMA 设置改了，要先 wmfs dev down、再 wmfs dev up 才生效"
-            ));
-        }
-        lines.push(start(d, n)?);
-    }
-    if count > 1 {
-        let m = cluster::wait_members(d, count).map_err(|e| format!("{}\n{e}", lines.join("\n")))?;
-        lines.push(m);
-    }
-    // 取不到集群图 = 没有就绪的 leader（例如旧里程碑建的开发集群插件清单不一致）：大声失败，别让后面的命令白等
-    let ws = warnings(d, 1).map_err(|e| {
-        let log = log_path(d, 1).display().to_string();
-        format!("{}\n节点起来了，但没能取到集群图：{e}（日志 {log}）", lines.join("\n"))
-    })?;
-    lines.extend(ws.iter().map(|w| format!("警告：{w}")));
-    Ok(lines)
-}
-
-/// 开发节点的默认 target（`<节点目录>/targets/1`，容量上限 20 GiB，无标签；init 与 join 共用）。
-fn dev_target(nd: &Path) -> TargetConfig {
-    TargetConfig { path: nd.join("targets/1").display().to_string(), labels: vec![], capacity: "20G".into() }
-}
-
-/// 已有的节点是按 `want` 这个 profile 建的吗（看 node.toml 的 `[plugins] disable`：profile 的初始 KV 写进了元数据库，不能事后
-/// 改写）？不是 → 报错并给出修法。
-fn check_profile(nd: &Path, want: Profile) -> Result<(), String> {
-    let p = nd.join("node.toml");
-    let cfg = NodeConfig::parse(&std::fs::read_to_string(&p).map_err(|e| format!("读 {} 失败：{e}", p.display()))?)?;
-    if cfg.plugins.disable == want.disabled_plugins() {
-        return Ok(());
-    }
-    let was = if cfg.plugins.disable == Profile::Minimal.disabled_plugins() { "minimal" } else { "default" };
-    Err(format!(
-        "{} 是按 --profile {was} 建的开发集群，这次要的是 --profile {}：先 wmfs dev down --purge，再 wmfs dev up",
-        nd.display(),
-        want.name()
-    ))
-}
-
-/// 集群警告（ADR-0016：`wmfs dev up` 的输出里也要看得到）：用这个节点的 admin key 取一次集群图（等 leader 最多 30 s）。
-fn warnings(d: &Path, n: u32) -> Result<Vec<String>, String> {
-    let l = crate::leader::connect(&[mgmt_addr(d, n)?], admin_key(d, n)?)?;
-    let m = fetch_map(l.rpc, &[l.ep], Duration::from_secs(30)).map_err(|e| format!("取集群图失败：{e}"))?;
-    Ok(m.warnings.clone())
 }
 
 /// 启动第 n 个节点（已在运行就只报告），等它就绪：health 有响应，并且 pid 文件里就是这个进程
@@ -368,6 +306,7 @@ fn down(d: &Path, purge: bool) -> Result<Vec<String>, String> {
         return Ok(vec![format!("没有开发集群（{} 不存在）", d.display())]);
     }
     let mut lines = mount::stop_all(d); // 先挂载、后节点：节点停了以后挂载点上的命令会卡到 --op-timeout（7.2 的清理顺序）
+    lines.extend(mgr::stop(d)); // M14：wmfs dev mgr 起的 mgr
     for n in nodes(d) {
         if running_pid(d, n).is_none() {
             continue;

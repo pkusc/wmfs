@@ -1,4 +1,4 @@
-//! M11 的管理端点（design.md 7.1、3.10、4.8）：后台任务、本节点的任务进度、数据加密密钥。
+//! M11 的管理端点（design.md 7.1、3.10、4.8）：后台任务、数据加密密钥（本节点的任务进度 `GET /api/v1/node` 在 `mgmt/node.rs`）。
 //!
 //! - `GET /api/v1/tasks`（只由就绪的元数据 leader 回答）：每个任务一行（`TaskInfo`）。leader 任务 = leader 上调度器此刻的样子（含最近的
 //!   速率；刚当上 leader、还没跑过的用库里持久化的进度）；节点任务 = 集群级记录里的控制字段（`node` 为 0；`runs` = 收到过几次 run），各节点的
@@ -7,17 +7,14 @@
 //!   （`bg::progress::apply_action`，一个批次），changelog `TaskControl`（`extra` = `kind`/`action`，set 另有 `bw`/`items`）；回改完的那一行；
 //!   leader 任务顺手把新的限速与暂停放进本节点的进度板（调度器每秒才读一次控制字段：紧接着的 `wmfs task list` 也看得到）。不认识的任务 →
 //!   404。限速是运维参数（存在 TaskRecV1 里），不是数据策略（3.10）。
-//! - `GET /api/v1/node`（每个节点回答本节点的，需认证）：本节点号、本节点看不看得到任务的控制（`controlled` = 已应用过元数据：只做数据的
-//!   节点为 false）与本节点上节点任务（scrub、gc-local）的进度——`wmfs task list` 与 `wmfs dev wait task-idle` 逐个节点问它。
 //! - `POST /api/v1/datakeys {name, tenant}`（admin）：随机生成一把数据密钥、用 `K_wrap` 包好（`data::datakey`）；一个批次——名字没被用过、
 //!   `next_datakey` 取号、写 DATAKEY 与 DATAKEY_NAME、`map_epoch += 1`（集群图里带着它）、changelog `DataKeyCreate`（`extra` =
 //!   `id`/`name`/`tenant`）；回 `{id, name}`。密钥本身不出现在管理 API 里。
 
 use super::api::{failed_at, read, write};
-use super::auth;
-use super::http::{MgmtCtx, Reply, err, json};
+use super::http::{MgmtCtx, Reply, json};
 use crate::api::types::{
-    DataKeyCreateReply, DataKeyCreateReq, NodeInfoReply, STATE_PAUSED, STATE_RUNNING, TaskInfo, TaskSetReq, TasksReply,
+    DataKeyCreateReply, DataKeyCreateReq, STATE_PAUSED, STATE_RUNNING, TaskInfo, TaskSetReq, TasksReply,
     backlog_in_dirs,
 };
 use crate::base::types::ReqCtx;
@@ -27,7 +24,6 @@ use crate::bg::progress::{self, Action};
 use crate::meta::attr_registry::datakey_name_ok;
 use crate::meta::changelog::{self, Change};
 use crate::meta::engine::EmbeddedEngine;
-use crate::meta::engine::txn::MetaEngine;
 use crate::meta::schema::keys::{self, G_NEXT_DATAKEY};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{DataKeyIdV1, DataKeyV1, TaskRecV1};
@@ -162,15 +158,4 @@ fn datakey(
         changelog::append(v, c, Change { op: "DataKeyCreate", extra, ..Default::default() })?;
         Ok(DataKeyCreateReply { id, name })
     })
-}
-
-/// `GET /api/v1/node`（节点本地，需认证，见文件头）。
-pub(super) fn node_info(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option<&str>, body: &[u8]) -> Reply {
-    if let Err(d) = auth::check(&*ctx.keys, method, url, auth_hdr, body, false) {
-        return err(d.status, d.code, d.message);
-    }
-    let tasks = ctx.board.as_ref().map(|b| b.all()).unwrap_or_default();
-    let tasks = tasks.into_iter().filter(|t| !t.on_leader()).collect();
-    let controlled = ctx.meta.as_ref().is_some_and(|m| m.status().applied > 0); // 只做数据的节点：一个条目也没应用过
-    json(200, &NodeInfoReply { node_id: ctx.health.node.node_id, controlled, tasks })
 }

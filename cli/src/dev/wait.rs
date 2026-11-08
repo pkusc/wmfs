@@ -16,27 +16,34 @@
 //!   false），只看它这一轮做完、积压 0；连不上的节点不当它空闲，一直等到超时，超时信息写出在等哪个节点（ADR-0042 第 12 条）。没有这个
 //!   任务 → 马上失败（不等到超时）。
 //!
-//! 其余条件（`alert`、`audit-caught-up`）随功能在后面的里程碑加入。
+//! - `alert <规则> firing|resolved`（M14）：`wmfs dev mgr` 起的 mgr 的 `GET /alerts` 里这条规则是这个状态（resolved = 触发过、现在已恢复）；
+//!   mgr 没在运行就接着等（超时信息里写着），规则名不存在 → 马上失败。
+//! - `audit-caught-up`（M14）：`audit-log` 游标追上了**开始等时**最新的 changelog seq（之后又有新记录不影响）；还没有这个游标（没有目录
+//!   开过 `audit`）→ 马上失败。
 
 use std::path::Path;
 use std::time::Duration;
 
-use wmfs_core::api::types::{ChainsReply, NodeInfoReply, STATE_DONE, SessionsReply, TaskInfo};
+use wmfs_core::api::types::{ChainsReply, CursorReply, NodeInfoReply, STATE_DONE, SessionsReply, TaskInfo};
 use wmfs_core::base::clock;
 use wmfs_mgr::api::ApiClient;
 
+use super::cluster::api;
 use super::{admin_key, health, mgmt_addr, nodes};
 
 pub fn wait(d: &Path, what: &[String], timeout_s: u64) -> Result<Vec<String>, String> {
     let cond = what.first().map(String::as_str).unwrap_or_default();
-    let (sid, kind) = match (cond, what.get(1)) {
+    // 条件的参数：num = session-evicted 的会话号、audit-caught-up 开始等时最新的 changelog seq；name = 任务名、告警规则名
+    let (num, name) = match (cond, what.get(1)) {
         ("leader" | "chains-serving", None) => (0, String::new()),
         ("session-evicted", Some(mp)) if what.len() == 2 => {
             (super::mount::session_of(d, Path::new(mp))?, String::new())
         }
         ("task-idle", Some(k)) if what.len() == 2 => (0, k.clone()),
+        ("alert", Some(r)) if what.len() == 3 && ["firing", "resolved"].contains(&what[2].as_str()) => (0, r.clone()),
+        ("audit-caught-up", None) => (api(d)?.last_seq().map_err(|e| e.to_string())?, String::new()),
         _ => {
-            let have = "leader、chains-serving、session-evicted <挂载点>、task-idle <任务>（alert 等随功能在后面的里程碑加入）";
+            let have = "leader、chains-serving、session-evicted <挂载点>、task-idle <任务>、alert <规则> firing|resolved、audit-caught-up";
             return Err(format!("不认识的条件 {what:?}：现在有 {have}"));
         }
     };
@@ -47,8 +54,10 @@ pub fn wait(d: &Path, what: &[String], timeout_s: u64) -> Result<Vec<String>, St
         let (ok, now) = match cond {
             "leader" => leader(d),
             "chains-serving" => chains(d),
-            "task-idle" => idle(d, &kind, &mut base)?,
-            _ => evicted(d, sid),
+            "task-idle" => idle(d, &name, &mut base)?,
+            "alert" => alert(d, &name, &what[2])?,
+            "audit-caught-up" => audit(d, num)?,
+            _ => evicted(d, num),
         };
         if ok {
             seen.push(now);
@@ -76,15 +85,15 @@ fn leader(d: &Path) -> (bool, String) {
     (false, if state.is_empty() { format!("{} 里没有开发节点", d.display()) } else { state.join("；") })
 }
 
+/// 用全部开发节点的管理地址 GET 一个依赖元数据的端点（跟随 leader）。
+fn get<T: serde::de::DeserializeOwned>(d: &Path, path: &str) -> Result<T, String> {
+    api(d)?.get(path).map_err(|e| e.to_string())
+}
+
 fn chains(d: &Path) -> (bool, String) {
-    let addrs: Vec<String> = nodes(d).iter().filter_map(|n| mgmt_addr(d, *n).ok()).collect();
-    let key = match admin_key(d, 1) {
-        Ok(k) => k,
-        Err(e) => return (false, e),
-    };
-    let r = match ApiClient::new(addrs, key).get::<ChainsReply>("/api/v1/chains") {
+    let r = match get::<ChainsReply>(d, "/api/v1/chains") {
         Ok(r) => r,
-        Err(e) => return (false, e.to_string()),
+        Err(e) => return (false, e),
     };
     let bad: Vec<String> = r
         .chains
@@ -105,18 +114,13 @@ fn chains(d: &Path) -> (bool, String) {
 }
 
 fn evicted(d: &Path, sid: u64) -> (bool, String) {
-    let addrs: Vec<String> = nodes(d).iter().filter_map(|n| mgmt_addr(d, *n).ok()).collect();
-    let key = match admin_key(d, 1) {
-        Ok(k) => k,
-        Err(e) => return (false, e),
-    };
     let id = format!("{sid:x}");
-    match ApiClient::new(addrs, key).get::<SessionsReply>("/api/v1/sessions") {
+    match get::<SessionsReply>(d, "/api/v1/sessions") {
         Ok(r) => match r.sessions.iter().find(|s| s.id == id) {
             Some(s) => (s.state == "evicted", format!("会话 {id}：{}", s.state.to_uppercase())),
             None => (false, format!("会话 {id} 不在会话列表里（已经正常关闭了？）")),
         },
-        Err(e) => (false, e.to_string()),
+        Err(e) => (false, e),
     }
 }
 
@@ -145,6 +149,32 @@ fn idle(d: &Path, kind: &str, base: &mut Option<(u64, u64)>) -> Result<(bool, St
     let on_nodes: Vec<(String, Result<NodeInfoReply, String>)> =
         on_nodes.into_iter().map(|(a, n)| (label(&a), n)).collect();
     Ok(nodes_idle(kind, r0, &on_nodes))
+}
+
+/// `alert <规则> firing|resolved`（见文件头）。
+fn alert(d: &Path, rule: &str, want: &str) -> Result<(bool, String), String> {
+    let r = match super::mgr::alerts(d) {
+        Ok(r) => r,
+        Err(e) => return Ok((false, format!("mgr 没有回答（{e}；mgr 在运行吗？wmfs dev mgr）"))),
+    };
+    let names: Vec<&str> = r.alerts.iter().map(|a| a.name.as_str()).collect();
+    let a = r
+        .alerts
+        .iter()
+        .find(|a| a.name == rule)
+        .ok_or_else(|| format!("没有告警规则 {rule}（有：{}）", names.join("、")))?;
+    let state = a.state.as_str();
+    Ok((state == want, format!("告警 {rule}：{state}（{}）", a.message)))
+}
+
+/// `audit-caught-up`：audit-log 游标 ≥ 开始等时最新的 seq `want`（见文件头）。
+fn audit(d: &Path, want: u64) -> Result<(bool, String), String> {
+    match api(d)?.get::<CursorReply>("/api/v1/changelog/cursor?name=audit-log") {
+        Ok(c) if c.seq >= want => Ok((true, format!("audit-log 游标 {}：已追上 {want}", c.seq))),
+        Ok(c) => Ok((false, format!("audit-log 游标 {}，要追上 {want}（mgr 在运行吗？wmfs dev mgr）", c.seq))),
+        Err(e) if e.status == 404 => Err("没有 audit-log 游标：没有目录开过 audit（wmfs set <目录> audit=on）".into()),
+        Err(e) => Ok((false, e.to_string())),
+    }
 }
 
 /// 这一轮做完了、积压 0。
@@ -194,7 +224,7 @@ mod tests {
             runs,
             ..Default::default()
         };
-        Ok(NodeInfoReply { node_id: 1, controlled, tasks: vec![t] })
+        Ok(NodeInfoReply { node_id: 1, controlled, tasks: vec![t], ..Default::default() })
     }
 
     /// 节点任务的 task-idle：每个节点都照办了运行请求（只做数据的节点不看）、做完、积压 0；连不上的节点不算空闲，写出在等它。

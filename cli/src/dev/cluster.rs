@@ -1,13 +1,15 @@
 //! `wmfs dev` 的多节点部分（design.md 7.2，roadmap M8）：`dev up --nodes N` 的第 2…N 个节点用 `wmfs join` 的本地侧加入（种子 = node1
 //! 的 rpc 地址，cluster.key 就是 node1 的那个文件——`wmfs dev` 在单机上，3.4.3），起好之后等元数据成员齐了才返回（[`wait_members`]）；
 //! `dev start n` 最后等这个节点追上（[`wait_caught_up`]）；`dev leader` 打印就绪 leader 的节点号（`L=$(wmfs dev leader); wmfs dev kill $L`）。
-//! M9：`dev restart-all`（[`restart_all`]，3.7.2 第 4 条）。
+//! M9：`dev restart-all`（[`restart_all`]，3.7.2 第 4 条）。M14：`dev restart <n>`（[`restart`]）；两者都先用 `--dylib` 给出的列表改写
+//! node.toml 的 `[plugins] dylib`（[`set_dylib`]，不给 = 清空；路径换成绝对路径）。
 
 use std::path::Path;
 use std::time::Duration;
 
 use wmfs_core::api::types::ClusterReply;
-use wmfs_core::base::clock;
+use wmfs_core::base::config::NodeConfig;
+use wmfs_core::base::{clock, sys};
 use wmfs_core::buf::PoolConfig;
 use wmfs_core::init::{JoinOpts, Profile, join_node, read_master};
 use wmfs_mgr::api::ApiClient;
@@ -19,11 +21,13 @@ use crate::registry;
 const MEMBERS_TIMEOUT_MS: u64 = 60_000;
 const CATCH_UP_TIMEOUT_MS: u64 = 30_000;
 
-/// 第 n 个开发节点加入 node1 所在的集群（node1 已经在运行）。
+/// 第 n 个开发节点加入 node1 所在的集群（node1 已经在运行）；动态库插件沿用 node1 的（M14：集群清单里有 `authz:deny-uid` 时新节点
+/// 也要装上它才能加入）。
 pub fn join(d: &Path, n: u32, profile: Profile) -> Result<(), String> {
     let nd = node_dir(d, n);
     let (rpc_port, mgmt_port) = ports(n);
     let disable = profile.disabled_plugins();
+    let dylib = node_config(d, 1)?.plugins.dylib;
     let o = JoinOpts {
         data_dir: nd.clone(),
         seed: format!("127.0.0.1:{}", ports(1).0),
@@ -35,8 +39,9 @@ pub fn join(d: &Path, n: u32, profile: Profile) -> Result<(), String> {
         failpoints_api: true,
         debug_ops: true,
         host_id: Some(format!("host-{n}")),
-        plugins: registry::init_plugin_list(&disable)?,
+        plugins: registry::init_plugin_list(&disable, &dylib)?,
         disable,
+        dylib,
         targets: vec![dev_target(&nd)],
         meta_auto: true,
         transports: registry::client_transports()?,
@@ -44,8 +49,8 @@ pub fn join(d: &Path, n: u32, profile: Profile) -> Result<(), String> {
     join_node(&o).map(|_| ()).map_err(|e| format!("node{n} 加入集群失败：{}（{}）", e.msg, e.code))
 }
 
-/// 用全部开发节点的管理地址问（409 跟随 leader，连不上换下一个）。
-fn api(d: &Path) -> Result<ApiClient, String> {
+/// 用全部开发节点的管理地址问（409 跟随 leader，连不上换下一个）；`dev wait` 也用它。
+pub(super) fn api(d: &Path) -> Result<ApiClient, String> {
     let addrs: Vec<String> = nodes(d).iter().filter_map(|n| mgmt_addr(d, *n).ok()).collect();
     Ok(ApiClient::new(addrs, admin_key(d, 1)?))
 }
@@ -95,6 +100,9 @@ pub fn wait_caught_up(d: &Path, n: u32) -> Result<(), String> {
     let api = api(d)?;
     let deadline = clock::mono_ms() + CATCH_UP_TIMEOUT_MS;
     loop {
+        if running_pid(d, n).is_none() {
+            return Err(exited(d, n)); // 起来之后又退出了（例如插件清单不一致）：不用等满 30 s（M14）
+        }
         let Ok(r) = api.get::<ClusterReply>("/api/v1/cluster") else { return Ok(()) };
         let me = r.nodes.iter().find(|x| x.node_id == n);
         let Some(me) = me.filter(|x| x.member != "none" && !x.caught_up) else { return Ok(()) };
@@ -116,12 +124,16 @@ pub fn leader(d: &Path) -> Result<Vec<String>, String> {
         .ok_or_else(|| "现在没有就绪的元数据 leader（可以先 wmfs dev wait leader）".into())
 }
 
-/// `wmfs dev restart-all`：按各节点当前的 node.toml 依次重启全部节点——先 follower、最后 leader（SIGTERM 时它先让位），每个都等它追上；
+/// `wmfs dev restart-all [--dylib F]…`：先按 `--dylib` 改写每个节点 node.toml 的 `[plugins] dylib`（**不给 = 清空**：原来带着动态库插件的
+/// 集群要每次都写上），再依次重启全部节点——先 follower、最后 leader（SIGTERM 时它先让位），每个都等它追上；
 /// 开始时集群是好的（都在运行、有就绪的 leader）就每重启一个都等链全部恢复 Serving（`dev wait chains-serving`）再重启下一个，不然冗余
 /// 会一路降到 1 份。停着的节点直接起（`cluster plugins add|remove` 之后节点都因清单不一致退出了：改好各节点的 node.toml 再
 /// restart-all）。最后等就绪的 leader 与元数据成员到齐，并确认没有节点起来之后又退出（例如 node.toml 还与集群插件清单不一致：退出码 3）。
-pub fn restart_all(d: &Path) -> Result<Vec<String>, String> {
+pub fn restart_all(d: &Path, dylib: &[String]) -> Result<Vec<String>, String> {
     let all = nodes(d);
+    for n in &all {
+        set_dylib(d, *n, dylib)?;
+    }
     let leader = all.iter().copied().find(|n| health(d, *n).is_ok_and(|h| h.meta_role == "leader"));
     let healthy = leader.is_some() && all.iter().all(|n| running_pid(d, *n).is_some());
     let mut order: Vec<u32> = all.iter().copied().filter(|n| Some(*n) != leader).collect();
@@ -139,14 +151,47 @@ pub fn restart_all(d: &Path) -> Result<Vec<String>, String> {
     if count > 1 {
         lines.push(wait_members(d, count)?);
     }
-    let deadline = clock::mono_ms() + 1500; // 清单不一致的节点在启动后约 1.2 s 退出（3.7.2：1 s 后退出）
+    stays_up(d, &all)?;
+    Ok(lines)
+}
+
+/// 这几个节点起来之后 1.5 s 里没有退出（清单不一致的节点在启动后约 1.2 s 退出，3.7.2：1 s 后退出）。
+fn stays_up(d: &Path, all: &[u32]) -> Result<(), String> {
+    let deadline = clock::mono_ms() + 1500;
     while clock::mono_ms() < deadline {
         if let Some(n) = all.iter().find(|n| running_pid(d, **n).is_none()) {
             return Err(exited(d, *n));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Ok(lines)
+    Ok(())
+}
+
+/// 第 n 个节点的 node.toml。
+fn node_config(d: &Path, n: u32) -> Result<NodeConfig, String> {
+    let p = node_dir(d, n).join("node.toml");
+    NodeConfig::parse(&std::fs::read_to_string(&p).map_err(|e| format!("读 {} 失败：{e}", p.display()))?)
+}
+
+/// 用 `dylib` 改写第 n 个节点 node.toml 的 `[plugins] dylib`（3.7.6；空 = 清空列表；相对路径换成绝对路径——server 的工作目录未必相同）。
+pub fn set_dylib(d: &Path, n: u32, dylib: &[String]) -> Result<(), String> {
+    let p = node_dir(d, n).join("node.toml");
+    let mut cfg = node_config(d, n)?;
+    let abs = |f: &String| std::path::absolute(f).map_or_else(|_| f.clone(), |a| a.display().to_string());
+    cfg.plugins.dylib = dylib.iter().map(abs).collect();
+    sys::atomic_write(&p, cfg.to_toml().as_bytes()).map_err(|e| format!("写 {} 失败：{e}", p.display()))
+}
+
+/// `wmfs dev restart <n> [--dylib F]…`（见文件头）：改写 dylib 列表、停、起；起不来或起来之后又退出了 → 报错，带日志里的原因。
+pub fn restart(d: &Path, n: u32, dylib: &[String]) -> Result<Vec<String>, String> {
+    if !node_dir(d, n).join("NODE").exists() {
+        return Err(format!("没有 node{n}（{} 还没有初始化）", node_dir(d, n).display()));
+    }
+    set_dylib(d, n, dylib)?;
+    stop(d, n)?;
+    let line = start(d, n)?;
+    stays_up(d, &[n])?;
+    Ok(vec![line])
 }
 
 /// 第 n 个节点起来之后又退出了：日志最后说插件清单不一致 → 给出修法（旧里程碑建的开发集群多了新插件时也是这样，roadmap §0 第 3 条）。
@@ -154,8 +199,8 @@ fn exited(d: &Path, n: u32) -> String {
     let log = std::fs::read_to_string(log_path(d, n)).unwrap_or_default();
     if log.lines().rev().take(50).any(|l| l.contains("与集群插件清单不一致")) {
         return format!(
-            "node{n} 因插件清单与集群插件清单不一致退出了（wmfs dev logs {n}）：开发集群是旧里程碑建的 → wmfs dev down --purge 之后\
-             重新 wmfs dev up；改过 wmfs cluster plugins → 先改好各节点的 node.toml，再 wmfs dev restart-all"
+            "node{n} 因插件清单与集群插件清单不一致退出了（差异见 wmfs dev logs {n}）：改过 wmfs cluster plugins → 让每个节点的插件配置\
+             跟上再重启（动态库插件：wmfs dev restart-all --dylib <.so>）；开发集群是旧里程碑建的 → wmfs dev down --purge 之后重新 wmfs dev up"
         );
     }
     format!("node{n} 起来之后又退出了（看 wmfs dev logs {n}）")

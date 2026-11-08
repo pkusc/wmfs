@@ -11,7 +11,9 @@
 //! （`chain.rs`）、`dev restart-all`、`dev pause|resume`、`dev wait chains-serving`、`dev up --profile nas-safe`。M10 加了
 //! `key create|list|revoke`、`session list|evict`（`key.rs`）、`dev wait session-evicted`、`mount --allow-other`。M11 加了
 //! `task list|show|pause|resume|run|set` 与 `datakey create`（`task.rs`）、`dev wait task-idle <任务>`。M13 加了 `class create|update|list|show|delete`
-//! （`class.rs`）、`dev mount --node`、`mount --host-id` 与 `mount --cache local-nvme:DIR[:SIZE]`。
+//! （`class.rs`）、`dev mount --node`、`mount --host-id` 与 `mount --cache local-nvme:DIR[:SIZE]`。M14 加了 `mgr`（`mgr.rs`）、
+//! `trace <id>|--recent [N]`（`trace.rs`）、`dev mgr`、`dev restart <n> [--dylib F]…`、`dev restart-all --dylib`、`dev wait alert|audit-caught-up`，
+//! 以及 node.toml 的 `[plugins] dylib`（动态库插件，`registry.rs`）；M14 收尾加了 `feature list|enable`（`feature.rs`，ADR-0045 第 11 条）。
 //! 其余子命令随里程碑加入。插件注册表 `registry.rs` 是全仓库唯一"知道有哪些插件"的文件。
 
 mod attr;
@@ -23,16 +25,19 @@ mod debug;
 mod dev;
 mod doctor;
 mod failpoint;
+mod feature;
 mod fs;
 mod fuse;
 mod key;
 mod leader;
+mod mgr;
 mod node;
 mod node_admin;
 mod pathmap;
 mod ping;
 mod registry;
 mod task;
+mod trace;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -149,6 +154,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: task::DataKeyCmd,
     },
+    /// incompat 特性（list、enable）
+    Feature {
+        #[command(subcommand)]
+        cmd: feature::FeatureCmd,
+    },
+    /// 一个请求跨节点的时间线（wmfs trace <trace_id>），或各节点最近的请求（wmfs trace --recent [N]）
+    Trace(trace::TraceArgs),
+    /// 在前台运行进程外插件宿主：dashboard、Prometheus 汇总、告警、审计日志、webhook（同一集群只运行一个）
+    Mgr(mgr::MgrArgs),
     /// 调试工具
     Debug {
         #[command(subcommand)]
@@ -238,6 +252,9 @@ fn main() {
         Cmd::Session { cmd } => key::run_session(cmd),
         Cmd::Task { cmd } => task::run_task(cmd),
         Cmd::Datakey { cmd } => task::run_datakey(cmd),
+        Cmd::Feature { cmd } => feature::run_feature(cmd),
+        Cmd::Trace(a) => trace::run_trace(a),
+        Cmd::Mgr(a) => mgr::run_mgr(a),
         Cmd::Debug { cmd: DebugCmd::RstatCheck { data_dir, json } } => debug::rstat_check(&data_dir, json),
         Cmd::Debug { cmd: DebugCmd::GenKey { out } } => node::gen_key(&out),
         Cmd::Debug { cmd: DebugCmd::Kv { cmd } } => debug::run(cmd),

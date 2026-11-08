@@ -9,7 +9,7 @@
 //!   一次就从头计时）、再过一个旧租约周期之后由一个批次删掉（新 leader 上任时看到它还在：照样按 max 计时，上任一个旧租约周期之后再删）。
 //! - [`sync_done`]（`NodeOp::SyncDone`，3.4.2.8 第 4 步）与 [`force_serving`]（`wmfs chain force-serving`）也在这里。
 //! - 指标：`wmfs_chains_degraded`（Serving 成员少于期望的链）、`wmfs_chains_unavailable`（没有 Serving 成员的链）、
-//!   `wmfs_chain_members{chain,state}`（7.3）。只有就绪的 leader 报；不是（或不再是）就绪的 leader → 全部归零（换了 leader 旧值不留着）。
+//!   `wmfs_chain_members{chain,state}`（7.3）、`wmfs_targets_offline`（离线的 target 数，不算已移除的节点上的；M14：告警 target_offline 看它）。只有就绪的 leader 报；不是（或不再是）就绪的 leader → 全部归零（换了 leader 旧值不留着）。
 //! - 转发失败的报告（3.4.2.10）只认报告者最近 FRESH_MS 内的心跳里的（它停了心跳，最后一次报告不能一直当作"持续"的证据），时长按
 //!   同一台机器的钟算（`chain_plan::FwdFailure`），并且只算下游这次启动以来、本 leader 一直看到它活着的那一段（[`since_up`]）。
 //! - 两步移出活着的成员（ADR-0041 第 13 条，`chain_plan::part`）：本 leader 第一次看到每个 Syncing 成员时的 (map_epoch, 时刻) 记在
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use wmfs_api::metrics::{self, Gauge};
 
 use super::chain_plan::{self, FRESH_MS, Facts, FwdFailure, Plan, Seen, sole};
-use super::chains::{SERVING, SYNCING, serving_count};
+use super::chains::{SERVING, SYNCING, TARGET_OFFLINE, serving_count};
 use super::settings::{self, max_each, target_lease_shrinking};
 use super::targets::TargetUsage;
 use crate::base::types::ReqCtx;
@@ -31,7 +31,7 @@ use crate::meta::engine::EmbeddedEngine;
 use crate::meta::engine::txn::{KvTxn, MetaEngine, OpCtx, TxnOp, txn_blocking_exclusive};
 use crate::meta::schema::keys::{self, G_NEXT_CHAIN, G_SETTINGS_PREV};
 use crate::meta::schema::kv;
-use crate::meta::schema::records::{ChainRecV1, ClusterSettingsV1, TargetRecV1};
+use crate::meta::schema::records::{ChainRecV1, ClusterSettingsV1, NODE_REMOVED, TargetRecV1};
 use crate::proto::meta::MetaReply;
 use crate::proto::peer::ClusterMap;
 
@@ -152,6 +152,7 @@ impl ChainMgr {
         let down = map.chains.iter().filter(|(_, c)| serving_count(c) == 0).count();
         degraded_gauge().set(degraded as f64);
         unavailable_gauge().set(down as f64);
+        offline_gauge().set(offline_targets(map) as f64);
         for (id, c) in &map.chains {
             for (state, name) in [(SERVING, "serving"), (SYNCING, "syncing")] {
                 let g = self.gauges.entry((*id, state)).or_insert_with(|| {
@@ -166,10 +167,22 @@ impl ChainMgr {
     fn zero_gauges(&self) {
         degraded_gauge().set(0.0);
         unavailable_gauge().set(0.0);
+        offline_gauge().set(0.0);
         self.gauges.values().for_each(|g| g.set(0.0));
     }
 }
 
+/// 离线的 target 数：不算已经移除的节点上的（`wmfs node remove` 之后 target 记录还在、停机之后一直是 Offline——算上它们的话
+/// 告警 target_offline 在任何一次正常移除节点之后永远 firing）。
+fn offline_targets(map: &ClusterMap) -> usize {
+    let removed = |node: u32| map.nodes.iter().any(|(id, n)| *id == node && n.state == NODE_REMOVED);
+    map.targets.iter().filter(|(_, t)| t.state == TARGET_OFFLINE && !removed(t.node)).count()
+}
+
+/// 离线的 target 数（M14：mgr 的告警规则 target_offline 看它，4.14；7.3 之外新增的指标）。
+fn offline_gauge() -> Arc<Gauge> {
+    metrics::gauge("wmfs_targets_offline", "离线（target 租约过期）的 target 数（只有就绪的 leader 报）", &[])
+}
 fn degraded_gauge() -> Arc<Gauge> {
     metrics::gauge("wmfs_chains_degraded", "Serving 成员少于声明副本数的链（只有就绪的 leader 报）", &[])
 }
@@ -325,5 +338,36 @@ mod tests {
         let mut f = vec![FwdFailure { down: 9, ..fail(50_000)[0] }];
         since_up(&mut up, &alive(1, 8), &mut f, 41_000);
         assert_eq!(f[0].lasted_ms, 0, "下游没在心跳：不算（它归离线的规则管）");
+    }
+
+    /// 已经 `wmfs node remove` 的节点上的 Offline target 不算离线（M14 审查：否则告警 target_offline 移除节点之后永远 firing）。
+    #[test]
+    fn targets_of_removed_nodes_are_not_counted_offline() {
+        use crate::meta::schema::records::{NODE_ACTIVE, NodeRecV1};
+        let node = |state| NodeRecV1 {
+            addrs: vec![],
+            mgmt_addr: String::new(),
+            host_id: String::new(),
+            machine_id: String::new(),
+            hostname: String::new(),
+            meta_role: 0,
+            features: vec![],
+            joined_ms: 0,
+            state,
+        };
+        let target = |node, state| TargetRecV1 {
+            node,
+            path: String::new(),
+            labels: vec![],
+            phys_devs: vec![],
+            capacity: 0,
+            boot_id: 0,
+            state,
+            last_up_ms: 0,
+            read_only: false,
+        };
+        let mut m = ClusterMap { nodes: vec![(1, node(NODE_ACTIVE)), (2, node(NODE_REMOVED))], ..Default::default() };
+        m.targets = vec![(1, target(1, TARGET_OFFLINE)), (2, target(2, TARGET_OFFLINE)), (3, target(1, 1))];
+        assert_eq!(offline_targets(&m), 1, "只算没有移除的节点上的");
     }
 }

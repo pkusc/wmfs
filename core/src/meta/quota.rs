@@ -44,6 +44,7 @@ use crate::meta::rstat::{self, Delta};
 use crate::meta::schema::keys::{self, QUOTA_CLASS_TOTAL};
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{AttrMapV1, ClassIdV1, QuotaStateV1, RStatV1};
+use crate::obs::stages::Stage;
 
 const DEFAULT_GRACE_MS: u64 = 7 * 86_400_000;
 const DEFAULT_QUANTUM: u64 = 64 << 20;
@@ -140,8 +141,10 @@ pub fn used_of(class: Option<u16>, r: &RStatV1) -> (u64, u64) {
     }
 }
 
-/// 目录 `dir` 到根的配额 scope：`class` = Some(类) 只要总量的与这个类的（文件），None 要全部（rename 搬一棵子树）。
+/// 目录 `dir` 到根的配额 scope：`class` = Some(类) 只要总量的与这个类的（文件），None 要全部（rename 搬一棵子树）。实现注记（M14 收尾，
+/// ADR-0045 第 9 条）：这里与 [`ask`] 的时间记作"quota"、之前的记作"执行"（慢日志的各阶段耗时）。
 fn scopes(v: &dyn KvRead, c: &OpCtx, dir: u64, class: Option<u16>) -> Result<Vec<QuotaScope>, ErrCode> {
+    c.mark(Stage::Exec);
     let e = c.attrs.resolve(v, dir)?;
     let mut out = Vec::new();
     for (d, q) in e.quotas.iter().filter(|(_, q)| class.is_none() || q.class.is_none() || q.class == class) {
@@ -150,6 +153,7 @@ fn scopes(v: &dyn KvRead, c: &OpCtx, dir: u64, class: Option<u16>) -> Result<Vec
         let over_soft = q.soft > 0 && used_of(q.class, &used).0 > q.soft; // 回到软限以内：计时作废（见文件头）
         out.push(scope(*d, q, used, if over_soft { since } else { 0 }));
     }
+    c.mark(Stage::Quota);
     Ok(out)
 }
 
@@ -180,6 +184,7 @@ fn key_class(v: &dyn KvRead, key: &str) -> Result<Option<u16>, ErrCode> {
 }
 
 fn ask(c: &OpCtx, ss: &[QuotaScope], class: u16, bytes: i64, files: i64) -> QuotaDecision {
+    c.mark(Stage::Exec);
     let input = QuotaInput {
         who: &c.req.who,
         scopes: ss,
@@ -188,7 +193,9 @@ fn ask(c: &OpCtx, ss: &[QuotaScope], class: u16, bytes: i64, files: i64) -> Quot
         class_id: class,
         now_ms: c.req.now_ms,
     };
-    c.pipeline.quota(&input)
+    let d = c.pipeline.quota(&input);
+    c.mark(Stage::Quota);
+    d
 }
 
 /// 软限的计时开始（见文件头）：QUOTA_STATE 记下起点，changelog `PolicyViolation`。
@@ -278,12 +285,18 @@ pub fn same_range(v: &dyn KvRead, c: &OpCtx, n: &Node, dir: u64) -> Result<(), E
 
 /// CommitWrite 让文件 `n` 长了 `grow` 字节：插件放行就照常；插件拒绝时按护栏判（见文件头）。孤儿不计。
 pub fn commit_growth(v: &mut dyn KvTxn, c: &OpCtx, n: &Node, grow: u64, want_quota: bool) -> Result<(), ErrCode> {
-    if n.rec.nlink == 0 || grow == 0 {
+    if n.rec.nlink == 0 || (grow == 0 && !want_quota) {
         return Ok(());
     }
     let class = n.rec.class_id;
     let ss = scopes(v, c, n.rec.parent, Some(class))?;
     if ss.is_empty() {
+        return Ok(());
+    }
+    if grow == 0 {
+        // 客户端用完了额度来要（长度不变）：问插件"再多 1 字节行不行"——一点余量也没有时插件判 Deny 并计入
+        // wmfs_quota_denied_total（告警 quota_denied）；回复的 quota_end = 长度，客户端随后报 EDQUOT（实现注记（M14 审查））
+        let _ = ask(c, &ss, class, 1, 0);
         return Ok(());
     }
     let d = ask(c, &ss, class, grow as i64, 0);

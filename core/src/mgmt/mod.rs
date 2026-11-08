@@ -6,8 +6,9 @@
 //! - [`changelog`]：changelog 流（长轮询）与消费者游标（M7）
 //! - [`cluster`]：集群概览与节点运维、集群插件清单、各节点的元数据哈希（M8）
 //! - [`keys`]：认证 key 的建立、列表与撤销，会话列表与手动驱逐（M10）
-//! - [`tasks`]：后台任务的列表与控制、本节点的任务进度、数据加密密钥（M11）
+//! - [`tasks`]：后台任务的列表与控制、数据加密密钥（M11）
 //! - [`classes`]：存储类的增删改查（M13）
+//! - [`node`]：节点本地的 `GET /api/v1/node`（本节点的任务进度，M11；M14 加上 target、boot_id、内存池、线程数）与 trace 端点（M14）
 //!
 //! 请求/响应结构都在 wmfs-api（`types.rs`、签名格式在 `auth.rs`），服务端与 wmfs-mgr 的 ApiClient 共用。
 //! 错误统一为 `{"error": "<错误码名的小写>", "message": "<中文说明>"}`。`/metrics` 与 `/api/v1/health` 免认证。
@@ -19,6 +20,7 @@ pub mod classes;
 pub mod cluster;
 pub mod http;
 pub mod keys;
+pub mod node;
 pub mod tasks;
 
 pub use http::{MgmtCtx, MgmtServer, RoleFn};

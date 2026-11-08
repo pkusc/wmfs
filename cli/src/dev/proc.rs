@@ -28,7 +28,7 @@ pub fn spawn_logged(args: &[&OsStr], log: &Path) -> Result<Child, String> {
         .map_err(|e| format!("启动 wmfs {what} 失败：{e}"))
 }
 
-/// 等 `ready()` 成立（每 50 ms 看一次）。子进程先退出了、或过了 `timeout_ms` → 结束它，报错（带日志路径与日志的最后一行）。
+/// 等 `ready()` 成立（每 50 ms 看一次）。子进程先退出了、或过了 `timeout_ms` → 结束它，报错（带日志路径与日志的最后一个非空行）。
 pub fn wait_ready(
     child: &mut Child,
     timeout_ms: u64,
@@ -52,7 +52,7 @@ pub fn wait_ready(
                 format!("没能在 {} s 内就绪（已停止它）", timeout_ms / 1000)
             };
             let text = std::fs::read_to_string(log).unwrap_or_default();
-            let last = text.lines().last().unwrap_or_default();
+            let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or_default(); // 最后一个非空行
             return Err(format!("{what} {why}，请看日志 {}（最后一行：{last}）", log.display()));
         }
         std::thread::sleep(Duration::from_millis(50));

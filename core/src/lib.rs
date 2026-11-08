@@ -5,6 +5,7 @@
 //! `tests/golden/` 有每种消息、记录、帧头、chunk 头的金样（`cargo test -p wmfs-core golden`）。
 //!
 //! - [`base`]：错误码、单位、时钟、随机数、日志、node.toml、libc 封装、物理盘解析
+//! - [`obs`]：span 环形缓冲与慢请求日志（3.11，M14）
 //! - [`proto`]：帧头与全部线上消息（3.3）
 //! - [`buf`]：预注册内存池与缓冲区所有权（3.6）
 //! - [`net`]：连接包装、RpcClient / RpcServer、握手、重试（3.3、3.12）
@@ -29,5 +30,6 @@ pub mod init;
 pub mod meta;
 pub mod mgmt;
 pub mod net;
+pub mod obs;
 pub mod proto;
 pub mod server;

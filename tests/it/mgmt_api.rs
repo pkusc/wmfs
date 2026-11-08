@@ -4,13 +4,15 @@
 //! - 递归用量、声明 vs 实际、语义、集群运行参数（`epoch_gc_grace=0s` 立即进集群图）。
 //! - changelog：分页、AttrSet/Mkdir/Create 都在、长轮询在新记录提交后**立即**被唤醒（不是等到 wait_ms 到期）、同时最多 2 个长轮询
 //!   （第 3 个立即回空页）、消费者游标（不能超过最新的 seq，名字有限制）。
+//! - incompat 特性（ADR-0045 第 11 条）：`GET /api/v1/features` 列出 GLOBAL 已启用的（首发为空）与各节点声明支持的；enable 预留名 →
+//!   400 feature_unsupported"二期功能"，不认识的名字 → 400 einval，client key → 403；之后 GLOBAL 照旧为空、changelog 没有新记录。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wmfs_core::api::types::{
     AttrGetReply, AttrSetReply, AttrSetReq, AttrUnsetReply, ChangelogPage, ClassReply, ClusterSettingsReply,
-    CursorReply, CursorReq, KeyFile, SemanticsReply, StatusReply, UsageReply,
+    CursorReply, CursorReq, FeaturesReply, KeyFile, NodeFeatures, SemanticsReply, StatusReply, UsageReply,
 };
 use wmfs_core::api::url::encode;
 use wmfs_core::meta::schema::keys::ROOT_INO;
@@ -180,5 +182,31 @@ fn changelog_pages_long_polls_and_cursors() {
     assert_eq!(a.get::<CursorReply>("/api/v1/changelog/cursor?name=nope").unwrap_err().status, 404);
     assert_eq!(changelog(&a, 0, 0).last_seq, last, "游标提交不写 changelog");
     c.meta.close();
+    run.stop();
+}
+
+#[test]
+fn features_list_and_enable_errors() {
+    let d = TempDir::new("mgmt-features");
+    init(&d.0);
+    let run = start(&d.0);
+    let (a, cl) = (api(&d.0, &run.mgmt_addr, "admin"), api(&d.0, &run.mgmt_addr, "client"));
+    let f: FeaturesReply = cl.get("/api/v1/features").unwrap();
+    let node = NodeFeatures { node_id: 1, features: vec![] };
+    assert_eq!(f, FeaturesReply { enabled: vec![], nodes: vec![node] }, "首发：没有启用的，节点也没声明");
+    let last = changelog(&a, 0, 0).last_seq;
+    let enable = |c: &ApiClient, name: &str| {
+        c.post::<_, FeaturesReply>(&format!("/api/v1/features/{name}/enable"), &()).unwrap_err()
+    };
+    let e = enable(&a, "chunk.snapshots");
+    assert!(e.status == 400 && e.code == "feature_unsupported" && e.message.contains("二期功能"), "{e:?}");
+    for name in ["chunk.dyn_transform", "meta.ec-layout", "proto.pipelined-meta"] {
+        assert_eq!(enable(&a, name).code, "feature_unsupported", "3.2.10 的预留名都是二期：{name}");
+    }
+    let e = enable(&a, "no.such");
+    assert!(e.status == 400 && e.code == "einval", "{e:?}");
+    assert_eq!(enable(&cl, "chunk.snapshots").status, 403, "启用要 admin key");
+    assert!(a.get::<FeaturesReply>("/api/v1/features").unwrap().enabled.is_empty(), "不写 GLOBAL");
+    assert_eq!(changelog(&a, 0, 0).last_seq, last, "不写 changelog");
     run.stop();
 }

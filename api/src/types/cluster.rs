@@ -1,6 +1,7 @@
 //! M8 的管理端点的请求/响应结构（design.md 7.1、3.4.1.9、3.7.2）：集群概览与节点（`GET /api/v1/cluster`、
 //! `POST /api/v1/nodes/<id>/{drain,remove,promote}`）、集群插件清单（`GET/POST /api/v1/cluster/plugins`）、各节点的元数据哈希
 //! （`GET /api/v1/debug/meta-hash`，`wmfs debug meta-hash` 用）。M9：链（`GET /api/v1/chains`、`POST /api/v1/chains/<id>/force-serving`）。
+//! M14 收尾：incompat 特性（`GET /api/v1/features`、`POST /api/v1/features/<name>/enable`，ADR-0045 第 11 条）。
 //! 字段只增不改（ADR-0005）；JSON 金样在 `cluster/tests.rs`。
 
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,9 @@ pub struct NodeInfo {
 }
 
 /// `GET /api/v1/cluster`：集群概览——节点、元数据 raft 的 leader/term/commit/applied/成员，以及集群警告（`ClusterMap.warnings`）。
-/// 实现注记（M8）：target、链、会话数随用到它们的里程碑加进来（只增）。
+/// 实现注记（M8）：target、链、会话数随用到它们的里程碑加进来（只增）。实现注记（M14，第一个用到它们的是 dashboard 的集群面板）：
+/// `targets`（每个 target 的编号、所在节点、状态，离线的标红）、`chains`（链的条数；每条链的成员与状态在 `GET /api/v1/chains`）、
+/// `sessions`（Active 的客户端会话数）；老的回复里没有它们也解得出来（`#[serde(default)]`）。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ClusterReply {
     pub leader: u32,
@@ -50,6 +53,20 @@ pub struct ClusterReply {
     pub voters_outgoing: Vec<u32>,
     pub nodes: Vec<NodeInfo>,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub targets: Vec<ClusterTarget>,
+    #[serde(default)]
+    pub chains: u64,
+    #[serde(default)]
+    pub sessions: u64,
+}
+
+/// `GET /api/v1/cluster` 里的一个 target（M14，只增）：`state` 是 `up` / `offline`（target 租约过期）/ `draining` / `removed`。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct ClusterTarget {
+    pub id: u32,
+    pub node: u32,
+    pub state: String,
 }
 
 /// `POST /api/v1/nodes/<id>/{drain,remove,promote}` 的回复：改完之后的这个节点与一句说明（成员变更由 cluster-mgr 接着做）。
@@ -99,6 +116,22 @@ pub struct ChainInfo {
 pub struct ChainsReply {
     pub chains: Vec<ChainInfo>,
     pub warnings: Vec<String>,
+}
+
+/// `GET /api/v1/features`（7.1，ADR-0045 第 11 条）：集群已启用的 incompat 特性 `enabled`（GLOBAL `features`，3.2.10；首发为空）与每个
+/// 没有移除的节点声明支持的特性（`NodeRecV1.features`；首发都是空的）。`POST /api/v1/features/<name>/enable` 成功时（二期）也回它；首发
+/// 没有能启用的：3.2.10 的预留名回 `FEATURE_UNSUPPORTED`（"二期功能"），不认识的名字回 `EINVAL`。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct FeaturesReply {
+    pub enabled: Vec<String>,
+    pub nodes: Vec<NodeFeatures>,
+}
+
+/// `GET /api/v1/features` 里的一个节点：它声明支持的特性。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct NodeFeatures {
+    pub node_id: u32,
+    pub features: Vec<String>,
 }
 
 /// `POST /api/v1/chains/<id>/force-serving?target=` 的请求体：必须明确写 `{"i_accept_data_loss": true}`（7.1）。回复是改完的

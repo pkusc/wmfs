@@ -1,0 +1,11 @@
+name = "audit-log"
+version = "0.1.0"
+hooks = ["event_sink"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = ["audit"]
+budget_ns = 0
+fail_points = ["plugin.audit-log.event_sink"]
+[config_schema]
+# 没有部署参数：审计日志写在 wmfs mgr --dir 下的 audit/（审计哪些目录、哪些操作是目录属性 audit=on,ops=…,uids=…）。

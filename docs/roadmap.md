@@ -528,21 +528,21 @@ scripts/accept.sh M13
 
 ```bash
 wmfs dev up --nodes 3 --profile nas-safe && eval "$(wmfs dev env)" && mkdir -p ~/wmfs-mnt && wmfs dev mount ~/wmfs-mnt
-# 预期：最后一行打印 dashboard 网址（带 token）——nas-safe 会在集群起好后自动起一个 mgr；浏览器打开它
+# 预期：wmfs dev up 输出的最后一行是 dashboard 网址（带 token，http://127.0.0.1:19090/?token=…）——nas-safe 会在集群起好后自动起一个 mgr；浏览器打开它
 touch ~/wmfs-mnt/home/a && rm ~/wmfs-mnt/home/a && wmfs dev wait audit-caught-up
 grep -hE '"op":"(Create|Unlink)"' ~/wmfs-dev/mgr/audit/audit-*.log | tail -2   # 预期：Create 与（进回收站的）Unlink 两条事件
 wmfs status ~/wmfs-mnt/home --json | python3 -m json.tool | head -40          # 预期：每个属性一项 {key, declared, source, effect, actual, mismatched}
-wmfs dev kill 3 && wmfs dev wait alert target_offline firing --timeout 120    # 预期：约 60 秒后告警触发
+wmfs dev kill 3 && wmfs dev wait alert target_offline firing --timeout 120    # 预期：约 70 秒后告警触发（target 租约 8 s 过期才算离线，规则再要求持续 60 s）
 wmfs dev start 3 && wmfs dev wait alert target_offline resolved && wmfs dev wait chains-serving
 dd if=/dev/zero of=$HOME/wmfs-mnt/home/t bs=4M count=4 conv=fsync
 wmfs trace --recent 5                               # 预期：最近 5 个请求的 trace_id、操作、耗时
 wmfs trace <上一步列出的某个 WriteChunk 的 trace_id>   # 预期：链头 → 中间 → 尾 各阶段耗时（客户端自己的耗时在客户端日志里）
 gcc -shared -fPIC -I core/include -o /tmp/deny_uid.so examples/dylib-deny-uid/deny_uid.c
 gcc -shared -fPIC -I core/include -o /tmp/bad_abi.so examples/dylib-deny-uid/bad_abi.c
-wmfs cluster plugins add authz:deny-uid             # 预期：提示"已写入；各节点会因插件集合不一致而退出，请用新配置重启全部节点"
+wmfs cluster plugins add authz:deny-uid             # 预期：列出新的集群插件清单，最后提示"各节点会因插件清单不一致而退出：用新配置重启全部节点"
 wmfs dev restart-all --dylib /tmp/deny_uid.so && wmfs dev wait leader
 wmfs fs --as-uid 4242 touch /home/zz                # 预期：Permission denied（动态库插件拒绝了 uid 4242）
-wmfs dev restart 1; wmfs dev logs 1 | tail -3       # 不带 .so 重启节点 1；预期："插件集合与集群清单不一致：缺少 authz:deny-uid"，节点 1 退出
+wmfs dev restart 1; wmfs dev logs 1 | tail -3       # 不带 .so 重启节点 1；预期："插件清单与集群插件清单不一致：本节点缺少 authz:deny-uid（集群清单里有）"，节点 1 退出
 wmfs dev restart 1 --dylib /tmp/deny_uid.so --dylib /tmp/bad_abi.so; wmfs dev logs 1 | tail -3   # 预期："动态库 ABI 版本 2 不受支持（支持 [1]），拒绝启动"
 wmfs dev restart 1 --dylib /tmp/deny_uid.so && wmfs dev wait chains-serving   # 恢复正常
 wmfs dev down

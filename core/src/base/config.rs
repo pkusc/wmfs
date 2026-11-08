@@ -1,7 +1,7 @@
 //! node.toml：本节点的部署参数（design.md 3.2.2、3.7.2；`NetConfig` 见 3.12）。
 //!
 //! 只放部署参数：各传输插件的监听地址（`[plugin.<name>]`）、control/data scheme（`[net]`）、管理 API 地址
-//! （`[mgmt]`）、target 列表（`[[target]]`）、内存池大小（`[mem]`）、插件启停（`[plugins]`）。
+//! （`[mgmt]`）、target 列表（`[[target]]`）、内存池大小（`[mem]`）、插件启停（`[plugins]`）、慢请求日志的阈值（`[obs]`，M14 审查，3.11）。
 //! 行为策略一律是目录属性，不得出现在这里（理念文档原则 3）。不认识的键 = 错误（拼写错误不会被静默忽略）；
 //! 插件自己的配置表 `[plugin.<name>]` 由插件按它的 `config_schema` 校验（3.7.2）。
 //!
@@ -60,6 +60,7 @@ pub struct NodeConfig {
     #[serde(rename = "target")]
     pub targets: Vec<TargetConfig>, // [[target]]
     pub debug: DebugConfig,
+    pub obs: ObsConfig,
 }
 
 impl Default for NodeConfig {
@@ -74,6 +75,7 @@ impl Default for NodeConfig {
             plugin: BTreeMap::new(),
             targets: Vec::new(),
             debug: DebugConfig::default(),
+            obs: ObsConfig::default(),
         }
     }
 }
@@ -134,6 +136,20 @@ impl TargetConfig {
     /// 容量上限（字节）；0 = 不限。写错时返回中文原因（不会静默当成"不限"）；`NodeConfig::parse` 已对每个 target 调用过它。
     pub fn capacity_bytes(&self) -> Result<u64, String> {
         units::parse_size(&self.capacity).map_err(|e| format!("target {} 的 capacity：{e}", self.path))
+    }
+}
+
+/// `[obs]`：慢请求日志的阈值（毫秒；3.11 的"可调"：元数据族 / 其余，超过就写一行带 trace_id 的 WARN）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObsConfig {
+    pub slow_meta_ms: u64,
+    pub slow_data_ms: u64,
+}
+
+impl Default for ObsConfig {
+    fn default() -> ObsConfig {
+        ObsConfig { slow_meta_ms: 50, slow_data_ms: 100 }
     }
 }
 
@@ -198,6 +214,8 @@ capacity = "20G"
 path = "/tmp/t2"
 [debug]
 host_id = "host-2"
+[obs]
+slow_data_ms = 30
 "#;
 
     #[test]
@@ -217,6 +235,8 @@ host_id = "host-2"
         let bad = TargetConfig { path: "/t".into(), labels: vec![], capacity: "20Q".into() };
         assert!(bad.capacity_bytes().unwrap_err().contains("/t"), "写错的容量返回错误，而不是当成不限");
         assert_eq!(c.debug.host_id.as_deref(), Some("host-2"));
+        assert_eq!(c.obs, ObsConfig { slow_meta_ms: 50, slow_data_ms: 30 }, "慢请求阈值：没写的取默认 50 ms");
+        assert!(NodeConfig::default().to_toml().contains("[obs]\nslow_meta_ms = 50\nslow_data_ms = 100\n"));
     }
 
     #[test]
@@ -241,6 +261,7 @@ host_id = "host-2"
         assert!(NodeConfig::parse("[plugins]\ndisabel = []\n").is_err());
         assert!(NodeConfig::parse("[[target]]\npath = \"/x\"\nlabel = []\n").is_err());
         assert!(NodeConfig::parse("[debug]\nhostid = \"h\"\n").is_err());
+        assert!(NodeConfig::parse("[obs]\nslow_ms = 1\n").is_err());
         // [mem] 只写一部分键 = 错误（见文件头的说明）
         assert!(NodeConfig::parse("[mem]\ns_mb = 128\n").is_err());
     }

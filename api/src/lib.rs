@@ -9,6 +9,7 @@
 //! - [`hex`]：字节 ↔ 小写 hex（cluster_id、密钥文件、签名共用）
 //! - [`types`]：密钥文件、changelog 事件、管理 API 的请求/响应结构（7.1，随里程碑增加）
 //! - [`url`]：管理 API 查询参数的百分号编解码（M7：`?path=` 里的路径）
+//! - [`units`]：尺寸、时长与 UTC 时刻的解析和显示（M14 从 core/base 挪来：告警规则的时长与 core 同一套写法）
 
 pub mod auth;
 pub mod codes;
@@ -17,4 +18,5 @@ pub mod hex;
 pub mod metrics;
 pub mod ops;
 pub mod types;
+pub mod units;
 pub mod url;

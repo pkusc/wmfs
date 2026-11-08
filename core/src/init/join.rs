@@ -52,6 +52,7 @@ pub struct JoinOpts {
     pub host_id: Option<String>,
     pub plugins: PluginListV1, // 本节点按 node.toml 装出来的插件清单（与 disable 对应）
     pub disable: Vec<String>,  // node.toml 的 `[plugins] disable`
+    pub dylib: Vec<String>, // node.toml 的 `[plugins] dylib`（动态库插件，3.7.6；M14：集群清单里有它时新节点也要装上才能加入）
     pub targets: Vec<TargetConfig>,
     pub meta_auto: bool, // --meta auto（现有元数据成员 < 3 时以 learner 加入）| none
     pub transports: Vec<Arc<dyn Transport>>,
@@ -93,7 +94,7 @@ pub fn join_node(o: &JoinOpts) -> Result<u32, JoinError> {
     let net = Listen { addr: &o.addr, rpc_port: o.rpc_port, mgmt_port: o.mgmt_port };
     let mut cfg = node_config(&net, &o.targets, o.host_id.clone());
     (cfg.failpoints_api, cfg.debug_ops, cfg.mem) = (o.failpoints_api, o.debug_ops, o.mem);
-    cfg.plugins.disable = o.disable.clone();
+    (cfg.plugins.disable, cfg.plugins.dylib) = (o.disable.clone(), o.dylib.clone());
     let local = |e: String| fail(ErrCode::EIO, format!("已加入集群（节点 {node_id}），但建数据目录失败：{e}"));
     write_common(d, &cfg, &o.master).map_err(local)?;
     let db = create_meta_db(d).map_err(local)?;

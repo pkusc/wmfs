@@ -12,6 +12,8 @@
   "实际"是这个目录下的新文件此刻能得到的副本数；声明与实际不同时，这一行之前还会多打印一行警告。
 - `wmfs status <路径>`：第一行是集群警告（例如"有 3 条链少于声明副本数""故障域重叠"）；之后逐个属性列出声明、来源、实际与是否一致（例如 replicas 声明 3、实际 2 的文件数；配额用量与软限计时；QoS 保底欠额；审计消费者落后多少条），以及隔离承诺、后台迁移进度。
 - `GET /api/v1/semantics`：本文要点与当前集群参数（租约时长、cap 有效期）。
+- M14 起：`wmfs mgr` 的 dashboard 的"声明 vs 实际"面板逐个属性显示同一份数据（调用同一个 `GET /api/v1/status`）；一个慢请求跨节点的时间线用
+  `wmfs trace <trace_id>` 查（链头 → 中间 → 链尾各一跳的耗时；trace_id 在客户端与服务端的慢请求日志里）。
 - M7 起这些都可用（`wmfs get/status` 的路径可以是挂载点下的路径）。`wmfs status` 的"实际"先给**这个目录下的新文件此刻实际
   得到的值**（例如单节点上 replicas 声明 3、实际 1）；M9 起 replicas 另给子树里已有文件中**实际副本数少于声明**的个数（实际 = 它所在
   的链此刻正常服务的副本数，例如节点宕机、链降级时）；M11 起还有逐个已有文件的统计：class、replicas、compress、encrypt、chunk、
@@ -237,8 +239,8 @@ M13 起能设置的属性：`class`、`replicas`、`chunk`、`stripe`、`inline`
     （含 `O_TRUNC` 的覆盖写）或删掉。
   - **坏盘**：一个 target 连续 3 次提交失败（多半是盘坏了）就自动变成只读，被移出写路径（链上补上别的副本），之后的写照常成功；重启节点
     后它重新加入。
-  - **gc**：除了旧数据与删除后的文件，还清理已经关掉的会话留下的请求去重记录、所有消费者都读过（或超过 7 天、超过 1000 万条）的
-    changelog（更早的读回 `410 Gone`，缺口是显式的），以及数据节点上元数据里已经没有的数据（例如节点离线时错过的删除，每 10 分钟查一次，
+  - **gc**：除了旧数据与删除后的文件，还清理已经关掉的会话留下的请求去重记录、所有消费者都读过（但至少留最近 1 万条）或超过 7 天、
+    超过 1000 万条的 changelog（更早的读回 `410 Gone`，缺口是显式的），以及数据节点上元数据里已经没有的数据（例如节点离线时错过的删除，每 10 分钟查一次，
     只删超过 1 小时的）。
   - 后台任务的进度、速率与积压：`wmfs task list`（连不上的节点显示成连不上）；`wmfs dev wait task-idle <任务>` 等它这一轮做完——
     连不上的节点不算做完，一直等到超时；只做数据的节点收不到运行请求，对它们只等这一轮做完、积压为 0。
@@ -266,8 +268,13 @@ M13 起能设置的属性：`class`、`replicas`、`chunk`、`stripe`、`inline`
   - **ttl**（`ttl=<时长>`）：子树里 mtime 早于"现在减去时长"的文件由后台任务 ttl 删掉（每分钟一轮，`wmfs task run ttl` 马上来一轮；`trash`
     生效时进回收站），changelog 的 `Unlink` 带 `reason=ttl`。
   - **审计标记**（`audit=on`）：之后这棵子树里的修改（命名空间、setattr、xattr、写入长度与属性变更）在 changelog 里带 `audited: true`，被拒绝的
-    修改也记一条（`result` 是错误码）；第一次启用时建 `audit-log` 游标，从此 changelog 按它保留（最多 7 天 / 1000 万条）。把审计记录写进文件
-    的 audit-log 在 M14 的 `wmfs mgr` 里；在那之前 `wmfs status` 与 `/api/v1/health` 显示"审计消费者落后 N 条"。
+    修改也记一条（`result` 是错误码）；第一次启用时建 `audit-log` 游标，从此 changelog 按它保留（最多 7 天 / 1000 万条）。M14 起，`wmfs mgr`
+    里的 audit-log 把这些记录写进审计日志文件（`<mgr 目录>/audit/audit-YYYYMMDD.log`，一行一个 JSON，带 seq；其中的 `trace_id` 是十进制数字，
+    `wmfs trace d:<它>` 查这个请求在各节点的时间线）：每批 fsync 之后才提交游标，至少一次投递——mgr 崩溃重启后同一条可能写两遍，**按 seq
+    去重**（每一行都是完整的 JSON：写到一半崩溃留下的半行在下次写之前截掉）。mgr 没在运行时记录按游标保留、重启后补写，这期间
+    `wmfs status` 的 audit 一行与 `/api/v1/health` 显示"审计消费者落后 N 条"——mgr 停着时**没有告警**（告警是 mgr 自己发的；生产环境用
+    systemd 的 `Restart=on-failure` 让它一直在运行，`docs/ops.md`）；mgr 在运行、审计却 10 分钟没有前进（例如写不出审计文件）时告警
+    `audit_stalled`。落后超出保留范围、那一段已被修剪时 mgr 显式告警（`changelog_gap`），不是静默丢失。同一个集群只运行一个 mgr（`docs/ops.md`）。
 - **改集群图时写会停顿一下（M13 起实测）**：会改集群图的操作（`wmfs set`/`unset` 的 `qos`、`wmfs class create/update/delete`、
   `wmfs cluster set`、`wmfs key` 等）之后约 1 s 内，正在写的文件偶尔有一次写停顿约 1 s（本机实测 0.7–0.9 s）：每个数据节点换上新集群图的
   那一两毫秒里暂停服务，赶上这一刻的写由链头约 0.5–1 s 之后重发。一个存储类（或一种副本数）的第一个文件，第一次写可能停顿约 1–1.5 s
@@ -277,6 +284,10 @@ M13 起能设置的属性：`class`、`replicas`、`chunk`、`stripe`、`inline`
   改了清单之后各节点都会退出，要用新配置重启全部节点（M9 起：只做数据的节点这时多半拿不到新的集群图——元数据节点都不一致、没有就绪的
   leader——它不退出，但续不了租约、自我隔离，不服务读写；重启全部节点时一并按新配置重启，开发集群用 `wmfs dev restart-all`）；清单里的某个插件再也装不上时，在**全部**元数据节点上（用同一份插件配置）都用
   `wmfs server --data-dir D --adopt-local-plugins` 启动，当选的节点把清单改成本地的，之后去掉这个参数重启（ADR-0039）。
+- **动态库授权插件**（M14，ADR-0012，`docs/plugin-abi.md`）：第三方可以用 C 写一个 `.so` 授权插件（node.toml 的 `[plugins] dylib`）。它与内置的
+  授权插件按同一组合规则判定（任一拒绝即拒绝），一样进集群插件清单：每个节点都必须加载它，少装的节点退出并列出"缺少 authz:<名字>"。
+  配置了却加载不了（找不到文件、缺依赖的符号、ABI 版本不受支持、初始化失败）的节点**拒绝启动**并写明原因——绝不跳过一条授权规则继续服务。
+  集群清单里有它之后，新节点用 `wmfs join … --dylib <.so>` 带上它才能加入。
 
 ---
 
@@ -297,7 +308,7 @@ M13 起能设置的属性：`class`、`replicas`、`chunk`、`stripe`、`inline`
 
 ## 9. 首发不支持（汇总）
 
-纠删码（`ec`，二期）；快照（`snapshot`，二期——chunk 版本已从第一天按快照需要设计）；NFS / SMB / S3 / ublk 网关（二期插件）；内核客户端与 LD_PRELOAD 拦截库（客户端库与协议已留出复用接口）；跨地域复制；磁带 / HSM；WASM 用户策略（二期，策略求值点已预留，`wasm:` 开头的属性值会被拒绝）；跨节点共享可写 mmap；FUSE passthrough 与 io_uring；cgroup io / NVMe WRR / NVM Sets / FDP 隔离；跨节点协调的 QoS（dmClock）与元数据 QoS；元数据 follower 读；审计 open/read（`audit` 只记录修改类操作）；动态库插件中除授权以外的钩子（ADR-0012，待人类确认）。设置这些功能对应的属性会得到明确错误（`EOPNOTSUPP`"二期功能"），不会被静默接受。
+纠删码（`ec`，二期）；快照（`snapshot`，二期——chunk 版本已从第一天按快照需要设计）；NFS / SMB / S3 / ublk 网关（二期插件）；内核客户端与 LD_PRELOAD 拦截库（客户端库与协议已留出复用接口）；跨地域复制；磁带 / HSM；WASM 用户策略（二期，策略求值点已预留，`wasm:` 开头的属性值会被拒绝）；跨节点共享可写 mmap；FUSE passthrough 与 io_uring；cgroup io / NVMe WRR / NVM Sets / FDP 隔离；跨节点协调的 QoS（dmClock）与元数据 QoS；元数据 follower 读；审计 open/read（`audit` 只记录修改类操作）；动态库插件中除授权以外的钩子（ADR-0012，人类于 2026-10-20 批准：首发的动态库 C ABI 只覆盖授权，`docs/plugin-abi.md`）。设置这些功能对应的属性会得到明确错误（`EOPNOTSUPP`"二期功能"），不会被静默接受。
 
 ---
 

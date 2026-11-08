@@ -1,0 +1,12 @@
+name = "webhook"
+version = "0.1.0"
+hooks = ["event_sink"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = []
+budget_ns = 0
+fail_points = ["plugin.webhook.event_sink"]
+[config_schema]
+url = { type = "url", default = "", doc = "接收 POST 的网址（http:// 或 https://）；不写 = 不启用 webhook" }
+proxy = { type = "url", default = "", doc = "走哪个 HTTP 代理；不写 = 不走代理" }

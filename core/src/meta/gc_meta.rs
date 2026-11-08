@@ -13,7 +13,8 @@
 //!   DEDUP 记录再也不会被查到（之后带这个会话号的请求一律 `SESSION_EVICTED`），分批点删；**changelog 修剪**（[`trim_changelog`]，3.11）——
 //!   保留全部消费者游标的最小值之后的记录，但最多 7 天 / 1000 万条：最旧的一页里被所有游标消费过的（有游标时才算这一条：没有消费者时只按
 //!   7 天 / 1000 万条修剪，`wmfs changelog tail` 仍看得到最近的历史）、超过 7 天的、比最新的旧 1000 万条以上的，点删；之后读它们得到显式的
-//!   `410 Gone`。
+//!   `410 Gone`。实现注记（M14 收尾，ADR-0045 第 12 条）：被所有游标消费过的记录也至少留最近 1 万条（[`MIN_KEEP_RECORDS`]）——mgr 在运行时
+//!   它的游标都是最新的，原先 gc 很快就把记录修剪光，`wmfs changelog tail` 常常是空的；7 天与 1000 万条的上限照旧（只会多留）。
 
 use crate::base::ErrCode;
 use crate::base::types::ReqCtx;
@@ -176,6 +177,8 @@ pub fn expire_evicted(eng: &dyn MetaEngine, now_ms: u64) -> Result<usize, ErrCod
 /// changelog 的保留上限（3.11）。
 const KEEP_MS: u64 = 7 * 24 * 3600 * 1000;
 const KEEP_RECORDS: u64 = 10_000_000;
+/// 被所有消费者游标消费过的记录也至少留最近这么多条（ADR-0045 第 12 条，见文件头）。
+pub const MIN_KEEP_RECORDS: u64 = 10_000;
 
 /// [`dead_dedup`] 的一页：要删的键、这一页最后一个键、后面还有没有。
 pub struct DedupPage {
@@ -242,10 +245,7 @@ pub fn trim_changelog(eng: &dyn MetaEngine, now_ms: u64, limit: usize) -> Result
         cut.clear();
         for (k, b) in v.scan(&lo, &hi, limit)? {
             let (seq, r): (u64, ChangeRecV1) = (kv::key_id(&k), decode_v1(&b)?);
-            let consumed = min_cursor.is_some_and(|m| seq <= m);
-            let too_many = seq.saturating_add(KEEP_RECORDS) <= last;
-            let too_old = r.time_ms.saturating_add(KEEP_MS) < now_ms;
-            if !consumed && !too_many && !too_old {
+            if !trimmable(seq, r.time_ms, last, min_cursor, now_ms) {
                 break; // 第一条要留的：之后的更新，都留着
             }
             cut.push(k);
@@ -255,4 +255,33 @@ pub fn trim_changelog(eng: &dyn MetaEngine, now_ms: u64, limit: usize) -> Result
     let (n, more) = (cut.len(), cut.len() == limit);
     delete_keys(eng, cut)?;
     Ok((n, more))
+}
+
+/// 第 `seq` 条（写于 `time_ms`）该修剪吗（见文件头）：被所有游标消费过、又比最新的 `last` 旧 1 万条以上的；超过 7 天的；比最新的旧
+/// 1000 万条以上的。`min_cursor` = 全部消费者游标的最小值（没有游标 = None：只按后两条）。
+fn trimmable(seq: u64, time_ms: u64, last: u64, min_cursor: Option<u64>, now_ms: u64) -> bool {
+    let consumed = min_cursor.is_some_and(|m| seq <= m) && seq.saturating_add(MIN_KEEP_RECORDS) <= last;
+    let too_many = seq.saturating_add(KEEP_RECORDS) <= last;
+    let too_old = time_ms.saturating_add(KEEP_MS) < now_ms;
+    consumed || too_many || too_old
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 游标都追上了（= 最新的 seq）：最近 1 万条不修剪、更早的修剪；超过 7 天的、超过 1000 万条的照样修剪；没有游标时只看后两条。
+    #[test]
+    fn consumed_records_keep_the_newest_ten_thousand() {
+        let (now, fresh, last) = (KEEP_MS * 3, KEEP_MS * 3 - 1000, 50_000);
+        let trim = |seq, time| trimmable(seq, time, last, Some(last), now);
+        assert!(trim(last - MIN_KEEP_RECORDS, fresh), "比最新的旧 1 万条：修剪");
+        assert!(!trim(last - MIN_KEEP_RECORDS + 1, fresh), "最近 1 万条里最旧的一条：留着");
+        assert!(!trim(last, fresh));
+        assert!(trim(last, KEEP_MS * 2 - 1), "超过 7 天：照样修剪");
+        assert!(!trimmable(1, fresh, last, Some(0), now), "还没被消费过：留着");
+        assert!(!trimmable(1, fresh, last, None, now), "没有消费者：只按 7 天 / 1000 万条");
+        assert!(trimmable(5, fresh, KEEP_RECORDS + 5, None, now), "比最新的旧 1000 万条：修剪");
+        assert!(!trimmable(6, fresh, KEEP_RECORDS + 5, None, now));
+    }
 }

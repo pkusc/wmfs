@@ -25,6 +25,7 @@ use crate::base::{ErrCode, clock, lock, log};
 use crate::buf::{Buf, BufSlice};
 use crate::net::client::{Endpoint, Family, check_reply};
 use crate::net::server::Responder;
+use crate::obs::stages::Stage;
 use crate::proto::frame::{FrameHeader, FrameKind, InFrame, MSG_PEER_CALL, OutFrame};
 use crate::proto::peer::{ForwardWrite, PeerOp, PeerReply};
 use crate::proto::{decode_body, encode_body};
@@ -39,6 +40,12 @@ pub fn peer_frame(op: &PeerOp, bulk: Vec<BufSlice>) -> OutFrame {
     OutFrame { hdr, body: encode_body(op), bulk, recv_into: None }
 }
 
+/// 转发给下一跳的帧带上上游请求的 trace_id、span_id + 1（3.11；上游的 [`Responder::trace`]，没有上游是 (0, 0)：不记 span）。
+fn traced(mut f: OutFrame, (trace_id, span_id): (u64, u16)) -> OutFrame {
+    (f.hdr.trace_id, f.hdr.span_id) = (trace_id, span_id.saturating_add(1));
+    f
+}
+
 /// 同步与修复向别的成员发的一次 PeerCall（ListChunks、FetchChunk；等着回复）：回复与 bulk。
 pub(super) fn peer_call(node: &DataNode, ep: &Endpoint, op: &PeerOp) -> Result<(PeerReply, Option<Buf>), ErrCode> {
     let rpc = node.peer.get().ok_or(ErrCode::NOT_READY)?;
@@ -48,7 +55,7 @@ pub(super) fn peer_call(node: &DataNode, ep: &Endpoint, op: &PeerOp) -> Result<(
 
 /// head 写完 pending 之后（write.rs）：登记 pending（客户端的回复句柄交给它），第一次转发（增量）给后继。
 pub fn first_send(node: &Arc<DataNode>, job: Box<WriteJob>, p: Prepared, succ: u32, chain_ver: u64) {
-    let id = job.chunk;
+    let (id, trace) = (job.chunk, job.reply.as_ref().map_or((0, 0), Responder::trace));
     let (header, blocks) = p.nv.forward_parts();
     let fw = ForwardWrite {
         chunk: id,
@@ -80,11 +87,12 @@ pub fn first_send(node: &Arc<DataNode>, job: Box<WriteJob>, p: Prepared, succ: u
         );
         std::process::abort();
     }
-    send(node, fw, p.nv.into_bulk(), succ);
+    send(node, fw, p.nv.into_bulk(), succ, trace);
 }
 
-/// 发一次 ForwardWrite；结果（确认、NeedFull、错误、超时）由 repl 线程处理（replica.rs 的 `on_reply`）。
-pub fn send(node: &DataNode, fw: ForwardWrite, bulk: Vec<BufSlice>, succ: u32) {
+/// 发一次 ForwardWrite；结果（确认、NeedFull、错误、超时）由 repl 线程处理（replica.rs 的 `on_reply`）。`trace` = 上游请求的
+/// (trace_id, span_id)（M14）。
+pub fn send(node: &DataNode, fw: ForwardWrite, bulk: Vec<BufSlice>, succ: u32, trace: (u64, u16)) {
     let (chunk, version) = (fw.chunk, fw.version);
     let q = node.repl.get().cloned();
     let done = move |res: Result<InFrame, ErrCode>| {
@@ -99,7 +107,8 @@ pub fn send(node: &DataNode, fw: ForwardWrite, bulk: Vec<BufSlice>, succ: u32) {
     let _ = fail_point("chain.forward.delay");
     let ep = node.map.get().and_then(|m| chain::endpoint(&m, succ));
     let (Some(rpc), Some(ep)) = (node.peer.get(), ep) else { return done(Err(ErrCode::NOT_SERVING)) };
-    rpc.call_cb(&ep, Family::Data, peer_frame(&PeerOp::ForwardWrite(fw), bulk), FWD_TIMEOUT, Box::new(done));
+    let f = traced(peer_frame(&PeerOp::ForwardWrite(fw), bulk), trace);
+    rpc.call_cb(&ep, Family::Data, f, FWD_TIMEOUT, Box::new(done));
 }
 
 /// 把 pending（规则 2 之后是已在本地提交的）版本完整地重发给 `succ`（NeedFull、重新驱动、后继变了）。失败只写日志：pending 留着，
@@ -144,7 +153,7 @@ fn pack_and_send(node: &DataNode, id: &ChunkId, succ: u32) -> Result<(), ErrCode
         blocks: vec![],
         sync,
     };
-    send(node, fw, vec![buf.freeze().whole()], succ);
+    send(node, fw, vec![buf.freeze().whole()], succ, (0, 0)); // 重发不属于哪个客户端请求
     Ok(())
 }
 
@@ -156,6 +165,9 @@ fn pack_and_send(node: &DataNode, id: &ChunkId, succ: u32) -> Result<(), ErrCode
 /// 的那一次：已提交的就是这个版本，算提交了）。
 #[must_use]
 pub fn settle(node: &Arc<DataNode>, id: &ChunkId, mut p: PendingWrite) -> Option<Box<WriteJob>> {
+    if p.successor.is_some() {
+        p.mark(Stage::Forward); // 等后继确认的时间（慢日志的各阶段耗时，ADR-0045 第 9 条）
+    }
     if !p.committed
         && let Err(e) = write::commit(node, id, p.target, p.sync, p.clean)
         && node.targets.get(&p.target).and_then(|t| read::committed_version(node, t, id)) != Some(p.version)
@@ -170,6 +182,7 @@ pub fn settle(node: &Arc<DataNode>, id: &ChunkId, mut p: PendingWrite) -> Option
         node.chunks.set_pending(id, p);
         return None;
     }
+    p.mark(Stage::Disk); // 本地提交
     sync::touch(node, id, p.target);
     let next = node.chunks.finish(id);
     if let Some(up) = p.upstream {
@@ -197,11 +210,15 @@ pub fn abandon(node: &Arc<DataNode>, id: &ChunkId, p: PendingWrite) -> Option<Bo
 pub fn relay(node: &DataNode, op: PeerOp, succ: u32, up: Responder, ok: Vec<u8>) {
     let ep = node.map.get().and_then(|m| chain::endpoint(&m, succ));
     let (Some(rpc), Some(ep)) = (node.peer.get(), ep) else { return up.error(ErrCode::NOT_SERVING, 0) };
-    let cb = move |res: Result<InFrame, ErrCode>| match res.and_then(check_reply) {
-        Ok(_) => up.reply(ok, vec![]),
-        Err(e) => up.error(e, 0),
+    let f = traced(peer_frame(&op, vec![]), up.trace());
+    let cb = move |res: Result<InFrame, ErrCode>| {
+        up.mark(Stage::Forward); // 整条链的回复到了（慢日志的各阶段耗时，ADR-0045 第 9 条）
+        match res.and_then(check_reply) {
+            Ok(_) => up.reply(ok, vec![]),
+            Err(e) => up.error(e, 0),
+        }
     };
-    rpc.call_cb(&ep, Family::Data, peer_frame(&op, vec![]), RELAY_TIMEOUT, Box::new(cb));
+    rpc.call_cb(&ep, Family::Data, f, RELAY_TIMEOUT, Box::new(cb));
 }
 
 /// 转发送不到后继（连接断开、超时）/ 送到了（后继回了话，哪怕回的是错误）："持续 10 s 无法把转发送达后继"由心跳上报，3.4.2.10。

@@ -39,6 +39,7 @@ use crate::meta::schema::records::{
     ClusterInfoV1, ClusterSettingsV1, KeyMetaV1, NodeRecV1, PluginListV1, WriteBatchV1, decode_v1,
 };
 use crate::net::client::RpcClient;
+use crate::obs::stages::Stages;
 use crate::proto::handshake::{SERVER_KEY, derive_secret};
 use crate::proto::meta::MetaReply;
 use crate::proto::peer::ClusterMap;
@@ -91,8 +92,9 @@ impl OpEnv {
         OpEnv { pipeline, attrs, maps, cap_key, usage }
     }
 
-    /// 一个操作的上下文：`map` 是这个批次（或这个只读请求）的集群图快照，集群参数取自它。
-    pub fn op_ctx<'a>(&'a self, req: &'a ReqCtx, map: &'a ClusterMap) -> OpCtx<'a> {
+    /// 一个操作的上下文：`map` 是这个批次（或这个只读请求）的集群图快照，集群参数取自它；`stages` = 这个请求的各阶段耗时（执行器里的
+    /// 客户端修改才有，ADR-0045 第 9 条）。
+    pub fn op_ctx<'a>(&'a self, req: &'a ReqCtx, map: &'a ClusterMap, stages: Option<&'a Stages>) -> OpCtx<'a> {
         OpCtx {
             req,
             pipeline: &self.pipeline,
@@ -101,6 +103,7 @@ impl OpEnv {
             settings: &map.settings,
             cap_key: &self.cap_key,
             usage: &self.usage,
+            stages,
         }
     }
 }
@@ -290,7 +293,7 @@ impl EmbeddedEngine {
         let rtx = self.shared.db.begin_read().map_err(|e| redb_eio("读事务", e))?;
         let view = ReadView::new(&rtx)?;
         let map = self.shared.map_for(&view)?;
-        f(&view, &self.shared.env.op_ctx(ctx, &map))
+        f(&view, &self.shared.env.op_ctx(ctx, &map, None))
     }
 }
 
@@ -311,12 +314,12 @@ impl MetaEngine for EmbeddedEngine {
     fn txn(&self, req: TxnRequest) {
         let t0 = match self.hook.enter() {
             Ok(t) => t,
-            Err(c) => return (req.done)(Err(c)),
+            Err(c) => return (req.done)(Err(c), req.stages),
         };
         match self.exec_tx.try_send(req) {
             Ok(()) => {}
-            Err(TrySendError::Full(r)) => (r.done)(Err(ErrCode::BUSY)),
-            Err(TrySendError::Disconnected(r)) => (r.done)(Err(ErrCode::NOT_LEADER)),
+            Err(TrySendError::Full(r)) => (r.done)(Err(ErrCode::BUSY), r.stages),
+            Err(TrySendError::Disconnected(r)) => (r.done)(Err(ErrCode::NOT_LEADER), r.stages),
         }
         self.hook.exit(t0, true);
     }

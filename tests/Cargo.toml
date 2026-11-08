@@ -185,6 +185,10 @@ name = "meta_quota"
 path = "it/meta_quota.rs"
 
 [[test]]
+name = "quota_denied"
+path = "it/quota_denied.rs"
+
+[[test]]
 name = "meta_rstat"
 path = "it/meta_rstat.rs"
 
@@ -313,3 +317,13 @@ path = "it/client_strong.rs"
 [[test]]
 name = "classes"
 path = "it/classes.rs"
+
+# M14：动态库插件的稳定 C ABI（gcc 编 examples/dylib-deny-uid/ 里的两个 C 插件；用到 fail point：单独一个测试程序）。
+[[test]]
+name = "dylib"
+path = "it/dylib.rs"
+
+# M14：trace（链头 → 中间 → 链尾的 span）、GET /api/v1/node 的只增字段、节点 /metrics 的新指标、慢请求阈值的 fail point。
+[[test]]
+name = "trace"
+path = "it/trace.rs"

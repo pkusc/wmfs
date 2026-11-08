@@ -6,8 +6,9 @@
 #        数据完整……）；
 #     ② 再起一个同样的部署，在 wmfs-tools 容器里跑 fio verify、pjdfstest 子集、fsx（没有镜像 → SKIP，不算通过也不算失败）。
 #     M7 起冒烟里有目录属性的 set/get 与递归用量。
-#   nas-safe（M9 起的阶段版：3 节点、replicas=3；M12 起 /home 加上 trash=7d、audit=on）：① tests/profiles/nas_safe.rs（写入中依次 kill -9
-#     每个节点、fsync 过的文件全部完好；M12：回收站恢复、审计标记）；
+#   nas-safe（M9 起的阶段版：3 节点、replicas=3；M12 起 /home 加上 trash=7d、audit=on；M14 起是完整版：wmfs dev up --profile nas-safe
+#     在集群起好之后起一个 mgr）：① tests/profiles/nas_safe.rs（写入中依次 kill -9 每个节点、fsync 过的文件全部完好；M12：回收站恢复、
+#     审计标记；M14：审计日志在 mgr 被 kill -9、重启之后仍完整，按 seq 去重之后每个文件的 Create 恰好一条）；
 #     ② 再起一个 nas-safe 部署跑 Jepsen-lite（tests/it/jepsen_register.rs：寄存器在随机 kill / SIGSTOP 下线性一致；只跑这一个用例——
 #     那里另有一个 drain 用例，drain 撤销不了，只由 scripts/accept.d/m10.sh 最后跑），之后等链全部 Serving、跑不变式检查器
 #     （tests/it/replica_check.rs）。
@@ -55,12 +56,12 @@ minimal)
     fi
     ;;
 nas-safe)
-    # 阶段版（design.md 9.7）：3 节点、TCP、/home replicas=3（M12 起加上 trash=7d、audit=on）。两部分都有总期限（timeout 连同测试起的
-    # 节点与挂载进程一起结束），超时或失败之后照样 wmfs dev down --purge 兜底：不留进程、挂载与目录。
+    # design.md 9.7：3 节点、TCP、/home replicas=3（M12 起加上 trash=7d、audit=on；M14 起含 mgr 与审计日志）。两部分都有总期限（timeout
+    # 连同测试起的节点、挂载进程与 mgr 一起结束），超时或失败之后照样 wmfs dev down --purge 兜底：不留进程、挂载与目录。
     pdir="$(mktemp -d "${TMPDIR:-/tmp}/wmfs-profile-nas-safe-XXXX")"
     if WMFS_PROFILE_DIR="$pdir" timeout 1200 cargo test --release -p wmfs --test profile_nas_safe -- --ignored --nocapture \
         >"$LOG" 2>&1; then
-        ok "写入中依次 kill -9 每个节点：客户端 0 个错误；fsync 过的文件全部完好；节点回来之后先 Syncing、后 Serving，副本差距归零；回收站恢复与审计标记"
+        ok "写入中依次 kill -9 每个节点：客户端 0 个错误；fsync 过的文件全部完好；节点回来之后先 Syncing、后 Serving，副本差距归零；回收站恢复与审计标记；mgr 重启后审计日志完整"
     else
         tail -30 "$LOG"
         bad "单点故障无错误 + 已确认写不丢（cargo test -p wmfs --test profile_nas_safe -- --ignored）"

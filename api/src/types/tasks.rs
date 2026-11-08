@@ -1,5 +1,5 @@
-//! M11 的管理端点的请求/响应结构（design.md 7.1、3.10）：后台任务（列表、暂停、恢复、立即跑一轮、限速）、本节点的任务进度
-//! （`GET /api/v1/node`）、数据加密密钥的建立。字段只增不改（ADR-0005）；JSON 都有逐字的金样（`tasks/tests.rs`）。
+//! M11 的管理端点的请求/响应结构（design.md 7.1、3.10）：后台任务（列表、暂停、恢复、立即跑一轮、限速）、数据加密密钥的建立
+//! （本节点的任务进度 `GET /api/v1/node` 的 `NodeInfoReply` 在 `types/obs.rs`）。字段只增不改（ADR-0005）；JSON 都有逐字的金样（`tasks/tests.rs`）。
 
 use serde::{Deserialize, Serialize};
 
@@ -64,16 +64,6 @@ pub struct TaskSetReq {
     pub bw: Option<String>,
     #[serde(default)]
     pub items: Option<u64>,
-}
-
-/// `GET /api/v1/node`（每个节点回答本节点的）：节点号、本节点看不看得到任务的控制（`controlled`：它在元数据 raft 里、已应用的 KV 里
-/// 有集群级的任务记录；只做数据的节点为 false——`wmfs task pause|set|run` 到不了它，它一直按默认值跑）与本节点上 `every-node` 任务的
-/// 进度（M11；target、内存池等随 M14 加入，只增）。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-pub struct NodeInfoReply {
-    pub node_id: u32,
-    pub controlled: bool,
-    pub tasks: Vec<TaskInfo>,
 }
 
 /// `POST /api/v1/datakeys` 的请求：名字（`encrypt=tenant:<名字>` 用它）与它属于哪个租户。

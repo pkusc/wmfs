@@ -29,7 +29,8 @@ use super::lease::{Lease, OpenDelta, OpenFiles};
 use crate::base::{ErrCode, clock, lock, log, rand, sys};
 use crate::net::client::{Endpoint, Family, RpcClient};
 use crate::net::retry::{BACKOFF_MAX_MS, BACKOFF_START_MS, retryable};
-use crate::proto::frame::{FrameHeader, FrameKind, InFrame, MSG_META_CALL, MSG_NODE_CALL, OutFrame};
+use crate::obs::trace::ClientTimer;
+use crate::proto::frame::{FrameHeader, FrameKind, InFrame, MSG_META_CALL, MSG_NODE_CALL, OutFrame, msg_name};
 use crate::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
 use crate::proto::peer::{ClusterMap, NodeOp, NodeReply};
 use crate::proto::{decode_body, encode_body};
@@ -280,7 +281,10 @@ impl MetaClient {
         need: u64,
     ) -> Result<(InFrame, Option<u64>), ErrCode> {
         let deadline = clock::mono_ms().saturating_add(self.opts.op_timeout.as_millis() as u64);
-        let trace_id = rand::random_u64(); // 同一个操作的重试用同一个 trace_id
+        // 同一个操作的重试用同一个 trace_id；会话心跳不属于哪个文件操作，用 0（服务端不记 span，`wmfs trace --recent` 不被心跳占满，3.11）
+        let trace_id = if what == "SessionHeartbeat" { 0 } else { rand::random_u64() };
+        let (component, op) = (msg_name(msg_type).unwrap_or("MetaCall"), || what.to_string());
+        let _slow = ClientTimer { component, op: &op, trace_id, t0: std::time::Instant::now() }; // 慢了写客户端日志（3.11）
         let (mut backoff, mut hops, mut attempt) = (BACKOFF_START_MS, 0, 0);
         let mut timed_out = false;
         loop {

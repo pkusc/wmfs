@@ -29,6 +29,7 @@ use crate::meta::schema::records::{
     DentryV1, F_HAS_ACL, F_INLINE, F_ORPHAN, GcRecV1, InodeV1, KIND_BLK, KIND_CHR, KIND_DIR, KIND_FIFO, KIND_FILE,
     KIND_SOCK, LayoutV1,
 };
+use crate::obs::stages::Stage;
 use crate::proto::cap::{self, CapV1, RIGHT_READ, RIGHT_WRITE};
 use crate::proto::meta::{AttrOut, OpenOut};
 
@@ -302,6 +303,7 @@ pub fn may_read(v: &dyn KvRead, c: &OpCtx, n: &Node) -> bool {
 /// 调 authz 钩子（posix-mode → posix-acl → path-caps，3.7.2）。inode 带扩展 ACL 时把它的 `system.posix_acl_access`
 /// 一并交给插件。实现注记（M10）：调用者的 key 有路径限制时才算 `ancestors`（要看的对象——有父目录时是父目录，否则是目标——的祖先，
 /// 根 → 父，按 attr_epoch 缓存；只有 path-caps 用它，别的 key 给空）；路径遍历的放宽见 `ns/path_view.rs`。
+/// 实现注记（M14 收尾，ADR-0045 第 9 条）：之前的时间记作"执行"，这里（读 ACL、算祖先、问插件）记作"authz"（慢日志的各阶段耗时）。
 pub fn authz(
     v: &dyn KvRead,
     c: &OpCtx,
@@ -310,6 +312,7 @@ pub fn authz(
     parent: Option<&Node>,
     victim: Option<&Node>,
 ) -> Result<(), ErrCode> {
+    c.mark(Stage::Exec);
     let acl = |n: Option<&Node>| match n {
         Some(n) if n.rec.flags & F_HAS_ACL != 0 => get_xattr(v, n.ino, ACL_ACCESS),
         _ => Ok(None),
@@ -320,7 +323,9 @@ pub fn authz(
     let who = relaxed.as_ref().unwrap_or(&c.req.who);
     let input =
         AuthzInput { who, op, target: t.as_ref(), parent: p.as_ref(), victim: w.as_ref(), ancestors: &ancestors };
-    c.pipeline.authz(&input)
+    let r = c.pipeline.authz(&input);
+    c.mark(Stage::Authz);
+    r
 }
 
 fn view<'a>(n: Option<&Node>, acl: &'a Option<Vec<u8>>) -> Option<InodeView<'a>> {

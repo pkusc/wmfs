@@ -22,6 +22,7 @@ sha2.workspace = true
 crossbeam-channel.workspace = true
 tiny_http.workspace = true
 serde_json.workspace = true
+libloading.workspace = true # 动态库插件（hooks/cabi.rs，3.7.6，M14）
 
 [lints]
 workspace = true

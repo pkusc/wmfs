@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use slog::KV as _;
 
 use super::{ErrCode, clock};
+pub use wmfs_api::units::utc_string; // 实现注记（M14）：挪进 wmfs-api（wmfs-mgr 的日志也用它），这里重新导出
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -110,24 +111,6 @@ pub fn log(l: Level, component: &str, msg: impl Display) {
     }
 }
 
-/// Unix 毫秒 → `YYYY-MM-DDTHH:MM:SS.mmmZ`（UTC；按 Howard Hinnant 的 civil_from_days 算法）。
-/// 思路：公历每 400 年（146 097 天）完全重复一次；把"一年"看成从 3 月 1 日开始，闰日 2 月 29 日就落在年末，
-/// 于是每个月的起始天数可以用一个线性公式算出来。
-pub fn utc_string(ms: u64) -> String {
-    let secs = (ms / 1000) as i64;
-    let (days, sod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400)); // 1970-01-01 起的天数、当天的第几秒
-    let z = days + 719_468; // 改成从 0000-03-01 起算的天数
-    let era = z.div_euclid(146_097); // 第几个 400 年周期
-    let doe = z.rem_euclid(146_097); // 周期内的第几天（0..=146 096）
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // 周期内的第几年（0..=399），已扣掉闰日
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // 这一年（从 3 月 1 日起）的第几天（0..=365）
-    let mp = (5 * doy + 2) / 153; // 从 3 月起算的月份（0 = 3 月 …… 11 = 次年 2 月）
-    let day = doy - (153 * mp + 2) / 5 + 1; // 当月第几天（1..=31）
-    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // 换回 1..=12
-    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 }; // 1、2 月属于"下一年"
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z", sod / 3600, sod % 3600 / 60, sod % 60, ms % 1000)
-}
-
 /// 把 raft-rs 的 slog 日志转到我们自己的日志：`slog::Logger::root(SlogBridge, slog::o!())`（3.4.1.1）。
 pub struct SlogBridge;
 
@@ -164,14 +147,6 @@ impl slog::Serializer for KvText {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn utc_formatting() {
-        assert_eq!(utc_string(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(utc_string(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
-        assert_eq!(utc_string(951_782_400_000), "2000-02-29T00:00:00.000Z", "闰日");
-        assert_eq!(utc_string(1_792_454_400_000), "2026-10-20T00:00:00.000Z");
-    }
 
     #[test]
     fn level_parsing() {

@@ -122,11 +122,8 @@ pub fn run_key(cmd: KeyCmd) -> i32 {
             let call = move |c: &ApiClient, _: &str| {
                 let r = c.post::<_, KeyCreateReply>("/api/v1/keys", &req)?;
                 if let Some(p) = &dest {
-                    let e = |e: wmfs_core::base::ErrCode| ApiError {
-                        status: 0,
-                        code: "eio".into(),
-                        message: format!("写 {} 失败：{e}", p.display()),
-                    };
+                    let e =
+                        |e: wmfs_core::base::ErrCode| ApiError::new(0, "eio", format!("写 {} 失败：{e}", p.display()));
                     sys::atomic_write(p, r.key_file.as_bytes()).map_err(e)?;
                 }
                 Ok(r)

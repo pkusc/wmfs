@@ -1,0 +1,11 @@
+name = "prometheus-exporter"
+version = "0.1.0"
+hooks = ["mgmt_ext"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = ["quota", "quota.*"]
+budget_ns = 0
+fail_points = ["plugin.prometheus-exporter.mgmt_ext"]
+[config_schema]
+# 没有部署参数：抓哪些节点由 wmfs mgr --cluster 决定。

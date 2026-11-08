@@ -1,6 +1,7 @@
 //! M8 的管理端点（design.md 7.1、3.4.1.9、3.7.2）：
 //! - `GET /api/v1/cluster`：集群概览——各节点（地址、状态、元数据里的实际角色 `member` 与指定的角色 `member_wanted`、leader 看到的
-//!   matched、是否追上）、元数据 raft 的 leader/term/commit/applied/成员、集群警告（[`ClusterReply`]）。`wmfs node list` 用它。
+//!   matched、是否追上）、元数据 raft 的 leader/term/commit/applied/成员、集群警告（[`ClusterReply`]）；M14 只增 target（编号、节点、
+//!   状态）、链的条数、Active 的会话数（dashboard 的集群面板）。`wmfs node list` 用它。
 //! - `POST /api/v1/nodes/<id>/{drain,remove,promote}`（admin）：只改节点记录（一个 exclusive 批次——拓扑类操作，3.4.1.4 规则 5；changelog
 //!   `NodeDrain/NodeRemove/NodePromote`，`map_epoch += 1`），成员变更由 cluster-mgr 接着做（`meta/raft/membership.rs`）。drain = 不再当
 //!   leader、不再被提升（M9 起还要把链从它上面迁走）；remove = 移出元数据 raft（不能移除最后一个 voter）；promote = 指定为 voter（先以
@@ -13,14 +14,19 @@
 //!   成员的 `state`：链记录里的 `serving`/`syncing`；leader 最近 2 s 没听到它的心跳 → `unheard`，听到的 boot_id 与集群图里的不同（刚重启、
 //!   链管理器还没处理）→ `restarting`（审查后加的取值：`wmfs dev wait chains-serving` 不把它们算作 Serving）。
 //!
-//! 前三组（与链）只有就绪的元数据 leader 回答（`api.rs` 的 leader_gate，ADR-0038 第 2 条；读写途中失去 leader 也照这条回，`failed_at`）；读是
-//! 线性一致读、写是 seq 0 的执行器闭包（复用 `api.rs` 的 `read` / `write` / `write_exclusive`）。
+//! - M14 收尾（ADR-0045 第 11 条，7.1 列了、roadmap 没排进里程碑的最小版）：`GET /api/v1/features`（[`FeaturesReply`]：GLOBAL 已启用的
+//!   incompat 特性与没有移除的节点各自声明支持的，3.2.10）、`POST /api/v1/features/<name>/enable`（admin）：首发没有能启用的——3.2.10
+//!   的预留名（都是二期）回 `FEATURE_UNSUPPORTED`"二期功能"，不认识的名字回 `EINVAL`；不写 GLOBAL、不写 changelog。
+//!
+//! 前三组（与链、特性）只有就绪的元数据 leader 回答（`api.rs` 的 leader_gate，ADR-0038 第 2 条；读写途中失去 leader 也照这条回，`failed_at`）；
+//! 读是线性一致读、写是 seq 0 的执行器闭包（复用 `api.rs` 的 `read` / `write` / `write_exclusive`）。
 
 use super::api::{failed_at, read, write, write_exclusive};
 use super::auth;
 use super::http::{MgmtCtx, Reply, err, json};
 use crate::api::types::{
-    ChainInfo, ChainMember, ChainsReply, ClusterReply, ForceServingReq, NodeInfo, NodeOpReply, PluginsReply, PluginsReq,
+    ChainInfo, ChainMember, ChainsReply, ClusterReply, ClusterTarget, FeaturesReply, ForceServingReq, NodeFeatures,
+    NodeInfo, NodeOpReply, PluginsReply, PluginsReq,
 };
 use crate::api::url::param;
 use crate::base::types::ReqCtx;
@@ -30,20 +36,27 @@ use crate::meta::cluster::chains::{self, SERVING};
 use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::cluster::{chain_mgr, plugins};
 use crate::meta::engine::EmbeddedEngine;
-use crate::meta::engine::txn::{EngineStatus, MetaEngine};
+use crate::meta::engine::txn::{EngineStatus, KvScan, MetaEngine};
 use crate::meta::schema::keys;
 use crate::meta::schema::kv;
 use crate::meta::schema::records::{
-    ChainRecV1, META_LEARNER, META_NONE, META_VOTER, NODE_ACTIVE, NODE_DRAINING, NODE_REMOVED, NodeRecV1,
+    ChainRecV1, META_LEARNER, META_NONE, META_VOTER, NODE_ACTIVE, NODE_DRAINING, NODE_REMOVED, NodeRecV1, SessionRecV1,
+    TargetRecV1, decode_v1,
 };
+use crate::meta::sessions::SESSION_ACTIVE;
 use crate::proto::peer::ClusterMap;
 
 /// 这个路径归这里管吗（`meta-hash` 另走 [`meta_hash`]）。
 pub fn handles(path: &str) -> bool {
-    matches!(path, "/api/v1/cluster" | "/api/v1/cluster/plugins" | "/api/v1/chains")
+    matches!(path, "/api/v1/cluster" | "/api/v1/cluster/plugins" | "/api/v1/chains" | "/api/v1/features")
         || path.starts_with("/api/v1/nodes/")
         || path.starts_with("/api/v1/chains/")
+        || path.starts_with("/api/v1/features/")
 }
+
+/// 3.2.10 的预留名（都是二期，首发不能启用）。
+const RESERVED_FEATURES: [&str; 4] =
+    ["chunk.snapshots", "chunk.dyn_transform", "meta.ec-layout", "proto.pipelined-meta"];
 
 /// leader_gate 之后的分派（`usage` = leader 内存里的 target 心跳情况，链成员的状态用）。
 pub(super) fn serve(
@@ -71,6 +84,8 @@ pub(super) fn serve(
             }
         },
         ("POST", p) if p.starts_with("/api/v1/nodes/") => node_op(eng, req, p).map(|x| json(200, &x)),
+        ("GET", "/api/v1/features") => read(eng, req, |_v, c| Ok(features(c.map))).map(|x| json(200, &x)),
+        ("POST", p) if p.starts_with("/api/v1/features/") => Err(enable(p)),
         _ => Err(Failed::new(ErrCode::EINVAL, format!("{path} 不支持 {method}"))),
     };
     r.unwrap_or_else(|f| failed_at(eng, f))
@@ -89,10 +104,16 @@ pub(super) fn meta_hash(ctx: &MgmtCtx, method: &str, url: &str, auth_hdr: Option
 }
 
 fn overview(eng: &EmbeddedEngine, req: &ReqCtx) -> Result<ClusterReply, Failed> {
-    let map = read(eng, req, |_v, c| Ok(c.map.clone()))?; // 线性一致：ReadIndex 之后的集群图
+    let (map, sessions) = read(eng, req, |v, c| Ok((c.map.clone(), active_sessions(v)?)))?; // 线性一致：ReadIndex 之后
     let (st, role) = (eng.status(), eng.role());
     let nodes = map.nodes.iter().map(|(id, n)| info(*id, n, &st, role.leader_id)).collect();
+    let state =
+        |s: u8| ["unknown", "up", "offline", "draining", "removed"].get(s as usize).copied().unwrap_or("unknown");
+    let target = |(id, t): &(u32, TargetRecV1)| ClusterTarget { id: *id, node: t.node, state: state(t.state).into() };
     Ok(ClusterReply {
+        targets: map.targets.iter().map(target).collect(),
+        chains: map.chains.len() as u64,
+        sessions,
         leader: role.leader_id,
         term: role.term,
         commit: st.commit,
@@ -103,6 +124,15 @@ fn overview(eng: &EmbeddedEngine, req: &ReqCtx) -> Result<ClusterReply, Failed> 
         nodes,
         warnings: map.warnings.clone(),
     })
+}
+
+/// Active 的客户端会话数（M14：`ClusterReply.sessions`）。
+fn active_sessions(v: &dyn KvScan) -> Result<u64, Failed> {
+    let mut n = 0;
+    for (_, b) in kv::scan_tag(v, keys::T_SESSION)? {
+        n += u64::from(decode_v1::<SessionRecV1>(&b)?.state == SESSION_ACTIVE);
+    }
+    Ok(n)
 }
 
 fn info(id: u32, n: &NodeRecV1, st: &EngineStatus, leader: u32) -> NodeInfo {
@@ -181,6 +211,30 @@ fn node_op(eng: &EmbeddedEngine, req: &ReqCtx, path: &str) -> Result<NodeOpReply
         Ok(n)
     })?;
     Ok(NodeOpReply { node: info(id, &n, &st, eng.role().leader_id), message: message.into() })
+}
+
+/// `GET /api/v1/features`（见文件头）：GLOBAL 已启用的 incompat 特性，与没有移除的节点各自声明支持的。
+fn features(m: &ClusterMap) -> FeaturesReply {
+    let nodes = m.nodes.iter().filter(|(_, n)| n.state != NODE_REMOVED);
+    let nodes = nodes.map(|(id, n)| NodeFeatures { node_id: *id, features: n.features.clone() }).collect();
+    FeaturesReply { enabled: m.features.incompat.clone(), nodes }
+}
+
+/// `POST /api/v1/features/<name>/enable`（见文件头）：首发一律失败（预留名 `FEATURE_UNSUPPORTED`，别的 `EINVAL`）。
+fn enable(path: &str) -> Failed {
+    match path.strip_prefix("/api/v1/features/").and_then(|r| r.strip_suffix("/enable")) {
+        Some(n) if RESERVED_FEATURES.contains(&n) => {
+            Failed::new(ErrCode::FEATURE_UNSUPPORTED, format!("{n} 是二期功能：首发不能启用"))
+        }
+        Some(n) => Failed::new(
+            ErrCode::EINVAL,
+            format!(
+                "不认识的特性 {n:?}：首发没有能启用的 incompat 特性（预留名都是二期功能：{}）",
+                RESERVED_FEATURES.join("、")
+            ),
+        ),
+        None => Failed::new(ErrCode::EINVAL, format!("{path}：应为 /api/v1/features/<名字>/enable")),
+    }
 }
 
 /// leader 最近听到的 target 的 boot_id（没听到 → None）。

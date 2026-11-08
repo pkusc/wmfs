@@ -12,7 +12,7 @@ use crate::base::ErrCode;
 /// （3.11：注册时加锁，热路径只做原子加）。code = OK 的计数器与直方图在创建时注册；某个错误码第一次出现时才注册它的计数器，
 /// 之后从本族自己的小表里取（这把锁只在错误回复上用）。实现注记（M1）：`op` 暂时等于 family，各服务解出具体操作后再细分。
 pub(super) struct FamilyStats {
-    family: &'static str,
+    pub(super) family: &'static str,
     ok: Arc<Counter>,
     latency: Arc<Histogram>,
     errors: Mutex<Vec<(ErrCode, Arc<Counter>)>>,

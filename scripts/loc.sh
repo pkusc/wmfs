@@ -125,9 +125,26 @@ LIMIT=38000
 # M13 收尾（ADR-0044，design.md 2.2 的注记）：再新增约 190 行。重估两个已超出估算的：core/meta/cluster 1555 → 1605（已约 1,603：
 # p99 的记账与 latency_target_exceeded、hdd 标注；余下小改）、core/data 3120 → 3206（已约 3,138：latency.rs、slots.rs；余下 M14 的
 # trace span 约 68，与上次重估相同）。Σ max ≈ 37,041（超过上报线 37,000，写进了 M13 收尾的 escalations；没有超过上限 38,000）。
-MODULES="wmfs-api:1175 core/base:950 core/obs:250 core/proto:900 core/buf:420 core/net:1285 core/hooks:1145
-core/meta/raft:1780 core/meta/engine:830 core/meta/schema:620 core/meta/ns:2080 core/meta:3120 core/meta/cluster:1605
-core/data:3206 core/client:2485 core/bg:1210 core/mgmt:1455 core:970 plugins:4980 cli:5500 dashboard:880
+# M14（design.md 2.2 的 M14 注记）：新增约 1,750 行（预算约 1,190，超出约 47%）。已写完的按实际重估、超出的上调，共十一个：dashboard 880 → 1210
+# （已约 1,207：宿主——manifest 校验、调用包装、唯一的 changelog 循环、HTTP 与 tick、装配、/metrics 的抓取与合并——约 520，原估 150；五个插件约
+# 540；ApiClient 约 145）、core/obs 250 → 110（下调：已写完，约 108）、core/hooks 1145 → 1190（cabi.rs 约 190，原估 150）、core/mgmt 1455 → 1490
+# （node 与 trace 端点约 60）、cli 5500 → 5560（已约 5,514：mgr、trace、dev mgr、dev wait alert/audit-caught-up、dev restart --dylib；余下 M15 约 45）、
+# core/net 1285 → 1295、core/meta/cluster 1605 → 1610、core/client 2485 → 2490（都已写完，余下小改）、core/data 3206 → 3165（下调：trace 已写完）、
+# core 970 → 935（下调：mgr 不由 core 装配，余下 M15 约 5）、wmfs-api 不变（已约 1,166）。Σ max ≈ 37,320（超过上报线 37,000，没有超过上限 38,000）。
+# M14 审查修复（design.md 2.2 的 M14 审查注记）：净增约 230 行（共约 36,980）。尺寸、时长与 UTC 时刻的函数从 core/base 挪进 wmfs-api（约 83 行，
+# 两边的估算一起挪：wmfs-api 1175 → 1265、core/base 950 → 865）；dashboard 1210 → 1365（changelog 循环的 audit-log 等游标、webhook 攒批、
+# 按 oldest 跳过缺口约 +55，告警按序列的 rate、状态枚举、操作名核对、fetch 约 +50，exporter 自己的线程约 +20，audit-log 不留半行约 +30，
+# ApiClient 的短超时、节点发现、记住回答的地址约 +20）；core/mgmt 1490 → 1508（cluster 的 target、链数、会话数）；另有几处小改的按实际：
+# core/obs 117、core/net 1298、core/hooks 1193、core/meta/cluster 1612、core/data 3170、core/bg 1212。Σ max ≈ 37,515（超过上报线 37,000，
+# 没有超过上限 38,000）。
+# M14 收尾（ADR-0045 第 9–12 条，design.md 2.2 的注记）：净增约 270 行（共约 37,247；ADR 估的是约 100）。慢日志的各阶段耗时约 165（core/obs 的
+# stages.rs、Responder 拆出 server/responder.rs 与它的计时、TxnRequest/OpCtx 带计时、执行器与数据路径上的标记），grows 告警约 26，features 的
+# 最小版约 75（wmfs-api、core/mgmt、cli），changelog 至少留 1 万条约 6。超出的九个都已写完，按实际上调：wmfs-api 1265 → 1271、core/obs 117 → 163、
+# core/net 1298 → 1331、core/meta/engine 830 → 850、core/meta/ns 2080 → 2083、core/meta 3120 → 3124、core/data 3170 → 3219、core/mgmt 1508 → 1533、
+# dashboard 1365 → 1391。Σ max ≈ 37,727（超过上报线 37,000，没有超过上限 38,000）。
+MODULES="wmfs-api:1271 core/base:865 core/obs:163 core/proto:900 core/buf:420 core/net:1331 core/hooks:1193
+core/meta/raft:1780 core/meta/engine:850 core/meta/schema:620 core/meta/ns:2083 core/meta:3124 core/meta/cluster:1612
+core/data:3219 core/client:2490 core/bg:1212 core/mgmt:1533 core:935 plugins:4980 cli:5560 dashboard:1391
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。

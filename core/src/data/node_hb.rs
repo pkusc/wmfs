@@ -8,6 +8,8 @@
 //! hb 线程立刻拉一次（3.4.2.4：通知 hb 线程立即拉集群图）。
 //!
 //! 实现注记（M13 收尾，ADR-0044 第 5 条）：心跳末尾带上按存储类统计的 p99 延迟（`class_p99`，`latency.rs`）。
+//! 实现注记（M14，7.3）：每次心跳顺带设 `wmfs_target_used_bytes{target}`、`wmfs_target_capacity_bytes{target}`（就是报给 leader 的那两个数）；
+//! 心跳回复里的 leader 墙钟估出本节点的时钟偏差 `wmfs_clock_skew_seconds`（3.11；按往返的一半校正，取绝对值，秒）。
 //! 实现注记（M5）：M5 只是"最小版"。实现注记（M8）：每拿到一张集群图先交给 `on_map`（服务端装配时给的：比对集群插件清单，不一致 →
 //! 退出码 3，3.7.2）。实现注记（M9）：心跳成功就续 target 租约（按**发送时刻** + 0.8 × 回复里的租约，I5，`chain.rs`），上报持续转发
 //! 不到后继的链（3.4.2.10）；新集群图交给 `redrive::switch`：先按 3.4.2.6 处理完 pending，再换上；同步线程交来的 SyncDone 跟在心跳
@@ -21,6 +23,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use wmfs_api::failpoint::fail_point;
+use wmfs_api::metrics;
 
 use super::{DataNode, redrive};
 use crate::base::{ErrCode, clock, lock, log};
@@ -181,6 +184,11 @@ fn beat_to(hb: &HbDeps, ep: &Endpoint, poked: bool, hint: &mut Option<String>) -
     let mut targets = Vec::new();
     for t in hb.data.targets.values() {
         let st = hb.data.store(|| t.stat())?;
+        let tid = t.id.to_string();
+        let l = [("target", tid.as_str())];
+        metrics::gauge("wmfs_target_used_bytes", "target 的已用字节", &l).set(st.used as f64);
+        metrics::gauge("wmfs_target_capacity_bytes", "target 的容量（statfs 与 node.toml 的上限取小）", &l)
+            .set(st.capacity as f64);
         let (target, phys_devs, read_only) = (t.id, t.phys_devs.clone(), t.read_only());
         targets.push(TargetReport { target, used: st.used, capacity: st.capacity, phys_devs, read_only });
     }
@@ -202,8 +210,10 @@ fn beat_to(hb: &HbDeps, ep: &Endpoint, poked: bool, hint: &mut Option<String>) -
     };
     let sent = clock::mono_ms(); // 租约从发送时刻算（持有方的计时起点早于授予方，3.4.4）
     let epoch = match call(&hb.rpc, ep, &NodeOp::Heartbeat(msg), hint)? {
-        NodeReply::HeartbeatOk { map_epoch, lease_ms, .. } => {
+        NodeReply::HeartbeatOk { map_epoch, lease_ms, leader_wall_ms } => {
             d.lease.renew(sent, lease_ms, map_epoch);
+            let skew = skew_seconds(clock::wall_ms(), leader_wall_ms, clock::mono_ms().saturating_sub(sent));
+            metrics::gauge("wmfs_clock_skew_seconds", "本节点墙钟与元数据 leader 的偏差（绝对值，秒）", &[]).set(skew);
             map_epoch
         }
         _ => return Err(ErrCode::INTERNAL),
@@ -230,4 +240,20 @@ fn deficits(d: &DataNode) -> Vec<(u64, u32)> {
         *m.entry(q.key.qos_id).or_default() += q.deficit_per_s;
     }
     m.into_iter().filter(|(_, x)| *x >= 0.5).map(|(id, x)| (id, x.round().min(u32::MAX as f64) as u32)).collect()
+}
+
+/// 本节点墙钟与 leader 的偏差（绝对值，秒）：leader 回复里的墙钟 + 回复路上的时间（按往返 `rtt_ms` 的一半算）。告警只关心偏差多大（3.11）。
+fn skew_seconds(local_wall_ms: u64, leader_wall_ms: u64, rtt_ms: u64) -> f64 {
+    let leader_now = leader_wall_ms + rtt_ms / 2;
+    (local_wall_ms as f64 - leader_now as f64).abs() / 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn clock_skew_is_absolute_and_corrects_half_the_round_trip() {
+        assert_eq!(super::skew_seconds(10_000, 9_000, 0), 1.0, "本节点快 1 s");
+        assert_eq!(super::skew_seconds(10_000, 12_000, 0), 2.0, "本节点慢 2 s：也是正数");
+        assert_eq!(super::skew_seconds(10_100, 10_000, 200), 0.0, "回复路上 100 ms（往返 200 ms 的一半）");
+    }
 }

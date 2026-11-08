@@ -16,7 +16,7 @@ pub mod log;
 pub mod rand;
 pub mod sys;
 pub mod types;
-pub mod units;
+pub use wmfs_api::units; // 实现注记（M14）：挪进 wmfs-api，与 wmfs-mgr 共用（原路径照旧可用）
 
 pub use errcode::{ErrCode, Failed};
 

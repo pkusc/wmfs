@@ -21,13 +21,14 @@ use wmfs_api::types::{ErrorReply, Failpoint, FailpointList, Health, NodeAddrs, Q
 
 use crate::base::{ErrCode, log};
 use crate::bg::progress::TaskBoard;
+use crate::data::DataNode;
 use crate::data::datakey::Wrapper;
 use crate::hooks::traits::{BG_QUEUE, KeyLookup, QosPlugin, QueueStat};
 use crate::meta::changelog::{self, AUDIT_CURSOR};
 use crate::meta::cluster::targets::TargetUsage;
 use crate::meta::engine::EmbeddedEngine;
 use crate::meta::sessions::Live;
-use crate::mgmt::{api, auth, cluster, tasks};
+use crate::mgmt::{api, auth, cluster, node};
 
 /// 请求体上限（字节）。
 const MAX_BODY: usize = 1 << 20;
@@ -52,6 +53,8 @@ pub struct MgmtCtx {
     pub wrapper: Option<Arc<Wrapper>>,
     pub live: Option<Arc<Live>>,
     pub qos: Option<Arc<dyn QosPlugin>>, // 本节点的 qos 插件（`GET /api/v1/qos`，M13）
+    pub data: Option<Arc<DataNode>>,     // 本节点的数据面（`GET /api/v1/node` 的 target 与内存池，M14）
+    pub boot_id: u64,                    // 本次启动的随机号（心跳里报的那个，M14）
 }
 
 /// 已经绑定好地址、还没开始处理请求的管理 API（先绑定，才知道实际地址写进 health）。
@@ -131,6 +134,7 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
     match (method, path) {
         ("GET", "/metrics") => {
             let mut s = String::new();
+            metrics::gauge("wmfs_threads", "进程的线程数", &[]).set(crate::obs::threads() as f64); // 7.3 基座一行（M14）
             metrics::render_prometheus(&mut s);
             Reply { status: 200, content_type: "text/plain; version=0.0.4", body: s.into_bytes() }
         }
@@ -144,8 +148,9 @@ fn route(ctx: &MgmtCtx, method: &str, url: &str, auth: Option<&str>, body: &[u8]
         }
         (_, "/api/v1/failpoints") => failpoints(ctx, method, url, auth, body),
         ("GET", "/api/v1/debug/meta-hash") => cluster::meta_hash(ctx, method, url, auth, body), // 每个节点都回答本节点的（M8）
-        ("GET", "/api/v1/node") => tasks::node_info(ctx, method, url, auth, body), // 每个节点都回答本节点的（M11）
-        ("GET", "/api/v1/qos") => qos(ctx, method, url, auth, body),               // 本节点的 QoS 队列（M13）
+        ("GET", "/api/v1/node") => node::node_info(ctx, method, url, auth, body), // 每个节点都回答本节点的（M11、M14）
+        ("GET", p) if p.starts_with("/api/v1/trace/") => node::trace(ctx, method, url, auth, body), // 本节点的 span（M14）
+        ("GET", "/api/v1/qos") => qos(ctx, method, url, auth, body), // 本节点的 QoS 队列（M13）
         (_, p) if api::handles(p) => api::serve(ctx, method, url, auth, body),
         _ => err(404, "enoent", format!("没有这个接口：{method} {path}")),
     }
@@ -253,8 +258,22 @@ mod tests {
         };
         let keys = Arc::new(InitKeys::new(MASTER, 0));
         let (meta, usage, polls) = (None, None, AtomicUsize::new(0));
-        let (board, wrapper, live, qos) = (None, None, None, None);
-        let ctx = MgmtCtx { health, role: None, keys, failpoints_api, meta, usage, polls, board, wrapper, live, qos };
+        let (board, wrapper, live, qos, data) = (None, None, None, None, None);
+        let ctx = MgmtCtx {
+            health,
+            role: None,
+            keys,
+            failpoints_api,
+            meta,
+            usage,
+            polls,
+            board,
+            wrapper,
+            live,
+            qos,
+            data,
+            boot_id: 0,
+        };
         m.start(Arc::new(ctx)).unwrap();
         addr
     }

@@ -3,7 +3,8 @@
 //!   验收：拿着旧 layout 的读者照样读得到），关掉之后才删；截断到 0 换下来的（kind 2）过了宽限期就删，文件一直打开着也一样（像
 //!   copytruncate 式的日志轮转），拿着旧 layout 的读者按 C5 看到截断；
 //! - 关掉了的会话留下的去重记录被删掉（ADR-0041 第 9 条留给 M11 的）；
-//! - changelog 修剪到所有消费者游标都消费过的位置，再读更早的 → `410 Gone`（缺口显式），之后的照常读；
+//! - changelog 修剪到所有消费者游标都消费过的位置，但至少留最近 1 万条（ADR-0045 第 12 条：只有几十条时一条也不修剪），再读更早的 →
+//!   `410 Gone`（缺口显式，`oldest` 正好是最近 1 万条的第一条），之后的照常读；
 //! - 本地孤儿扫描（`gc-local`，fail point `gc.local.min_age_ms` 把 1 h 缩成 0）：元数据里已经死了的 epoch 目录（节点离线时错过的
 //!   DeleteEpoch、文件删掉之后才落下的 chunk）被删掉，当前的留着；leader 的 gc 还管着的旧 epoch（有 GC 记录：还在宽限期里的截断、
 //!   文件还打开着的迁移）它不碰。
@@ -16,8 +17,10 @@ use std::time::{Duration, Instant};
 use wmfs_core::api::failpoint;
 use wmfs_core::api::types::{ChangelogPage, CursorReply, CursorReq, NodeInfoReply, STATE_DONE};
 use wmfs_core::base::types::{ChunkId, ReqCtx};
+use wmfs_core::meta::changelog::{self, Change};
 use wmfs_core::meta::engine::EmbeddedEngine;
-use wmfs_core::meta::engine::txn::MetaEngine;
+use wmfs_core::meta::engine::txn::{MetaEngine, TxnOp, txn_blocking};
+use wmfs_core::meta::gc_meta::MIN_KEEP_RECORDS;
 use wmfs_core::meta::schema::keys::{self, ROOT_INO};
 use wmfs_core::meta::schema::records::{ChainRecV1, TargetRecV1, decode_v1};
 use wmfs_core::proto::meta::{MetaOp, MetaReply, O_RDONLY, O_RDWR, OpenOut};
@@ -53,6 +56,19 @@ fn dedup_rows(eng: &EmbeddedEngine, sid: u64) -> usize {
     })
     .unwrap();
     n
+}
+
+/// 直接在元数据里补 `n` 条 changelog 记录（每批 2000 条；比走客户端快得多，要超过"至少留最近 1 万条"，ADR-0045 第 12 条）。
+fn fill_changelog(eng: &EmbeddedEngine, n: usize) {
+    for _ in 0..n.div_ceil(2000) {
+        let op: TxnOp = Box::new(|v, c| {
+            for _ in 0..2000 {
+                changelog::append(v, c, Change { op: "Mkdir", ..Default::default() })?;
+            }
+            Ok(MetaReply::Ok)
+        });
+        txn_blocking(eng, ReqCtx::internal(), op).unwrap();
+    }
 }
 
 /// 迁移换下来的旧 layout（kind 3）：只读打开着这个文件的读者照样读得到，gc 跑了几轮也不删；关掉之后才删。
@@ -132,20 +148,42 @@ fn dedup_records_of_closed_sessions_and_consumed_changelog_are_cleaned_up() {
     c.meta.close();
     assert!(wait_for(20, || dedup_rows(&run.meta, sid) == 0), "会话不在了：它的去重记录被 gc 删掉");
 
-    // changelog：消费者游标消费过的被修剪；再读更早的 → 410
+    // changelog：消费者游标消费过的、比最新的旧 1 万条以上的被修剪（ADR-0045 第 12 条）；再读更早的 → 410
+    let cursor = |seq| a.post::<_, CursorReply>("/api/v1/changelog/cursor", &CursorReq { name: "t-gc".into(), seq });
     let last = changelog(&a, 0).last_seq;
     assert!(last > 5);
-    let cur: CursorReply = a.post("/api/v1/changelog/cursor", &CursorReq { name: "t-gc".into(), seq: last }).unwrap();
-    assert_eq!(cur.seq, last);
-    let gone =
-        || a.get::<ChangelogPage>("/api/v1/changelog?after=0&limit=10&wait_ms=0").is_err_and(|e| e.status == 410);
-    assert!(wait_for(20, gone), "游标之前的已修剪，缺口是显式的");
+    assert_eq!(cursor(last).unwrap().seq, last);
+    let p0 = gc_passes(&a);
+    assert!(wait_for(20, || gc_passes(&a) >= p0 + 2), "gc 又跑了两轮");
+    let first = changelog(&a, 0).events.first().map(|e| e.seq);
+    assert_eq!(first, Some(1), "都被消费过，但不到 1 万条：一条也不修剪");
+    fill_changelog(&run.meta, MIN_KEEP_RECORDS as usize + 1000);
+    let last = changelog(&a, 0).last_seq;
+    cursor(last).unwrap();
+    // 410 回复里的 oldest = 还在的最早一条
+    let kept_from = || {
+        let e = a.get::<ChangelogPage>("/api/v1/changelog?after=0&limit=10&wait_ms=0").err()?;
+        if e.status == 410 { e.oldest } else { None }
+    };
+    let want = last - MIN_KEEP_RECORDS + 1; // 最近 1 万条的第一条
+    assert!(
+        wait_for(30, || kept_from() == Some(want)),
+        "比最新的旧 1 万条以上的已修剪，缺口是显式的：{:?}",
+        kept_from()
+    );
     let c2 = client(&d.0, &run, "admin");
     put(&c2, &me, ROOT_INO, "after", b"x").unwrap();
     let p0 = gc_passes(&a);
     assert!(wait_for(20, || gc_passes(&a) >= p0 + 3), "gc 又跑了三轮");
-    let kept = changelog(&a, last).events;
-    assert!(!kept.is_empty() && kept[0].seq == last + 1, "游标之后的一条也没修剪：{:?}", kept.first().map(|e| e.seq));
+    let o = kept_from().expect("更早的照样 410");
+    let p = changelog(&a, o - 1);
+    let first = p.events.first().map(|e| e.seq);
+    assert!(
+        first == Some(o) && p.last_seq - o + 1 >= MIN_KEEP_RECORDS,
+        "至少留着最近 1 万条：{first:?}..={}",
+        p.last_seq
+    );
+    assert!(changelog(&a, last).events.first().is_some_and(|e| e.seq == last + 1), "游标之后的一条也没修剪");
     run.stop();
 }
 

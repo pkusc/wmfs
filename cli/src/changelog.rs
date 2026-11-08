@@ -6,7 +6,7 @@
 //! 非零的字段与 extra；`--json` 每页一行 `{"events": [...], "next", "last_seq"}`（一条事件也没有时输出一行空页，带着 last_seq）。
 //! 实现注记（M8 审查）：`-f` 碰上换 leader（旧 leader 连不上、还在选举的节点回 503、409 指向刚被杀的 leader——ApiClient 都报成连不上或
 //! 503）不退出：保留读到的位置，隔 1 s 再问，连续失败最多 60 s（[`leader_changing`]）。实现注记（M11）：gc 会修剪消费者都读过的事件，
-//! `最新 − N` 之前的一段可能已经没了（`410`）：从还在的最早一条读起（二分找到它，[`first_kept`]），标准错误上提示一句；`-f` 等着的时候
+//! `最新 − N` 之前的一段可能已经没了（`410`）：从还在的最早一条读起（410 回复里的 `oldest`，M14 起不再二分查找），标准错误上提示一句；`-f` 等着的时候
 //! 还没读到的一段被修剪了（别的消费者的游标越过了它）也一样处理，接着等，不退出（[`follow_once`]）。
 
 use std::time::Duration;
@@ -63,22 +63,9 @@ fn page(c: &ApiClient, after: u64, wait_ms: u64) -> Result<ChangelogPage, ApiErr
 /// 读一页：(after, wait_ms) → 页（单元测试里换成假的）。
 type Get<'a> = &'a dyn Fn(u64, u64) -> Result<ChangelogPage, ApiError>;
 
-/// 从 `lo` 之后读回 410（那一段已修剪）、从 `hi` 之后读得到：最小的读得到的位置（二分，几次请求）。
-fn first_kept(get: Get, mut lo: u64, mut hi: u64) -> u64 {
-    while hi > lo + 1 {
-        let mid = lo + (hi - lo) / 2;
-        match get(mid, 0) {
-            Err(e) if e.status == 410 => lo = mid,
-            _ => hi = mid,
-        }
-    }
-    hi
-}
-
-/// 从 `after` 之后读回了 410（见文件头）：问一次最新的 seq，回还在的最早一条之前的位置，标准错误上提示一句。
-fn after_trimmed(get: Get, after: u64) -> Result<u64, ApiError> {
-    let last = get(u64::MAX - 1, 0)?.last_seq; // after 很大：不取事件，只要最新的 seq
-    let next = first_kept(get, after, last.max(after + 1));
+/// 从 `after` 之后读回了 410（见文件头）：从还在的最早一条（410 回复里的 `oldest`）之前接着读，标准错误上提示一句。
+fn after_trimmed(e: ApiError, after: u64) -> Result<u64, ApiError> {
+    let next = e.oldest.filter(|o| *o > after + 1).ok_or(e)? - 1;
     crate::fail(format!("（seq {next} 及更早的事件已被修剪）"));
     Ok(next)
 }
@@ -90,7 +77,7 @@ fn follow_once(get: Get, next: u64) -> Result<(Option<ChangelogPage>, u64), ApiE
             let at = p.next;
             Ok((Some(p), at))
         }
-        Err(e) if e.status == 410 => Ok((None, after_trimmed(get, next)?)),
+        Err(e) if e.status == 410 => Ok((None, after_trimmed(e, next)?)),
         Err(e) => Err(e),
     }
 }
@@ -110,7 +97,7 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
     let ChangelogCmd::Tail { n, follow, api } = cmd;
     let c = match crate::cluster_addrs(&api.cluster).and_then(|cl| client(&api, cl)) {
         Ok(c) => c,
-        Err(e) => return failed(api.json, &ApiError { status: 0, code: "einval".into(), message: e }),
+        Err(e) => return failed(api.json, &ApiError::new(0, "einval", e)),
     };
     let print = |p: &ChangelogPage| {
         if api.json {
@@ -130,7 +117,7 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
     while next < last {
         let p = match get(next, 0) {
             Ok(p) => p,
-            Err(e) if e.status == 410 => match after_trimmed(&get, next) {
+            Err(e) if e.status == 410 => match after_trimmed(e, next) {
                 Ok(at) => {
                     next = at;
                     continue;
@@ -180,10 +167,10 @@ pub fn run_changelog(cmd: ChangelogCmd) -> i32 {
 mod tests {
     use super::*;
 
-    /// 假的服务端：seq ≤ 98 的已被修剪（after < 98 → 410），最新的是 500。
+    /// 假的服务端：seq ≤ 98 的已被修剪（after < 98 → 410，最早还在的是 99），最新的是 500。
     fn fake(after: u64, _wait: u64) -> Result<ChangelogPage, ApiError> {
         match after {
-            a if a < 98 => Err(ApiError { status: 410, code: "gone".into(), message: "已修剪".into() }),
+            a if a < 98 => Err(ApiError { oldest: Some(99), ..ApiError::new(410, "gone", "已修剪".into()) }),
             a if a >= 500 => Ok(ChangelogPage { events: vec![], next: 500, last_seq: 500 }),
             a => Ok(ChangelogPage { events: vec![], next: a + 1, last_seq: 500 }),
         }
@@ -195,7 +182,7 @@ mod tests {
         assert_eq!(follow_once(&fake, 10).map(|(p, at)| (p.is_none(), at)), Ok((true, 98)), "从 98 之后接着读");
         assert_eq!(follow_once(&fake, 200).map(|(p, at)| (p.is_some(), at)), Ok((true, 201)));
         let down = |_: u64, _: u64| -> Result<ChangelogPage, ApiError> {
-            Err(ApiError { status: 0, code: "unavailable".into(), message: "连不上".into() })
+            Err(ApiError::new(0, "unavailable", "连不上".into()))
         };
         assert_eq!(
             follow_once(&down, 10).err().map(|e| e.status),

@@ -31,9 +31,9 @@ pub struct Manifest {
     pub altitude: u16, // 唯一型钩子填 0
     pub hot_path: bool,
     pub config_schema: &'static str,    // TOML 文本：每个配置项 { type, default, doc }
-    pub abi_version: u32,               // 静态插件 = CORE_ABI_VERSION；动态库 = 其 C ABI 版本
+    pub abi_version: u32, // = CORE_ABI_VERSION（实现注记（M14 审查）：动态库的 C ABI 版本在 cabi::load 里按 C_ABI_VERSIONS 核对，生成的 Manifest 也填它）
     pub attrs: &'static [&'static str], // 本插件消费的目录属性键（属性注册表据此校验，3.8）
-    pub budget_ns: u64,                 // 热路径单次调用预算；超出计入 wmfs_hook_over_budget_total
+    pub budget_ns: u64,   // 热路径单次调用预算；超出计入 wmfs_hook_over_budget_total
     pub fail_points: &'static [&'static str],
 }
 

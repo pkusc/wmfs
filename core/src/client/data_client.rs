@@ -34,6 +34,7 @@ use crate::meta::cluster::chains::SERVING;
 use crate::meta::schema::records::LayoutV1;
 use crate::net::client::{Endpoint, Family, RpcClient};
 use crate::net::retry::{BACKOFF_MAX_MS, BACKOFF_START_MS, retryable};
+use crate::obs::trace::ClientTimer;
 use crate::proto::data::{DataCall, DataOp, DataReply};
 use crate::proto::frame::{FrameHeader, FrameKind, InFrame, MSG_DATA_CALL, OutFrame};
 use crate::proto::peer::ClusterMap;
@@ -213,7 +214,8 @@ impl DataClient {
         mut to: To,
     ) -> Result<InFrame, ErrCode> {
         let deadline = clock::mono_ms().saturating_add(self.op_timeout.as_millis() as u64);
-        let trace_id = rand::random_u64();
+        let (trace_id, name) = (rand::random_u64(), || op(0).name().to_string());
+        let _slow = ClientTimer { component: "DataCall", op: &name, trace_id, t0: std::time::Instant::now() }; // 3.11
         let (mut backoff, mut skip, mut down, mut redirect) = (BACKOFF_START_MS, Vec::new(), Vec::new(), None);
         loop {
             let map = (self.map)();

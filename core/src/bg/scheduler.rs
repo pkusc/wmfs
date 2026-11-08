@@ -179,11 +179,7 @@ fn turn(s: &mut Slot, d: &BgDeps, walker: &Walker, migrate: &Migrator) {
     if leader {
         let role = d.eng.role();
         if !role.ready {
-            if s.term != 0 {
-                migrate.forget_all(); // 不再是 leader：迁移原语记的"因写打开被跳过"归新 leader 管
-            }
-            s.term = 0; // 不是就绪的 leader：不跑；再当上 leader 时重新读游标
-            return;
+            return not_leader(s, migrate);
         }
         if s.term != role.term {
             match progress::load_leader(&*d.eng, s.task.kind()) {
@@ -237,6 +233,19 @@ fn turn(s: &mut Slot, d: &BgDeps, walker: &Walker, migrate: &Migrator) {
     }
     step(s, d, walker, migrate);
     d.board.put(info(s, d));
+}
+
+/// leader 任务在不是（或不再是）就绪 leader 的节点上：不跑；再当上 leader 时重新读游标。积压与进度的 gauge 归零——换了 leader 旧值
+/// 不留着（同链管理器的 `zero_gauges`；告警 reconciler_backlog 看任一节点的样本，旧 leader 的旧值会让它永远 firing，M14 审查）。
+fn not_leader(s: &mut Slot, migrate: &Migrator) {
+    if s.term != 0 {
+        migrate.forget_all(); // 不再是 leader：迁移原语记的"因写打开被跳过"归新 leader 管
+    }
+    s.term = 0;
+    s.backlog.set(0.0);
+    if let Some(g) = &s.ratio {
+        g.set(0.0);
+    }
 }
 
 /// 读控制字段（leader 任务：线性一致读；节点任务：本地已应用的 KV 与本节点的集群图）、更新限速。
@@ -379,3 +388,6 @@ fn info(s: &Slot, d: &BgDeps) -> TaskInfo {
         runs: if leader { 0 } else { s.run_seen },
     }
 }
+
+#[cfg(test)]
+mod tests;

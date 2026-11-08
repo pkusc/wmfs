@@ -1,0 +1,11 @@
+name = "alert"
+version = "0.1.0"
+hooks = ["mgmt_ext", "event_sink"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = []
+budget_ns = 0
+fail_points = ["plugin.alert.mgmt_ext", "plugin.alert.event_sink"]
+[config_schema]
+rules = { type = "path", default = "", doc = "额外的规则文件（TOML，格式同内置规则 default_rules.toml）：同名的替换内置规则，别的追加" }

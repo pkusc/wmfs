@@ -27,6 +27,7 @@ use crate::base::{ErrCode, log};
 use crate::buf::Buf;
 use crate::meta::cluster::chains::SERVING;
 use crate::net::server::Responder;
+use crate::obs::stages::Stage;
 use crate::proto::cap::CapV1;
 use crate::proto::data::DataReply;
 use crate::proto::encode_body;
@@ -77,14 +78,17 @@ pub fn drain(node: &Arc<DataNode>, mut next: Option<Box<WriteJob>>) {
 
 /// 做一个写；返回 false = 已转发给后继（回复交给确认它的线程）。
 fn step(node: &Arc<DataNode>, job: Box<WriteJob>) -> bool {
+    mark(&job, Stage::Queue); // 等这个 chunk 上前一个写的时间（慢日志的各阶段耗时，ADR-0045 第 9 条）
     match head_view(node, &job) {
         Err(e) => respond(job, Err(e)),
         Ok(None) => {
             let r = run(node, &job);
+            mark(&job, Stage::Disk);
             respond(job, r);
         }
         Ok(Some((s, ver))) => match prepare(node, &job) {
             Ok(Some(p)) => {
+                mark(&job, Stage::Disk);
                 forward::first_send(node, job, p, s, ver);
                 return false;
             }
@@ -104,6 +108,13 @@ fn head_view(node: &DataNode, job: &WriteJob) -> Result<Option<(u32, u64)>, ErrC
             Ok(chain::successor(c, pos).map(|s| (s, c.ver)))
         }
         _ => Err(ErrCode::STALE_CHAIN), // 排队期间链变了：客户端拉新集群图后重试
+    }
+}
+
+/// 在写者的回复句柄上记一个阶段（测试里直接调用时没有回复句柄）。
+fn mark(job: &WriteJob, s: Stage) {
+    if let Some(r) = &job.reply {
+        r.mark(s);
     }
 }
 

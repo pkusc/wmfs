@@ -39,6 +39,7 @@ use crate::base::{ErrCode, clock, log};
 use crate::buf::{Buf, FrozenBuf};
 use crate::net::client::{RpcClient, check_reply};
 use crate::net::server::{Responder, Service};
+use crate::obs::stages::Stage;
 use crate::proto::frame::InFrame;
 use crate::proto::peer::{ForwardWrite, PeerOp, PeerReply};
 use crate::proto::{decode_body, encode_body};
@@ -80,11 +81,13 @@ pub fn start(node: &Arc<DataNode>, rpc: Arc<RpcClient>, data: Arc<DataService>) 
 }
 
 impl Service for PeerService {
-    fn call(&self, f: InFrame, r: Responder) {
+    fn call(&self, f: InFrame, mut r: Responder) {
         let op: PeerOp = match decode_body(&f.body) {
             Ok(op) => op,
             Err(e) => return r.error(e, 0),
         };
+        r.set_op(op.name()); // span 里的操作名（M14）
+        r.mark(Stage::Decode);
         if matches!(op, PeerOp::ListChunks { .. } | PeerOp::FetchChunk { .. }) {
             return self.data.peer(op, r); // 同步源：io 线程、后台低优先级
         }
@@ -101,6 +104,7 @@ impl Service for PeerService {
 fn handle(node: &Arc<DataNode>, j: ReplJob) {
     match j {
         ReplJob::Peer { op: PeerOp::ForwardWrite(fw), bulk, r } => {
+            r.mark(Stage::Queue); // 在 repl 队列里等的时间（慢日志的各阶段耗时，ADR-0045 第 9 条）
             match check(node, fw.chunk.chain, fw.chain_ver, fw.from_target) {
                 Err(chain::Fail(e, x)) => r.error(e, x),
                 Ok(here) if node.chunks.claim(&fw.chunk) => apply(node, fw, bulk, here, Upstream::Peer(r)),
@@ -185,7 +189,7 @@ struct Local {
 
 /// 状态表的后两格：能用这个转发 → 写 pending（完整转发先放弃更旧的 pending）、提交或交给后继；不能 → NeedFull / INTERNAL。
 fn accept(node: &Arc<DataNode>, mut fw: ForwardWrite, data: Option<FrozenBuf>, here: Here, up: Upstream, l: Local) {
-    let id = fw.chunk;
+    let (id, trace) = (fw.chunk, up.trace());
     let fits = l.committed == Some(fw.base_version) && l.old.is_none();
     if !fw.full && !fits {
         if let Some(p) = l.old {
@@ -206,6 +210,7 @@ fn accept(node: &Arc<DataNode>, mut fw: ForwardWrite, data: Option<FrozenBuf>, h
         Ok(clean) => clean,
         Err(e) => return done(node, &id, || up.fail(e)),
     };
+    up.mark(Stage::Disk);
     let p = PendingWrite {
         version: fw.version,
         target: here.target,
@@ -222,7 +227,7 @@ fn accept(node: &Arc<DataNode>, mut fw: ForwardWrite, data: Option<FrozenBuf>, h
         Some(s) => {
             node.chunks.set_pending(&id, p);
             fw.from_target = here.target;
-            forward::send(node, fw, data.map(|d| vec![d.whole()]).unwrap_or_default(), s);
+            forward::send(node, fw, data.map(|d| vec![d.whole()]).unwrap_or_default(), s, trace);
         }
     }
 }
@@ -347,6 +352,7 @@ fn retry_upstream(node: &DataNode, id: &ChunkId, version: u64) {
 
 /// 后继收到 ForwardSync / ForwardDeleteEpoch（3.4.2.9）：本地做完，再交给自己的后继；尾直接回复。
 fn propagate(node: &Arc<DataNode>, mut op: PeerOp, r: Responder) {
+    r.mark(Stage::Queue);
     let (chain_id, ver, from) = match &op {
         PeerOp::ForwardSync { chain, chain_ver, from_target, .. } => (*chain, *chain_ver, *from_target),
         PeerOp::ForwardDeleteEpoch { chain, chain_ver, from_target, .. } => (*chain, *chain_ver, *from_target),
@@ -369,6 +375,7 @@ fn propagate(node: &Arc<DataNode>, mut op: PeerOp, r: Responder) {
         }
         _ => Err(ErrCode::INTERNAL),
     };
+    r.mark(Stage::Disk);
     match (local, succ) {
         (Err(e), _) => r.error(e, 0),
         (Ok(rep), None) => r.reply(encode_body(&rep), vec![]),

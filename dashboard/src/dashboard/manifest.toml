@@ -1,0 +1,11 @@
+name = "dashboard"
+version = "0.1.0"
+hooks = ["mgmt_ext"]
+altitude = 0
+hot_path = false
+abi_version = 1
+attrs = []
+budget_ns = 0
+fail_points = ["plugin.dashboard.mgmt_ext"]
+[config_schema]
+# 没有部署参数：监听地址是 wmfs mgr --listen，token 由 mgr 启动时生成。

@@ -47,7 +47,7 @@ use wmfs_api::metrics::{self, Counter};
 
 use crate::base::config::TargetConfig;
 use crate::base::types::ChunkId;
-use crate::base::{ErrCode, devinfo, log};
+use crate::base::{ErrCode, devinfo, lock, log};
 use crate::buf::{Buf, MemPool};
 use crate::hooks::pipeline::Pipeline;
 use crate::hooks::traits::{ChunkStore, StoreStat, TargetStore, TransformKind, TransformPlugin};
@@ -70,11 +70,12 @@ pub struct Target {
     pub id: u32,
     pub path: String,
     pub store: Arc<dyn TargetStore>,
-    pub ro_compat: bool,        // 超级块里有不认识的 ro_compat 位（3.2.3）：只读服务
-    broken: AtomicBool,         // 运行中连续提交失败（M11）
-    fail_streak: AtomicU32,     // 连续失败的次数
-    pub capacity: u64,          // node.toml 的 `[[target]] capacity`（0 = 不限）
-    pub phys_devs: Vec<String>, // 它所在的物理整盘（`base::devinfo`，建 Target 时解析一次；心跳上报）
+    pub ro_compat: bool,                 // 超级块里有不认识的 ro_compat 位（3.2.3）：只读服务
+    broken: AtomicBool,                  // 运行中连续提交失败（M11）
+    fail_streak: AtomicU32,              // 连续失败的次数
+    pub capacity: u64,                   // node.toml 的 `[[target]] capacity`（0 = 不限）
+    pub phys_devs: Vec<String>,          // 它所在的物理整盘（`base::devinfo`，建 Target 时解析一次；心跳上报）
+    last_stat: Mutex<Option<StoreStat>>, // hb 线程最近一次的容量与已用（M14：`GET /api/v1/node` 读它，管理线程不碰盘）
     read_bytes: Arc<Counter>,
     write_bytes: Arc<Counter>,
     corrupt: Arc<Counter>,
@@ -93,6 +94,7 @@ impl Target {
             fail_streak: AtomicU32::new(0),
             capacity,
             phys_devs: devinfo::phys_devs(Path::new(path)),
+            last_stat: Mutex::new(None),
             read_bytes: metrics::counter("wmfs_chunk_read_bytes_total", "读出的 chunk 明文字节数", &l),
             write_bytes: metrics::counter("wmfs_chunk_write_bytes_total", "写进 pending 文件的字节数", &l),
             corrupt: metrics::counter("wmfs_chunk_corrupt_total", "发现损坏（头 CRC 或块校验和不符）的次数", &l),
@@ -127,9 +129,16 @@ impl Target {
     }
 
     /// 容量与已用：chunk_store 报的容量（文件系统的大小）与 node.toml 的上限取小（防止测试写满系统盘，4.9）。
-    /// 调用方经 [`DataNode::store`] 调它（3.7.4 的包装）。
+    /// 调用方经 [`DataNode::store`] 调它（3.7.4 的包装）；记下来给 [`Target::last_stat`]。
     pub fn stat(&self) -> Result<StoreStat, ErrCode> {
-        Ok(limit_capacity(self.store.statfs()?, self.capacity))
+        let st = limit_capacity(self.store.statfs()?, self.capacity);
+        *lock(&self.last_stat) = Some(st);
+        Ok(st)
+    }
+
+    /// 最近一次 [`Target::stat`] 的结果（hb 线程每秒一次；还没有过 → None）：管理 API 的线程用它，不去碰可能挂死的盘（1.2 的线程表）。
+    pub fn last_stat(&self) -> Option<StoreStat> {
+        *lock(&self.last_stat)
     }
 }
 

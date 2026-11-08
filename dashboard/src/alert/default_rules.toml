@@ -1,0 +1,79 @@
+# alert 的内置规则（design.md 4.14）。规则文件（mgr.toml 的 [alert] rules = "<文件>"）格式相同：同名的规则替换这里的，别的追加。
+# 指标型：expr = "指标{标签} 比较符 阈值"（任一节点的样本满足即成立），或 "sum(指标{标签}) …"（全部节点之和）、
+#         "rate(指标{标签}) …"（各序列每秒增量之和：只算相邻两轮都抓到的序列，变小的按 0）、
+#         "grows(指标{标签}) …"（全部节点之和；满足比较之后每满一个 for 比一次：比窗口开始时大才 firing，不大就从现在重新计时；
+#         firing 之后一个 for 里不再增长就 resolved）；比较符 > >= < <= == !=。
+#         for = 条件持续多久才 firing（防抖，默认 0；时长写法同属性：500ms、60s、5m、1h、7d）。
+# 事件型：event = "操作名[|操作名…]"（changelog 的 op，按操作码表核对，大小写不敏感），可选 kind = "…"（只看 extra 里 kind 等于它的）：
+#         收到就 firing，之后 for（默认 5m）内没有新的就 resolved。
+# 可选 webhook = "http(s)://…"：状态变成 firing / resolved 时 POST {rule, state, message, at_ms}。
+
+[[rule]]
+name = "target_offline"
+expr = "wmfs_targets_offline > 0"
+for = "60s"
+
+[[rule]]
+name = "chain_degraded"
+expr = "wmfs_chains_degraded > 0"
+for = "5m"
+
+[[rule]]
+name = "chain_unavailable"
+expr = "wmfs_chains_unavailable > 0"
+
+[[rule]]
+name = "no_meta_leader"
+expr = "sum(wmfs_raft_is_leader) < 1"
+for = "10s"
+
+[[rule]]
+name = "quota_soft_exceeded"
+event = "PolicyViolation"
+kind = "quota_soft"
+
+[[rule]]
+name = "quota_denied"
+expr = "rate(wmfs_quota_denied_total) > 0"   # 硬限拒绝：create、truncate、fallocate 被拒，以及写到没有余量（CommitWrite 要不到额度）
+
+[[rule]]
+name = "scrub_corrupt"
+event = "ChecksumRepaired|DataLossDetected"
+
+# 4.14 的"协调器积压 1 h 内持续增长"（ADR-0045 第 10 条）：大目录的正常迁移（积压一直在减）不告警
+[[rule]]
+name = "reconciler_backlog"
+expr = "grows(wmfs_task_backlog{task=\"reconciler\"}) > 0"
+for = "1h"
+
+[[rule]]
+name = "bufpool_wait"
+expr = "rate(wmfs_bufpool_wait_seconds_count) > 1"
+for = "60s"
+
+[[rule]]
+name = "plugin_over_budget"
+expr = "rate(wmfs_hook_over_budget_total) > 10"
+for = "60s"
+
+[[rule]]
+name = "meta_batch_stale"
+expr = "wmfs_meta_batch_stale_total > 0"
+
+[[rule]]
+name = "audit_stalled"
+expr = "wmfs_mgr_sink_stalled_seconds{sink=\"audit-log\"} >= 600"
+
+[[rule]]
+name = "policy_violation"
+event = "PolicyViolation"
+
+[[rule]]
+name = "changelog_gap"
+expr = "wmfs_mgr_changelog_gaps_total > 0"
+
+# 3.11：数据节点的墙钟与元数据 leader 偏差超过 1 s（cap 过期判断容忍 5 min）；for 60s 防抖（实现注记（M14 审查）：一次心跳的往返抖动不告警）
+[[rule]]
+name = "clock_skew"
+expr = "wmfs_clock_skew_seconds > 1"
+for = "60s"

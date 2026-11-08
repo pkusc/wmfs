@@ -71,7 +71,7 @@ pub fn run_cluster(cmd: ClusterCmd) -> i32 {
     for it in &items {
         let Some((k, v)) = it.split_once('=') else {
             let message = format!("{it:?} 应写成 名字=值（例如 epoch_gc_grace=0s）");
-            return failed(api.json, &ApiError { status: 0, code: "einval".into(), message });
+            return failed(api.json, &ApiError::new(0, "einval", message));
         };
         m.insert(k.trim().to_string(), v.trim().to_string());
     }

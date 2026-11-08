@@ -1,8 +1,11 @@
 //! `wmfs dev` 的单元测试：端口规则、`up --rdma` 的声明式改写、`up --profile` 不改已有集群的 profile、`dev mount` 的就绪条件、
 //! 挂载日志里现在的会话号（M10 的 `dev wait session-evicted`）。
 
+use super::rdma::set_rdma;
+use super::up::check_profile;
 use super::*;
 use wmfs_core::base::clock;
+use wmfs_core::buf::PoolConfig;
 
 #[test]
 fn dev_ports_follow_the_19n00_scheme() {

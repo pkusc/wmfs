@@ -82,7 +82,7 @@ pub fn run_chain(cmd: ChainCmd) -> i32 {
         ChainCmd::Show { id, api } => {
             let call = move |c: &ApiClient, _: &str| {
                 let r = c.get::<ChainsReply>("/api/v1/chains")?;
-                let no = || ApiError { status: 404, code: "enoent".into(), message: format!("没有链 {id}") };
+                let no = || ApiError::new(404, "enoent", format!("没有链 {id}"));
                 r.chains.into_iter().find(|x| x.id == id).ok_or_else(no)
             };
             run(&api, None, call, line)
@@ -90,7 +90,7 @@ pub fn run_chain(cmd: ChainCmd) -> i32 {
         ChainCmd::ForceServing { id, target, i_accept_data_loss, api } => {
             if !i_accept_data_loss {
                 let message = "force-serving 可能丢掉别的成员独有的写：确认之后加 --i-accept-data-loss".to_string();
-                return failed(api.json, &ApiError { status: 0, code: "einval".into(), message });
+                return failed(api.json, &ApiError::new(0, "einval", message));
             }
             let path = format!("/api/v1/chains/{id}/force-serving?target={target}");
             let call = move |c: &ApiClient, _: &str| {

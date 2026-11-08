@@ -1,7 +1,9 @@
 //! ApiClient 的测试：签名的金样（与 core 的 tests/golden_net.rs 是同一组输入与期望值）、连不上换地址、409 跟随 leader、
-//! 错误回复变成 ApiError。测试用的 HTTP 服务端是 tiny_http（wmfs-mgr 不依赖 core）。
+//! 错误回复变成 ApiError（410 带上 oldest）、下一次先问回答了的地址、问不到集群概览时 node_addrs 用构造时的地址。测试用的 HTTP 服务端是
+//! tiny_http（wmfs-mgr 不依赖 core）。
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use wmfs_api::auth::{AuthHeader, parse_auth_header};
 use wmfs_api::types::FailpointList;
@@ -69,4 +71,27 @@ fn wrong_key_and_unreachable_become_api_errors() {
     assert_eq!(none.get::<FailpointList>("/x").unwrap_err().status, 0, "连不上：status = 0");
     assert_eq!(base_url("http://h:1/"), "http://h:1");
     assert_eq!(base_url("h:1"), "http://h:1");
+}
+
+/// 410 回复里的 `oldest` 带进 ApiError；下一次从上一次回答了的地址问起；问不到集群概览时 node_addrs 用构造时给的地址。
+#[test]
+fn gone_carries_oldest_and_the_answering_address_is_tried_first() {
+    let s = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = s.server_addr().to_ip().unwrap().to_string();
+    std::thread::spawn(move || {
+        for r in s.incoming_requests() {
+            let (code, body) = match r.url() {
+                u if u.starts_with("/api/v1/changelog") => (410, r#"{"error":"gone","message":"已修剪","oldest":42}"#),
+                _ => (404, r#"{"error":"enoent","message":"没有"}"#),
+            };
+            let _ = r.respond(tiny_http::Response::from_string(body).with_status_code(code));
+        }
+    });
+    let c = ApiClient::new(vec!["127.0.0.1:1".into(), addr.clone()], KeyFile { key_id: 1, secret: [0; 32] });
+    let e = c.get::<FailpointList>("/api/v1/changelog?after=1").unwrap_err();
+    assert_eq!((e.status, e.oldest), (410, Some(42)));
+    assert_eq!(c.prefer.load(Ordering::Relaxed), 1, "下一次先问回答了的那个地址");
+    assert_eq!(c.get::<FailpointList>("/x").unwrap_err().oldest, None);
+    assert_eq!(c.node_addrs(), ["http://127.0.0.1:1".to_string(), format!("http://{addr}")], "问不到集群概览");
+    assert_eq!(ApiError::new(0, "einval", "x".into()).oldest, None);
 }

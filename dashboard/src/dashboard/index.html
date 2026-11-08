@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wmfs dashboard</title>
+<style>
+  :root { --bg: #fafafa; --fg: #222; --card: #fff; --line: #ddd; --bad: #c62828; --ok: #2e7d32; --dim: #777; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161616; --fg: #ddd; --card: #222; --line: #444; --bad: #ef5350; --ok: #66bb6a; --dim: #999; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; overflow-x: auto; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { border-bottom: 1px solid var(--line); padding: 2px 6px; text-align: left; vertical-align: top; }
+  .bad { color: var(--bad); font-weight: 600; }
+  .ok { color: var(--ok); }
+  .dim { color: var(--dim); }
+  .bar { background: var(--line); height: 8px; border-radius: 4px; min-width: 80px; }
+  .bar > div { background: var(--ok); height: 8px; border-radius: 4px; }
+  .bar.hot > div { background: var(--bad); }
+  input { font: inherit; width: 60%; }
+</style>
+</head>
+<body>
+<h1>wmfs dashboard <span class="dim" id="updated"></span></h1>
+<div class="grid">
+  <section><h2>集群</h2><div id="cluster">加载中…</div></section>
+  <section><h2>容量与配额</h2><div id="capacity">加载中…</div></section>
+  <section><h2>声明 vs 实际</h2>
+    <form id="sform">路径 <input id="spath" value="/"> <button>查看</button></form>
+    <div id="status">加载中…</div></section>
+  <section><h2>QoS 与存储类</h2><div id="qos">加载中…</div></section>
+  <section><h2>后台任务</h2><div id="tasks">加载中…</div></section>
+  <section><h2>事件与告警</h2><div id="events">加载中…</div></section>
+</div>
+<script>
+"use strict";
+// 页面怎么取数据（design.md 4.14，dashboard/src/dashboard/mod.rs）：
+// - /dash/api?path=/api/v1/…：mgr 按 leader 跟随转给管理 API（用 mgr 的 key 签名），原样回 JSON；
+// - /dash/each?path=/api/v1/…：节点本地的端点，mgr 问集群里的每个节点，回 [{addr, reply} | {addr, error}]；
+// - /alerts：告警规则的状态与 mgr 最近收到的 changelog 记录；/metrics：全部节点合并后的指标（QoS 的等待 p99 用）。
+// 每个请求都带上网址里的 ?token=。六个面板各一个函数（cluster、capacity、status、qos、tasks、events），每 5 s 刷新一次；
+// "声明 vs 实际"要扫子树，每分钟刷新一次（或点"查看"）。
+
+const token = new URLSearchParams(location.search).get("token") || "";
+
+// 带 token 取一个 JSON；HTTP 出错时抛出"状态码 回复原文"
+async function q(url) {
+  const sep = url.includes("?") ? "&" : "?";
+  const r = await fetch(url + sep + "token=" + encodeURIComponent(token));
+  if (!r.ok) throw new Error(r.status + " " + (await r.text()));
+  return r.json();
+}
+const api = (p) => q("/dash/api?path=" + encodeURIComponent(p));
+const each = (p) => q("/dash/each?path=" + encodeURIComponent(p));
+
+// HTML 转义（显示服务端给的文字）
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// 字节数 → 1.5 GiB 这样的写法
+function size(b) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i ? 1 : 0) + " " + units[i];
+}
+
+// 用量条：超过 90% 标红
+function bar(used, cap) {
+  const r = cap > 0 ? Math.min(1, used / cap) : 0;
+  const hot = r > 0.9 ? " hot" : "";
+  return `<div class="bar${hot}"><div style="width:${(r * 100).toFixed(1)}%"></div></div>`;
+}
+
+// 表格：head 是表头文字，rows 是已经拼好的 <tr> 行；cls 标红等用的 class
+const row = (cells, cls = "") => `<tr class="${cls}">${cells.map((c) => `<td>${c}</td>`).join("")}</tr>`;
+const table = (head, rows) => `<table><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr>${rows.join("")}</table>`;
+
+// 画一个面板：f() 返回 HTML；出错就显示错误
+function show(id, f) {
+  const el = document.getElementById(id);
+  f().then((h) => { el.innerHTML = h; }).catch((e) => { el.innerHTML = `<span class="bad">${esc(e.message)}</span>`; });
+}
+
+// 集群：节点、元数据 leader、target（离线标红）、会话数、降级或离线的链、集群警告
+async function cluster() {
+  const [c, ch] = await Promise.all([api("/api/v1/cluster"), api("/api/v1/chains")]);
+  const warns = [...new Set([...c.warnings, ...ch.warnings])].map((w) => `<div class="bad">⚠ ${esc(w)}</div>`).join("");
+  const nodes = c.nodes.map((n) => {
+    const name = `node${n.node_id}` + (n.leader ? " <b>(leader)</b>" : "");
+    const behind = n.member !== "none" && !n.caught_up ? ' <span class="bad">没追上</span>' : "";
+    return row([name, esc(n.mgmt_addr), n.state, n.member + behind], n.state === "active" ? "" : "bad");
+  });
+  const offline = c.targets.filter((t) => t.state !== "up");
+  const targets = c.targets.map((t) => `<span class="${t.state === "up" ? "" : "bad"}">t${t.id}@node${t.node} ${t.state}</span>`);
+  const bad = ch.chains.filter((x) => x.members.length < x.want || x.members.some((m) => m.state !== "serving"));
+  const chains = bad.map((x) => {
+    const members = x.members.map((m) => `t${m.target}@node${m.node} ${m.state}`).join(", ");
+    return row([`chain ${x.id}`, esc(x.class), members, `期望 ${x.want}`], "bad");
+  });
+  const chainLine = bad.length ? `<span class="bad">${bad.length} 条降级或离线</span>` : '<span class="ok">全部 Serving</span>';
+  return warns
+    + `<p>元数据 leader node${c.leader}，term ${c.term}，voter ${c.voters.join(",")}，已应用 ${c.applied}；${c.sessions} 个客户端会话</p>`
+    + table(["节点", "管理地址", "状态", "元数据"], nodes)
+    + `<p>${c.targets.length} 个 target${offline.length ? `，<span class="bad">${offline.length} 个不在线</span>` : ""}：${targets.join("，")}</p>`
+    + `<p>${c.chains} 条链，${chainLine}</p>`
+    + (bad.length ? table(["链", "存储类", "成员", ""], chains) : "");
+}
+
+// 容量与配额：每个节点每个 target 的已用 / 容量；设了配额的目录的用量条与软限计时
+async function capacity() {
+  const [nodes, attrs] = await Promise.all([each("/api/v1/node"), api("/api/v1/attr?path=/&recursive=1")]);
+  const rows = [];
+  for (const n of nodes) {
+    if (n.error) { rows.push(row([esc(n.addr), `连不上：${esc(n.error)}`, "", ""], "bad")); continue; }
+    for (const t of n.reply.targets) {
+      const ro = t.read_only ? ' <span class="bad">只读</span>' : "";
+      rows.push(row([`node${n.reply.node_id} t${t.id}${ro}`, `${size(t.used)} / ${size(t.capacity)}`, bar(t.used, t.capacity),
+        `<span class="dim">${esc(t.phys_devs.join(","))}</span>`]));
+    }
+  }
+  const dirs = attrs.subtree.filter((d) => Object.keys(d.attrs).some((k) => k === "quota" || k.startsWith("quota.")));
+  const quotas = [];
+  for (const d of dirs) {
+    const u = await api("/api/v1/usage?path=" + encodeURIComponent(d.path));
+    for (const x of u.quotas.filter((x) => x.dir === d.path)) {
+      const lim = x.hard || x.soft;
+      const over = (x.soft && x.used_bytes > x.soft) || (x.hard && x.used_bytes > x.hard);
+      const timer = x.grace_left_ms == null ? "" : `软限计时，宽限还剩 ${Math.round(x.grace_left_ms / 1000)} s`;
+      const dir = esc(x.dir) + (x.class ? ":" + esc(x.class) : "");
+      quotas.push(row([dir, `${size(x.used_bytes)} / ${lim ? size(lim) : "不限"}`, bar(x.used_bytes, lim), timer], over ? "bad" : ""));
+    }
+  }
+  return table(["target", "已用 / 容量", "", "物理盘"], rows) + "<h2>配额（策略根）</h2>"
+    + (quotas.length ? table(["目录", "用量 / 上限", "", "软限"], quotas) : '<p class="dim">没有目录设了配额</p>');
+}
+
+// "声明 vs 实际"里一个属性的"实际"一栏：status API 给了哪几项就显示哪几项
+function actual(a) {
+  const x = a.actual;
+  const parts = [`新文件：${esc(x.new_files)}`];
+  if (x.files != null) parts.push(`${x.files} 个已有文件里 ${x.mismatched_files || 0} 个不同${x.migrates === false ? "（不迁移）" : ""}`);
+  if (x.open_files) parts.push(`写打开着被跳过 ${x.open_files}`);
+  if (x.short_files) parts.push(`副本不足 ${x.short_files}`);
+  if (x.quotas) parts.push(x.quotas.map((q) => `${size(q.used_bytes)} / ${size(q.hard || q.soft)}`).join("；"));
+  if (x.bytes != null) parts.push(`回收站 ${size(x.bytes)}`);
+  if (x.lag != null) parts.push(`审计落后 ${x.lag} 条`);
+  if (x.deficit != null) parts.push(`保底欠额 ${x.deficit}`);
+  return parts.join("，");
+}
+
+// 声明 vs 实际：输入的路径上逐个属性显示声明、来源、实际、是否一致（不一致标红）
+async function status() {
+  const p = document.getElementById("spath").value || "/";
+  const s = await api("/api/v1/status?path=" + encodeURIComponent(p));
+  const rows = s.attrs.map((a) => {
+    const same = a.mismatched ? "✗ 不一致" : '<span class="ok">✓</span>';
+    return row([esc(a.key), esc(a.declared), `<span class="dim">${esc(a.source)}</span>`, actual(a), same], a.mismatched ? "bad" : "");
+  });
+  const warns = s.warnings.map((w) => `<div class="bad">⚠ ${esc(w)}</div>`).join("");
+  return `${warns}<p class="dim">扫了 ${s.scanned} 个 inode${s.truncated ? "（不全）" : ""}；降级链上 ${s.degraded_files} 个文件</p>`
+    + table(["属性", "声明", "来源", "实际", ""], rows);
+}
+
+// 按 /metrics 里 wmfs_qos_wait_seconds 的直方图算每个队列等待时间的 p99：
+// 同一个序列（节点 + 队列标签）的各个桶 le 从小到大排着，值是累计数；p99 = 累计数第一次到达总数 99% 的那个桶的上界
+function p99(text) {
+  const buckets = {}; // 序列 → [[上界, 累计数], …]
+  const re = /^wmfs_qos_wait_seconds_bucket\{node="([^"]*)",(.*)le="([^"]*)"\} (\S+)$/;
+  for (const line of text.split("\n")) {
+    const m = line.match(re);
+    if (!m) continue;
+    const key = m[1] + " " + m[2];
+    if (!buckets[key]) buckets[key] = [];
+    buckets[key].push([m[3] === "+Inf" ? Infinity : Number(m[3]), Number(m[4])]);
+  }
+  const out = {};
+  for (const [key, bs] of Object.entries(buckets)) {
+    const total = bs[bs.length - 1][1]; // +Inf 桶 = 总数
+    if (total > 0) out[key] = bs.find((b) => b[1] >= 0.99 * total)[0];
+  }
+  return out;
+}
+
+// QoS 与存储类：每个节点每个队列的排队、派发速率、保底欠额、命中上限；等待 p99；每个存储类的隔离承诺（照原文显示，降级标红）
+async function qos() {
+  const [nodes, classes, text] = await Promise.all([
+    each("/api/v1/qos"), api("/api/v1/classes"), fetch("/metrics").then((r) => r.text()),
+  ]);
+  const rows = [];
+  for (const n of nodes) {
+    if (n.error) continue;
+    for (const x of n.reply.queues) {
+      const queue = x.tenant == null ? "后台" : `租户 ${x.tenant} / qos ${x.qos_id} / 类 ${x.class_id}`;
+      const deficit = `<span class="${x.deficit_per_s > 0 ? "bad" : ""}">${x.deficit_per_s.toFixed(1)}</span>`;
+      rows.push(row([esc(n.addr), queue, x.depth, x.served_per_s.toFixed(1), deficit, x.limited_total]));
+    }
+  }
+  const waits = Object.entries(p99(text)).map(([k, v]) => row([esc(k), v === Infinity ? "> 10 s" : v * 1000 + " ms"]));
+  const cls = classes.classes.map((c) => {
+    const iso = c.downgraded ? `${esc(c.isolation)}（降级）` : esc(c.isolation);
+    return row([esc(c.name), esc(c.label), iso, esc(c.promise)], c.downgraded ? "bad" : "");
+  });
+  return table(["节点", "队列", "排队", "派发/秒", "保底欠额", "命中上限"], rows)
+    + "<h2>等待 p99</h2>" + table(["队列", "p99 ≤"], waits)
+    + "<h2>存储类的隔离承诺</h2>" + table(["存储类", "标签", "隔离", "承诺"], cls);
+}
+
+// 后台任务：leader 上的任务（/api/v1/tasks）与每个节点上的节点任务（各节点 /api/v1/node 的 tasks：scrub、gc-local 的真实进度）
+async function tasks() {
+  const [t, nodes] = await Promise.all([api("/api/v1/tasks"), each("/api/v1/node")]);
+  const line = (name, x) => {
+    const backlog = `<span class="${x.backlog > 0 ? "bad" : ""}">${x.backlog}${x.kind === "reconciler" ? " 个目录" : ""}</span>`;
+    return row([name, x.state, x.done, backlog, x.progress > 0 ? bar(x.progress, 1) : "", `<span class="bad">${esc(x.last_error)}</span>`]);
+  };
+  const rows = t.tasks.filter((x) => x.runs_on === "leader").map((x) => line(`${esc(x.kind)}（leader）`, x));
+  for (const n of nodes) {
+    if (n.error) { rows.push(row([esc(n.addr), `连不上：${esc(n.error)}`, "", "", "", ""], "bad")); continue; }
+    for (const x of n.reply.tasks) rows.push(line(`${esc(x.kind)}（node${n.reply.node_id}）`, x));
+  }
+  return table(["任务", "状态", "已处理", "积压", "这一轮", "最近出错"], rows);
+}
+
+// 事件与告警：不是 inactive 的告警规则；mgr 最近收到的 changelog 记录（新的在前，策略违约标红）
+async function events() {
+  const a = await q("/alerts");
+  const alerts = a.alerts.filter((x) => x.state !== "inactive").map((x) =>
+    row([esc(x.name), x.state, new Date(x.since_ms).toLocaleString(), esc(x.message)], x.state === "firing" ? "bad" : ""));
+  const recent = a.recent.reverse().map((e) => {
+    const extra = `<span class="dim">${esc(e.extra.map((kv) => kv.join("=")).join(" "))}</span>`;
+    const cells = [`#${e.seq}`, new Date(e.time_ms).toLocaleTimeString(), esc(e.op), esc(e.name || e.ino), extra];
+    return row(cells, e.op === "PolicyViolation" ? "bad" : "");
+  });
+  return "<h2>告警</h2>" + (alerts.length ? table(["规则", "状态", "从", "说明"], alerts) : '<p class="ok">没有告警</p>')
+    + "<h2>changelog 尾部（策略违约标红）</h2>" + table(["seq", "时间", "操作", "对象", "extra"], recent);
+}
+
+// 每 5 s 刷新一次；"声明 vs 实际"每 12 轮（1 分钟）一次
+let rounds = 0;
+function refresh() {
+  show("cluster", cluster);
+  show("capacity", capacity);
+  show("qos", qos);
+  show("tasks", tasks);
+  show("events", events);
+  if (rounds++ % 12 === 0) show("status", status);
+  document.getElementById("updated").textContent = "（" + new Date().toLocaleTimeString() + " 更新，每 5 s 刷新）";
+}
+document.getElementById("sform").addEventListener("submit", (e) => { e.preventDefault(); show("status", status); });
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

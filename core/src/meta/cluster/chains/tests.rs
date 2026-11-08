@@ -157,6 +157,7 @@ fn gen_chains_writes_chain_records_and_bumps_map_epoch() {
         settings: &settings,
         cap_key: &[0; 32],
         usage: &usage,
+        stages: None,
     };
     let views = gen_chains(&mut v, &c, &m.classes[0], 3).unwrap();
     assert_eq!(
