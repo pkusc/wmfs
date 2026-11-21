@@ -140,6 +140,7 @@ fn i5_fences_reads_and_forwards() {
         header: vec![],
         blocks: vec![],
         sync: false,
+        dedup: (0, 0),
     };
     let r = peer_call(&c, 2, &PeerOp::ForwardWrite(fw), vec![]);
     assert_eq!(r.err().map(|e| e.0), Some(ErrCode::FENCED), "后继处理转发之前也核对 I5");
@@ -246,4 +247,71 @@ fn partial_overwrites_and_truncates_of_multi_block_chunks_forward_incrementally(
     assert_eq!(c.read(0, CS).unwrap(), want);
     let v = c.check(Duration::from_secs(5));
     assert_eq!(v[&id(0)], (1 << 40) + 3, "4 个版本");
+}
+
+/// ADR-0046：数据写（WriteChunk / TruncateChunk）带 `write_id`，经 `ForwardWrite` 沿链复制到每个成员；head 宕机换主之后客户端
+/// 重试同一个 `write_id` 命中新 head 的去重表、直接回原版本号，不再作为新版本覆盖别的客户端之后完成的写。
+#[test]
+fn retried_writes_and_truncates_deduplicate_across_head_failover() {
+    use wmfs_core::base::types::Role;
+    use wmfs_core::buf::{Lane, MemPool, PoolConfig};
+    use wmfs_core::hooks::traits::Transport;
+    use wmfs_core::net::client::{Endpoint, Family, RpcClient};
+    use wmfs_core::proto::data::{DataCall, DataReply};
+    use wmfs_core::proto::frame::{FrameHeader, FrameKind, MSG_DATA_CALL, OutFrame};
+    use wmfs_core::proto::{decode_body, encode_body};
+    use wmfs_testkit::harness::net::{key, net};
+
+    let mut c = Craq::start(3, &[(1, S), (2, S), (3, S)]);
+    let pool = MemPool::new(&PoolConfig::small()).unwrap();
+    let tr = vec![Arc::new(plugin_mem_transport::MemTransport::new()) as Arc<dyn Transport>];
+    let rpc = RpcClient::new_with_role(pool.clone(), tr, key(2), Role::Client, net("mem")).unwrap();
+    let send_write = |c: &Craq, to: u32, chain_ver: u64, write_id: u64, data: &[u8]| -> u64 {
+        let mut b = pool.get(data.len(), Lane::Normal, Duration::from_secs(1)).unwrap();
+        b.as_mut_slice().copy_from_slice(data);
+        let op = DataOp::WriteChunk {
+            chunk: id(0),
+            chain_ver,
+            extents: vec![(0, data.len() as u32)],
+            sync: false,
+            write_id,
+        };
+        let hdr = FrameHeader::new(FrameKind::Request, MSG_DATA_CALL, 0, 0);
+        let f = OutFrame {
+            hdr,
+            body: encode_body(&DataCall { cap: c.cap(), op }),
+            bulk: vec![b.freeze().whole()],
+            recv_into: None,
+        };
+        let ep = Endpoint { node: to, addrs: vec![("mem".into(), c.members[to as usize - 1].addr.clone())] };
+        let r = rpc.call(&ep, Family::Data, f, Duration::from_secs(5)).unwrap();
+        assert!(r.error().is_none(), "{:?}", r.error());
+        match decode_body::<DataReply>(&r.body).unwrap() {
+            DataReply::Written { version } => version,
+            other => panic!("{other:?}"),
+        }
+    };
+    let v1 = send_write(&c, 1, 1, 777, b"AAAAAAAA");
+    c.crash(1);
+    c.set_chains(&[(1, chain(&[(2, S), (3, S)], 2, 1))]); // 2 成为新 head
+    let v2 = c.write(0, 0, b"BBBBBBBB").unwrap();
+    assert!(v2 > v1);
+    assert_eq!(c.read(0, 8).unwrap(), b"BBBBBBBB");
+    // A 重试 write_id=777 到新 head 2：命中经 ForwardWrite 复制过来的去重记录，返回原版本号 v1，不覆盖 B 的写
+    assert_eq!(send_write(&c, 2, 2, 777, b"AAAAAAAA"), v1);
+    assert_eq!(c.read(0, 8).unwrap(), b"BBBBBBBB", "重试的旧写没有覆盖 B 之后完成的写");
+    assert_eq!(c.committed_version(2, 0), Some(v2), "chunk 版本没有递增");
+
+    // TruncateChunk 同样按 write_id 沿链去重
+    let op = |chain_ver| DataOp::TruncateChunk { chunk: id(0), chain_ver, new_len: 4, write_id: 888 };
+    let v3 = match data_call(&c, 2, op(2)).unwrap() {
+        DataReply::Written { version } => version,
+        other => panic!("{other:?}"),
+    };
+    c.crash(2);
+    c.set_chains(&[(1, chain(&[(3, S)], 3, 1))]); // 3 成为新 head
+    let v4 = c.write(0, 0, b"CCCCCCCC").unwrap();
+    assert!(v4 > v3);
+    assert_eq!(data_call(&c, 3, op(3)), Ok(DataReply::Written { version: v3 }));
+    assert_eq!(c.read(0, 8).unwrap(), b"CCCCCCCC", "重试的旧截断没有截掉 B 之后完成的写");
 }

@@ -12,7 +12,8 @@
 //!   不能当错误码返回）；panic / abort / sleep 在函数内部执行；corrupt 不做事；
 //! - [`fail_point_hit`]：`return(..)` 与 `corrupt` 返回 true（drop、corrupt 这类动作由调用方自己做）；
 //! - [`fail_point_value`]：`return(<整数>)` 的整数值（可以为负、可以大于 u16），给时钟注入偏移与速率用；
-//! - [`fail_point_ms`]：`return(<毫秒>)` 的毫秒数（负数当 0），没有配置就是给的默认值——测试里缩短后台任务的 24 h、1 h 之类（M11）。
+//! - [`fail_point_ms`]：`return(<毫秒>)` 的毫秒数（负数当 0），没有配置就是给的默认值——测试里缩短后台任务的 24 h、1 h 之类（M11）；
+//! - [`active`]：配置了任何 fail point 吗（一次原子读）：热路径上先问它，是真才去拼带后缀的名字（M15，`net.drop.to.<节点>`）。
 //!
 //! 名字按完整字符串匹配（例如 `plugin.quota.quota_admission`、`net.drop.to.2`），只能由字母、数字和 `.` `_` `-` 组成。
 
@@ -61,14 +62,9 @@ fn points() -> &'static RwLock<HashMap<String, Arc<Point>>> {
     P.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// 热路径：未配置时只有这一次原子读。
+/// 热路径：未配置时只有 [`active`] 的一次原子读。
 fn lookup(name: &str) -> Option<Arc<Point>> {
-    let mut st = STATE.load(Ordering::Relaxed);
-    if st == UNINIT {
-        load_env();
-        st = STATE.load(Ordering::Relaxed);
-    }
-    if st != ACTIVE {
+    if !active() {
         return None;
     }
     points().read().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
@@ -115,6 +111,14 @@ pub fn fail_point(name: &str) -> Result<(), u16> {
         Outcome::Return(c) => Err(u16::try_from(c).ok().filter(|c| *c != 0).unwrap_or(INTERNAL)),
         _ => Ok(()),
     }
+}
+
+/// 配置了任何 fail point 吗：热路径上先问它，再拼带后缀的名字（例如 `net.drop.to.<节点>`），不在每次调用时 `format!`。
+pub fn active() -> bool {
+    if STATE.load(Ordering::Relaxed) == UNINIT {
+        load_env();
+    }
+    STATE.load(Ordering::Relaxed) == ACTIVE
 }
 
 /// 只问"这次是否触发"：`return(..)` 或 `corrupt` 触发时返回 true。

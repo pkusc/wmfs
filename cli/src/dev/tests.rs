@@ -6,6 +6,7 @@ use super::up::check_profile;
 use super::*;
 use wmfs_core::base::clock;
 use wmfs_core::buf::PoolConfig;
+use wmfs_core::init::Profile;
 
 #[test]
 fn dev_ports_follow_the_19n00_scheme() {
@@ -51,6 +52,17 @@ fn up_refuses_to_switch_the_profile_of_an_existing_cluster() {
     assert!(check_profile(&nd, Profile::Minimal).is_ok());
     assert!(check_profile(&nd, Profile::Default).unwrap_err().contains("--profile minimal"));
     std::fs::remove_dir_all(&nd).unwrap();
+}
+
+/// M15：`up --profile hpc-rdma` 的数据走 RDMA，不给 `--rdma` 就在建任何文件之前报错（不然 set_rdma 会把 node.toml 改回只用 tcp）；
+/// 不认识的 profile 列出全部四个。
+#[test]
+fn up_hpc_rdma_needs_rdma() {
+    let d = std::env::temp_dir().join(format!("wmfs-dev-hpc-{}-{}", std::process::id(), clock::mono_ms()));
+    let e = super::up_profile(&d, 3, None, "hpc-rdma").unwrap_err();
+    assert!(e.contains("--rdma"), "{e}");
+    assert!(!d.exists(), "报错之前什么也没建");
+    assert!(super::up_profile(&d, 1, None, "bogus").unwrap_err().contains("hpc-rdma"));
 }
 
 #[test]

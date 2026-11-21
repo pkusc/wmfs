@@ -573,6 +573,12 @@ scripts/accept.sh chaos                             # kill -9、SIGSTOP、分区
 scripts/accept.sh release                           # 以上全部 + clippy + 单元测试 + 文档齐全检查
 ```
 
+- 实现注记（M15）：演示命令照原样可用。`scripts/accept.sh profile-hpc-rdma` 在本机输出一行 `SKIP profile hpc-rdma（原因：本机没有可用的 RDMA
+  设备……未在本机验证……）`，最后一行 `profile-hpc-rdma SKIP（未在本机验证：不算通过，也不算失败）`、退出码 0；`release` 把它算作"未验证"，
+  最后一行是 `release PASS（另有 1 条 SKIP：未在本机验证，不算通过也不算失败）`。"`scripts/loc.sh` 在预算内"按 §0 第 7 条的上限判：非测试代码
+  合计 ≤ 38,000 行（人类 2026-11-05 定的，ADR-0041 第 2 条），不按 §1 的累计预算。容器里的外部测试是发布门槛：没有镜像 `wmfs-tools` 时
+  `profile-*` 与 `release` 失败（先 `scripts/build-tools-image.sh`），不是 SKIP。各入口跑什么、大约多久写在 `scripts/accept.d/m15.sh` 开头（本机
+  实测：`scripts/accept.sh M15` 约 5 分钟、`profile-minimal` 约 10 分钟、`profile-nas-safe` 约 16 分钟、`chaos` 约 4 分钟、`release` 约 38 分钟）。
 - **本阶段你需要理解的概念**：
   - **profile**：我们只承诺有限几种插件组合一定通过全套测试：`minimal`（单节点、无配额）、`hpc-rdma`（3 节点、RDMA、配额、QoS）、`nas-safe`（3 节点、3 副本、回收站、审计）。其他组合尽力而为（semantics.md 写明）。
   - **pjdfstest**：一套检查"文件系统行为是否符合 POSIX"的老牌测试，要用 root 跑，所以放在 docker 容器里执行。我们事先列出"因为文档里写明的放松而预期失败"的用例，清单外的失败就不能发布。

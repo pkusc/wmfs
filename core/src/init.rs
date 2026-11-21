@@ -11,7 +11,9 @@
 //! **NODE 最后写**，它是 init 的提交点：NODE 存在 = init 已经完成（`wmfs dev` 靠它判断"已初始化"）；init 中途失败或
 //! 被杀时目录里没有 NODE，删掉重来即可。实现注记（M3）：`--profile`/`--owner` 随用到它们的里程碑加入（只写 default
 //! profile，根目录的属主是运行 init 的用户）。实现注记（M6）：`--profile default|minimal`（[`Profile`]，3.4.3 的表）：minimal 的
-//! default 类 replica = 1、不写 replicas 属性，node.toml 停用 quota 与 mclock；M9 加了 nas-safe 的阶段版（`/home replicas=3`）。实现注记（M4）：`--target PATH[:label,label]` 写进 node.toml 的 `[[target]]`
+//! default 类 replica = 1、不写 replicas 属性，node.toml 停用 quota 与 mclock；M9 加了 nas-safe（M12 起是完整的 `/home replicas=3,trash=7d,
+//! audit=on`）。实现注记（M15）：数据族另走一个传输（hpc-rdma 的 rdma，[`InitOpts::data_transport`]）时，它的 `[plugin.<scheme>]` 与
+//! `[net] data_scheme` 随 node.toml 一起写（NODE 之前），它的 listen 与 tcp 的一起写进 NodeRecV1(1).addrs 公布（[`Listen::addrs`]）。实现注记（M4）：`--target PATH[:label,label]` 写进 node.toml 的 `[[target]]`
 //! 与初始 KV 的 TargetRecV1（id 1..=n，gen_chains 用它们生成链）；同一个路径给两次、或一个 target 在另一个里面 → 拒绝
 //! （两个 target 的超级块与 chunk 目录会互相踩到）。实现注记（M5）：init 给每个 target 建目录、写 TARGET 超级块（3.2.3：
 //! cluster_id、target_id = 1..=n、node_id 1，`atomic_write`，在 NODE 之前）；任何一个 target 目录里已经有超级块（属于别的集群）
@@ -21,6 +23,7 @@
 
 mod initial_kv;
 mod join;
+mod targets;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -28,20 +31,20 @@ use std::path::{Path, PathBuf};
 pub use initial_kv::{HOME_INO, InitialKv, SCRATCH_INO, default_class, initial_kv};
 pub use join::{JoinError, JoinOpts, join_node};
 use serde::{Deserialize, Serialize};
+pub use targets::parse_target;
 use wmfs_api::hex::{hex, unhex};
 use wmfs_api::types::KeyFile;
 
-use crate::base::config::{NodeConfig, TargetConfig};
+use crate::base::config::{NodeConfig, PluginTable, TargetConfig};
 use crate::base::types::Role;
 use crate::base::{clock, log, rand, sys};
 use crate::buf::PoolConfig;
-use crate::data::superblock::TargetSuperblock;
 use crate::hooks::traits::KeyLookup;
-use crate::meta::cluster::chains::TARGET_UP;
 use crate::meta::raft::storage;
-use crate::meta::schema::records::{KeyMetaV1, PluginListV1, TargetRecV1};
+use crate::meta::schema::records::{KeyMetaV1, PluginListV1};
 use crate::proto::handshake::derive_secret;
 use crate::proto::peer::ClusterMap;
+use targets::{check_targets, target_rec, write_superblocks};
 
 /// key 号的约定（key 0 = 服务端之间、1 = admin、2 = 默认 client）是协议常量，定义在 `proto::handshake`，这里原样转出。
 pub use crate::proto::handshake::{ADMIN_KEY, CLIENT_KEY, SERVER_KEY};
@@ -78,8 +81,9 @@ impl NodeFile {
     }
 }
 
-/// init 的部署模板（3.4.3 第 3 步的表）。M6 有 default 与 minimal。实现注记（M9）：nas-safe 是阶段版（9.7：只设置已有消费者的
-/// 属性）——`/home replicas=3`（M12 起加上 trash=7d、audit=on）；hpc-rdma 还没有实现（要 RDMA 网卡，开发机上没有，`scripts/profiles.sh` 显示 SKIP）。
+/// init 的部署模板（3.4.3 第 3 步的表）：default、minimal、nas-safe（`/home replicas=3,trash=7d,audit=on`）。hpc-rdma 不在这里：它的初始 KV
+/// 与 default 只差 NodeRecV1(1) 多公布一个 rdma 地址——命令行按 default 建，把 `[plugin.rdma]` 经 [`InitOpts::data_transport`] 交给 init
+/// （`cli/src/node.rs` 的 `parse_profile`；core 里除注释外不出现传输的名字，2.1）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Default,
@@ -88,14 +92,13 @@ pub enum Profile {
 }
 
 impl Profile {
-    pub fn parse(s: &str) -> Result<Profile, String> {
+    /// 按名字取模板；不认识 → None（给人看的合法名字只列在命令行的 `cli/src/node.rs` 的 `parse_profile`：它另认 hpc-rdma）。
+    pub fn parse(s: &str) -> Option<Profile> {
         match s {
-            "default" => Ok(Profile::Default),
-            "minimal" => Ok(Profile::Minimal),
-            "nas-safe" => Ok(Profile::NasSafe),
-            _ => Err(format!(
-                "--profile {s:?}：现在有 default、minimal、nas-safe（第三个部署模板还没有实现，design.md 9.7）"
-            )),
+            "default" => Some(Profile::Default),
+            "minimal" => Some(Profile::Minimal),
+            "nas-safe" => Some(Profile::NasSafe),
+            _ => None,
         }
     }
 
@@ -137,6 +140,9 @@ pub struct InitOpts {
     pub plugins: PluginListV1,      // 本节点按 node.toml 装出来的插件清单：写进 GLOBAL plugins（3.4.3、3.7.2）
     pub targets: Vec<TargetConfig>, // `--target`：写进 node.toml 的 [[target]] 与初始 KV 的 TargetRecV1（M4）
     pub profile: Profile,           // 部署模板（M6）：初始 KV 与 node.toml 的 `[plugins] disable`
+    /// 数据族另走的传输（M15，hpc-rdma）：(scheme, 它的 `[plugin.<scheme>]` 表，要有 `listen`)——写进 node.toml 并设 `[net] data_scheme`，
+    /// listen 与 tcp 的一起写进 NodeRecV1(1).addrs（3.4.3 第 3 步）。None = 只有 tcp。core 不认识具体的传输（2.1）。
+    pub data_transport: Option<(String, PluginTable)>,
 }
 
 /// 建一个新的单节点数据目录。目录必须不存在或为空（防止覆盖已有集群，坑 P14）。
@@ -147,12 +153,12 @@ pub fn init_node(o: &InitOpts) -> Result<(), String> {
     rand::fill(&mut cluster_id);
     rand::fill(&mut master);
     let node = NodeFile { format: 1, cluster_id: hex(&cluster_id), node_id: 1, created_ms: clock::wall_ms() };
-    let net = Listen { addr: &o.addr, rpc_port: o.rpc_port, mgmt_port: o.mgmt_port };
+    let net = Listen { addr: &o.addr, rpc_port: o.rpc_port, mgmt_port: o.mgmt_port, data: o.data_transport.as_ref() };
     let mut cfg = node_config(&net, &o.targets, o.host_id.clone());
     (cfg.failpoints_api, cfg.debug_ops, cfg.mem) = (o.failpoints_api, o.debug_ops, o.mem);
     cfg.plugins.disable = o.profile.disabled_plugins();
     write_common(d, &cfg, &master)?;
-    write_meta(d, o, &node)?;
+    write_meta(d, o, &node, net.addrs())?;
     let ids: Vec<u32> = (1..=o.targets.len() as u32).collect();
     write_superblocks(&o.targets, &ids, &node)?;
     write_node(d, &node) // NODE 放最后：它是提交点（见文件头），之前的文件都已经落盘
@@ -163,6 +169,17 @@ pub(crate) struct Listen<'a> {
     pub addr: &'a str,
     pub rpc_port: u16,
     pub mgmt_port: u16,
+    pub data: Option<&'a (String, PluginTable)>, // 数据族另走的传输（InitOpts::data_transport）
+}
+
+impl Listen<'_> {
+    /// 写进 NodeRecV1.addrs 公布的地址（3.4.3 第 3 步）：tcp 的 `addr:rpc_port`，再加数据族另走的那个传输的 `listen`。实现注记（M3、M8、M15）：
+    /// 取 node.toml 里的监听地址，不先起传输去问 `listen()`。
+    pub(crate) fn addrs(&self) -> Vec<(String, String)> {
+        let mut v = vec![("tcp".to_string(), format!("{}:{}", self.addr, self.rpc_port))];
+        v.extend(self.data.and_then(|(s, t)| Some((s.clone(), t.get("listen")?.as_str()?.to_string()))));
+        v
+    }
 }
 
 /// 新节点的检查（init 与 join 共用）：数据目录必须不存在或为空（防止覆盖已有集群，坑 P14）；target 不能重复、嵌套或已有超级块。
@@ -173,13 +190,18 @@ pub(crate) fn check_new_node(d: &Path, targets: &[TargetConfig]) -> Result<(), S
     check_targets(targets)
 }
 
-/// node.toml：监听地址（`[plugin.tcp] listen`、`[mgmt] listen`）、target、模拟的主机号；其余取默认值。
+/// node.toml：监听地址（`[plugin.tcp] listen`、`[mgmt] listen`；数据族另走的传输：它的 `[plugin.<scheme>]` 与 `[net] data_scheme`）、
+/// target、模拟的主机号；其余取默认值。
 pub(crate) fn node_config(l: &Listen, targets: &[TargetConfig], host_id: Option<String>) -> NodeConfig {
     let mut cfg = NodeConfig::default();
     cfg.mgmt.listen = format!("{}:{}", l.addr, l.mgmt_port);
     let tcp =
         toml::Table::from_iter([("listen".to_string(), toml::Value::String(format!("{}:{}", l.addr, l.rpc_port)))]);
     cfg.plugin.insert("tcp".into(), tcp);
+    if let Some((scheme, table)) = l.data {
+        cfg.plugin.insert(scheme.clone(), table.clone());
+        cfg.net.data_scheme = scheme.clone();
+    }
     cfg.debug.host_id = host_id;
     cfg.targets = targets.to_vec();
     cfg
@@ -218,14 +240,14 @@ pub(crate) fn create_meta_db(d: &Path) -> Result<redb::Database, String> {
 
 /// 写 `meta/meta.redb` 的 index = 1 初始状态（3.4.1.9、3.4.3 第 3 步）。根目录的属主 = 运行 init 的用户（本进程的有效
 /// uid/gid；数据目录可以是别的用户事先建好的空目录，所以不取它的属主）。
-fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile) -> Result<(), String> {
+fn write_meta(d: &Path, o: &InitOpts, node: &NodeFile, addrs: Vec<(String, String)>) -> Result<(), String> {
     let path = d.join("meta/meta.redb");
     let machine_id = read_fact("/etc/machine-id");
     let i = InitialKv {
         cluster_id: node.cluster_id_bytes()?,
         created_ms: node.created_ms,
         owner: sys::euid_egid(),
-        addrs: vec![("tcp".into(), format!("{}:{}", o.addr, o.rpc_port))],
+        addrs,
         mgmt_addr: format!("{}:{}", o.addr, o.mgmt_port),
         host_id: o.host_id.clone().unwrap_or_else(|| machine_id.clone()),
         machine_id,
@@ -253,43 +275,6 @@ pub(crate) fn read_fact(p: &str) -> String {
     }
 }
 
-/// 给每个 target 写超级块（见文件头的实现注记）：init 的 target_id 依次为 1..=n，与初始 KV 的 TargetRecV1 一致；join 的取自
-/// `Joined.target_ids`。
-pub(crate) fn write_superblocks(targets: &[TargetConfig], ids: &[u32], node: &NodeFile) -> Result<(), String> {
-    let cluster_id = node.cluster_id_bytes()?;
-    for (t, &target_id) in targets.iter().zip(ids) {
-        let dir = Path::new(&t.path);
-        let sb_path = dir.join("TARGET");
-        std::fs::create_dir_all(dir).map_err(|e| format!("建 target 目录 {} 失败：{e}", t.path))?;
-        let sb = TargetSuperblock {
-            features_compat: 0,
-            features_ro_compat: 0,
-            features_incompat: 0,
-            cluster_id,
-            target_id,
-            node_id: node.node_id,
-            created_ms: node.created_ms,
-        };
-        sys::atomic_write(&sb_path, &sb.encode()).map_err(|e| format!("写 {} 失败：{e}", sb_path.display()))?;
-    }
-    Ok(())
-}
-
-/// 一个 `[[target]]` 的初始 TargetRecV1（见 `initial_kv` 的实现注记）。
-fn target_rec(t: &TargetConfig, node: u32, created_ms: u64) -> Result<TargetRecV1, String> {
-    Ok(TargetRecV1 {
-        node,
-        path: t.path.clone(),
-        labels: t.labels.clone(),
-        phys_devs: vec![],
-        capacity: t.capacity_bytes()?,
-        boot_id: 0,
-        state: TARGET_UP,
-        last_up_ms: created_ms,
-        read_only: false,
-    })
-}
-
 /// init 写下的初始状态里的集群警告（3.4.3 第 4 步、ADR-0016）：例如单节点上 default 类声明 3 副本、只有 1 个故障域。
 pub fn initial_warnings(o: &InitOpts) -> Vec<String> {
     let targets = o.targets.iter().filter_map(|t| target_rec(t, 1, 0).ok());
@@ -299,41 +284,6 @@ pub fn initial_warnings(o: &InitOpts) -> Vec<String> {
         ..ClusterMap::default()
     };
     crate::meta::cluster::map::warnings(&m)
-}
-
-/// 解析 `--target PATH[:label,label]`（3.4.3）：路径换成绝对路径，标签只能由小写字母、数字与 `-` 组成。
-/// 路径里不能有 `:`（它分隔标签）。容量不限（`capacity = "0"`；`--target` 没有容量的写法）。
-pub fn parse_target(s: &str) -> Result<TargetConfig, String> {
-    let (path, labels) = s.split_once(':').unwrap_or((s, ""));
-    if path.is_empty() {
-        return Err(format!("--target {s:?}：缺少路径"));
-    }
-    let path = std::path::absolute(path).map_err(|e| format!("--target {s:?}：{e}"))?;
-    let labels: Vec<String> = labels.split(',').filter(|l| !l.is_empty()).map(String::from).collect();
-    let ok = |l: &String| l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if let Some(bad) = labels.iter().find(|l| !ok(l)) {
-        return Err(format!("--target {s:?}：标签 {bad:?} 只能由小写字母、数字与 - 组成"));
-    }
-    Ok(TargetConfig { path: path.display().to_string(), labels, capacity: "0".into() })
-}
-
-/// 同一个节点的 target 不能重复，也不能一个在另一个里面（按路径的各段比较，例如 /data 与 /data/t2）；目录里不能已经有超级块。
-fn check_targets(ts: &[TargetConfig]) -> Result<(), String> {
-    for (i, a) in ts.iter().enumerate() {
-        if Path::new(&a.path).join("TARGET").exists() {
-            return Err(format!("{} 里已经有 target 超级块（属于别的集群？）：拒绝初始化", a.path));
-        }
-        for b in &ts[i + 1..] {
-            let (pa, pb) = (Path::new(&a.path), Path::new(&b.path));
-            if pa == pb {
-                return Err(format!("target {} 给了两次", a.path));
-            }
-            if pa.starts_with(pb) || pb.starts_with(pa) {
-                return Err(format!("target {} 与 {} 一个在另一个里面：每个 target 要用各自的目录", a.path, b.path));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// 读 `<data_dir>/cluster.key`（32 字节）。

@@ -318,7 +318,8 @@ pub fn inject_pending(c: &Craq, n: u32, idx: u32, data: &[u8], succ: u32) -> u64
     let mut b = node.pool.get(data.len(), Lane::Normal, Duration::from_secs(1)).unwrap();
     b.as_mut_slice().copy_from_slice(data);
     let kind = JobKind::Write { extents: vec![(0, data.len() as u32)], sync: false };
-    let job = WriteJob { chunk: id(idx), target: n, cap: data_cap(c.cs), kind, bulk: Some(b), reply: None };
+    let job =
+        WriteJob { chunk: id(idx), target: n, cap: data_cap(c.cs), kind, bulk: Some(b), dedup: (0, 0), reply: None };
     assert!(node.chunks.claim(&id(idx)));
     let p = write::prepare(node, &job).unwrap().unwrap();
     let (last_sent, upstream, successor) = (clock::mono_ms(), None, Some(succ));
@@ -332,6 +333,7 @@ pub fn inject_pending(c: &Craq, n: u32, idx: u32, data: &[u8], succ: u32) -> u64
         sync: false,
         clean: true,
         committed: false,
+        dedup: (0, 0),
     };
     node.chunks.set_pending(&id(idx), pw);
     p.version

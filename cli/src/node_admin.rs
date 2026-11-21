@@ -14,7 +14,7 @@ pub enum NodeCmd {
         #[command(flatten)]
         api: ApiArgs,
     },
-    /// 让节点不再当 leader、不再被提升（M9 起还会把链从它上面迁走）
+    /// 让节点不再当 leader、不再被提升，并把链从它上面迁走（计划内下线之前用）
     Drain {
         id: u32,
         #[command(flatten)]

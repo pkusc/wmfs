@@ -21,6 +21,7 @@
 pub mod build;
 pub mod chain;
 pub mod datakey;
+pub mod dedup;
 pub mod format;
 pub mod forward;
 pub mod latency;
@@ -156,6 +157,7 @@ pub struct DataNode {
     pub pipeline: Arc<Pipeline>,
     pub targets: BTreeMap<u32, Target>,
     pub chunks: ChunkTable,
+    pub dedup: dedup::WriteDedup, // 数据写去重表（ADR-0046）：(chunk, session, write_id) → version
     pub pool: MemPool,
     pub cluster_id: [u8; 16],
     pub cap_key: [u8; 32],
@@ -207,6 +209,7 @@ impl DataNode {
             pipeline,
             targets,
             chunks: ChunkTable::new(),
+            dedup: dedup::WriteDedup::default(),
             pool,
             cluster_id,
             cap_key,

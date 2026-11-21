@@ -1,7 +1,8 @@
 //! init 的单元测试：写出的文件、拒绝非空目录、元数据库的 index = 1 初始状态（3.4.1.9、3.4.3）、`--target` 的解析与
-//! 重复/嵌套的 target、init 的集群警告、minimal profile（M6）。
+//! 重复/嵌套的 target、init 的集群警告、minimal profile（M6）、数据族另走的传输（M15：写进 node.toml 与 NodeRecV1(1).addrs）。
 
 use super::*;
+use crate::data::superblock::TargetSuperblock;
 use crate::meta::raft::storage::{KV, RedbStorage, read_applied};
 use crate::meta::schema::keys;
 use crate::meta::schema::raft_state::Applied;
@@ -23,6 +24,7 @@ fn opts(d: &Path) -> InitOpts {
             ..parse_target(&format!("{}/t1:nvme,fast", d.display())).unwrap()
         }],
         profile: Profile::Default,
+        data_transport: None,
     }
 }
 
@@ -130,9 +132,9 @@ fn targets_on_the_command_line_and_the_initial_warnings() {
 /// 3.4.3 的 profile 表：minimal = default 类 replica 1、不写 replicas 属性（单节点不出现降级警告）、node.toml 停用 quota 与 mclock。
 #[test]
 fn minimal_profile_has_one_replica_and_no_replicas_attrs() {
-    assert_eq!(Profile::parse("minimal"), Ok(Profile::Minimal));
-    assert_eq!(Profile::parse("nas-safe"), Ok(Profile::NasSafe), "M9：nas-safe 的阶段版");
-    assert!(Profile::parse("bogus").unwrap_err().contains("nas-safe"), "列出现在有的部署模板");
+    assert_eq!(Profile::parse("minimal"), Some(Profile::Minimal));
+    assert_eq!(Profile::parse("nas-safe"), Some(Profile::NasSafe));
+    assert_eq!(Profile::parse("bogus"), None, "给人看的合法名字列表在命令行（cli/src/node.rs 的 parse_profile）");
     let d = crate::base::test_dir("init-minimal");
     let o = InitOpts { profile: Profile::Minimal, ..opts(&d) };
     assert!(initial_warnings(&o).is_empty(), "单节点 1 副本：没有降级警告");
@@ -146,5 +148,26 @@ fn minimal_profile_has_one_replica_and_no_replicas_attrs() {
     let class: StorageClassV1 = decode_v1(&get(keys::class(1)).unwrap()).unwrap();
     assert_eq!((class.name.as_str(), class.replica), ("default", 1));
     assert!(get(keys::dirattr(HOME_INO)).is_none() && get(keys::dirattr(SCRATCH_INO)).is_none(), "不写 replicas 属性");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// M15（hpc-rdma 用它）：数据族另走一个传输时，它的 `[plugin.<scheme>]` 与 `[net] data_scheme` 在 NODE 之前写进 node.toml，它的 listen
+/// 与 tcp 的一起写进 NodeRecV1(1).addrs（3.4.3 第 3 步：addrs 来自各传输的监听地址）——客户端 `--transport <scheme>` 靠它找到地址。
+/// core 里不出现具体传输的名字（2.1），这里用一个虚构的 scheme。
+#[test]
+fn a_data_transport_goes_into_node_toml_and_the_published_addrs() {
+    let d = crate::base::test_dir("init-data-transport");
+    let table: PluginTable = "listen = \"10.77.0.1:19101\"\nmax_qps = 32\n".parse().unwrap();
+    let o = InitOpts { data_transport: Some(("xfast".into(), table.clone())), ..opts(&d) };
+    init_node(&o).unwrap();
+    let cfg = NodeConfig::parse(&std::fs::read_to_string(o.data_dir.join("node.toml")).unwrap()).unwrap();
+    assert_eq!(cfg.plugin_cfg("xfast"), table);
+    assert_eq!((cfg.net.control_scheme.as_str(), cfg.net.data_scheme.as_str()), ("tcp", "xfast"), "元数据照旧走 tcp");
+    let db = redb::Database::open(o.data_dir.join("meta/meta.redb")).unwrap();
+    let rtx = db.begin_read().unwrap();
+    let kv = rtx.open_table(KV).unwrap();
+    let node: NodeRecV1 = decode_v1(kv.get(keys::node(1).as_slice()).unwrap().unwrap().value()).unwrap();
+    let want = [("tcp", "127.0.0.1:19100"), ("xfast", "10.77.0.1:19101")].map(|(s, a)| (s.to_string(), a.to_string()));
+    assert_eq!(node.addrs, want, "公布 tcp 与数据族的传输");
     std::fs::remove_dir_all(&d).unwrap();
 }

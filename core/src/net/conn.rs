@@ -12,6 +12,11 @@
 //! 保活（实现注记 M1）：**客户端**连接在**握手完成之后**，写线程空闲 5 s 就发一个 `req_id = 0` 的 Ping（回复被忽略）；
 //! 握手完成之前不发——服务端会把它当成"未认证连接上的非握手帧"直接断开（3.3.2）。服务端从不向客户端发请求。
 //! 传输插件负责"15 s 收不到任何帧就判死"（tcp：读超时 15 s），于是两边都能发现对端已死。
+//!
+//! 实现注记（M15）：fail point `net.delay`（3.11）= `return(<毫秒>)`：每一帧在入队之后至少过这么久才写出去（模拟网络延迟）。入队时刻随帧
+//! 放进发送队列（只在配置了 fail point 时取时钟），写线程睡到"入队时刻 + N + 1 ms"：帧与帧之间不累加，排在后面的帧不会因为前面的帧再多等。
+//! 加 1 ms 是因为 `mono_ms` 只精确到毫秒（入队时刻与"现在"都被截掉了不到 1 ms），不加的话可能比 N 早不到 1 ms 写出去（同 `client.rs` 文件头
+//! 的实现注记 ④）。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -38,7 +43,7 @@ const STACK: usize = 256 << 10;
 #[derive(Clone)]
 pub struct ConnHandle {
     inner: Arc<Inner>,
-    tx: Sender<OutFrame>,
+    tx: Sender<(OutFrame, u64)>, // (帧, 入队时刻 mono_ms；没有配置任何 fail point 时是 0，见文件头的 net.delay)
 }
 
 struct Inner {
@@ -91,7 +96,8 @@ impl ConnHandle {
         if self.is_closed() {
             return Err(ErrCode::ECONNRESET);
         }
-        match self.tx.try_send(f) {
+        let at = if wmfs_api::failpoint::active() { clock::mono_ms() } else { 0 };
+        match self.tx.try_send((f, at)) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 counters().queue_full.inc();
@@ -183,12 +189,12 @@ pub(crate) fn spawn(
 }
 
 /// 写线程：从队列取帧 → 填帧头 → 过 transport 钩子包装 → `Conn::send`。出错（含写超时、fail point）即关闭连接。
-fn write_loop(inner: Arc<Inner>, rx: Receiver<OutFrame>, opts: ConnOpts) {
+fn write_loop(inner: Arc<Inner>, rx: Receiver<(OutFrame, u64)>, opts: ConnOpts) {
     let mut last = clock::mono_ms();
     loop {
-        let f = match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(f) => f,
-            Err(RecvTimeoutError::Timeout) if keepalive_due(&inner, &opts, last) => keepalive(),
+        let (f, at) = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(x) => x,
+            Err(RecvTimeoutError::Timeout) if keepalive_due(&inner, &opts, last) => (keepalive(), 0),
             Err(RecvTimeoutError::Timeout) if !inner.closed.load(Ordering::SeqCst) => continue,
             Err(_) => break, // 已关闭，或所有句柄都被丢弃（队列里的帧已写完）
         };
@@ -196,6 +202,11 @@ fn write_loop(inner: Arc<Inner>, rx: Receiver<OutFrame>, opts: ConnOpts) {
             break;
         }
         let hdr = f.hdr;
+        let delay = wmfs_api::failpoint::fail_point_ms("net.delay", 0); // 3.11：见文件头
+        let wait = (at + delay + 1).saturating_sub(clock::mono_ms()); // +1：见文件头
+        if delay > 0 && wait > 0 {
+            std::thread::sleep(Duration::from_millis(wait));
+        }
         let r = match send_one(&inner, f, &opts.hook) {
             Err(ErrCode::FEATURE_UNSUPPORTED) => unsent(&inner, &opts, &hdr), // 帧超过该传输的上限：只让这一个请求失败
             r => r,

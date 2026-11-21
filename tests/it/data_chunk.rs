@@ -141,6 +141,7 @@ fn header_versions_holes_and_layout_params() {
         cap: bad,
         kind: wmfs_core::data::write::JobKind::Truncate { new_len: 0 },
         bulk: None,
+        dedup: (0, 0),
         reply: None,
     };
     assert_eq!(wmfs_core::data::write::run(&node3, &j), Err(ErrCode::EINVAL), "cap 的 chunk_size 与这个 chunk 不同");

@@ -167,7 +167,10 @@ fn commit_local(node: &Arc<DataNode>, id: &ChunkId) {
     let Some(mut p) = take_wait(node, id) else { return };
     if !p.committed {
         match write::commit(node, id, p.target, p.sync, p.clean) {
-            Ok(()) => p.committed = true,
+            Ok(()) => {
+                p.committed = true;
+                node.dedup.record(*id, p.dedup, p.version);
+            }
             Err(e) => {
                 log::warn("data", format_args!("{id:?}：新 last serving 本地提交 v{} 失败：{e}（稍后重试）", p.version))
             }

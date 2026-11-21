@@ -150,6 +150,7 @@ pub fn init_targets(dir: &Path, labels: &[&[&str]]) {
         plugins: plugins(&cfg).plugin_list(),
         targets: targets.collect(),
         profile: Profile::Default,
+        data_transport: None,
     };
     init_node(&o).unwrap();
 }

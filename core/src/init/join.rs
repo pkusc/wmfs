@@ -8,6 +8,8 @@
 //! - 数据目录与 init 的一样（cluster.key、node.toml、keys、TARGET 超级块，NODE 最后写），只是元数据库是**空的**
 //!   （`bootstrap_empty`：空日志、空 ConfState，坑 P14；Joined 里的集群图预写进 kv，见 `seed_kv` 与 `meta/raft/boot.rs`）。
 //!   实现注记（M8）：与 init 一样，NodeRecV1 的地址取 node.toml 的监听地址（`--addr:--rpc-port`），不先起传输去问 `listen()`。
+//!   实现注记（M15）：数据族另走的传输（`wmfs join --rdma`、`wmfs dev up --rdma`，[`JoinOpts::data_transport`]）同 init：它的
+//!   `[plugin.<scheme>]` 与 `[net] data_scheme` 写进 node.toml，listen 随 Join 一起公布（`JoinReq.addrs`）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +22,7 @@ use super::{
     Listen, NodeFile, check_new_node, create_meta_db, node_config, read_fact, write_common, write_node,
     write_superblocks,
 };
-use crate::base::config::{NetConfig, TargetConfig};
+use crate::base::config::{NetConfig, PluginTable, TargetConfig};
 use crate::base::{ErrCode, clock};
 use crate::buf::{MemPool, PoolConfig};
 use crate::hooks::traits::Transport;
@@ -56,6 +58,7 @@ pub struct JoinOpts {
     pub targets: Vec<TargetConfig>,
     pub meta_auto: bool, // --meta auto（现有元数据成员 < 3 时以 learner 加入）| none
     pub transports: Vec<Arc<dyn Transport>>,
+    pub data_transport: Option<(String, PluginTable)>, // 数据族另走的传输（同 InitOpts::data_transport）
 }
 
 /// join 失败：错误码与给人看的原因；`rejected` = leader 拒绝了（原因是它写的 `ErrorBody.msg`：插件清单不一致是 `EINVAL`，
@@ -78,11 +81,12 @@ pub fn join_node(o: &JoinOpts) -> Result<u32, JoinError> {
     let machine_id = read_fact("/etc/machine-id");
     let caps = o.targets.iter().map(|t| t.capacity_bytes()).collect::<Result<Vec<_>, _>>();
     let caps = caps.map_err(|e| fail(ErrCode::EINVAL, e))?;
+    let net = Listen { addr: &o.addr, rpc_port: o.rpc_port, mgmt_port: o.mgmt_port, data: o.data_transport.as_ref() };
     let req = JoinReq {
         hostname: read_fact("/proc/sys/kernel/hostname"),
         host_id: o.host_id.clone().unwrap_or_else(|| machine_id.clone()),
         machine_id,
-        addrs: vec![("tcp".into(), format!("{}:{}", o.addr, o.rpc_port))],
+        addrs: net.addrs(),
         mgmt_addr: format!("{}:{}", o.addr, o.mgmt_port),
         meta_role: if o.meta_auto { JOIN_META_AUTO } else { JOIN_META_NONE },
         targets: o.targets.iter().zip(caps).map(|(t, c)| (t.path.clone(), t.labels.clone(), c, vec![])).collect(),
@@ -91,7 +95,6 @@ pub fn join_node(o: &JoinOpts) -> Result<u32, JoinError> {
     };
     let (node_id, target_ids, map) = ask(o, &req)?;
     let node = NodeFile { format: 1, cluster_id: hex(&map.cluster_id), node_id, created_ms: clock::wall_ms() };
-    let net = Listen { addr: &o.addr, rpc_port: o.rpc_port, mgmt_port: o.mgmt_port };
     let mut cfg = node_config(&net, &o.targets, o.host_id.clone());
     (cfg.failpoints_api, cfg.debug_ops, cfg.mem) = (o.failpoints_api, o.debug_ops, o.mem);
     (cfg.plugins.disable, cfg.plugins.dylib) = (o.disable.clone(), o.dylib.clone());

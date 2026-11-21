@@ -67,6 +67,7 @@ pub fn first_send(node: &Arc<DataNode>, job: Box<WriteJob>, p: Prepared, succ: u
         header,
         blocks,
         sync: p.sync,
+        dedup: job.dedup,
     };
     let pw = PendingWrite {
         version: p.version,
@@ -78,6 +79,7 @@ pub fn first_send(node: &Arc<DataNode>, job: Box<WriteJob>, p: Prepared, succ: u
         sync: p.sync,
         clean: p.clean,
         committed: false,
+        dedup: job.dedup,
     };
     node.chunks.set_pending(&id, pw);
     if fail_point_hit("chain.head.crash_after_pending") {
@@ -126,9 +128,9 @@ fn pack_and_send(node: &DataNode, id: &ChunkId, succ: u32) -> Result<(), ErrCode
     let now = clock::mono_ms();
     let sent = node.chunks.with_pending(id, None, |p| {
         (p.successor, p.chain_ver, p.last_sent) = (Some(succ), ver, now);
-        (p.version, p.target, p.sync, p.committed)
+        (p.version, p.target, p.sync, p.committed, p.dedup)
     });
-    let (version, t, sync, committed) = sent.ok_or(ErrCode::ENOENT)?;
+    let (version, t, sync, committed, dedup) = sent.ok_or(ErrCode::ENOENT)?;
     let store = &node.targets.get(&t).ok_or(ErrCode::NOT_SERVING)?.store;
     let (buf, h) = if committed {
         let mut rd = node.store(|| store.open_committed(id))?.ok_or(ErrCode::ENOENT)?;
@@ -152,6 +154,7 @@ fn pack_and_send(node: &DataNode, id: &ChunkId, succ: u32) -> Result<(), ErrCode
         header,
         blocks: vec![],
         sync,
+        dedup,
     };
     send(node, fw, vec![buf.freeze().whole()], succ, (0, 0)); // 重发不属于哪个客户端请求
     Ok(())
@@ -183,6 +186,7 @@ pub fn settle(node: &Arc<DataNode>, id: &ChunkId, mut p: PendingWrite) -> Option
         return None;
     }
     p.mark(Stage::Disk); // 本地提交
+    node.dedup.record(*id, p.dedup, p.version);
     sync::touch(node, id, p.target);
     let next = node.chunks.finish(id);
     if let Some(up) = p.upstream {

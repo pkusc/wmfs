@@ -4,6 +4,7 @@
 //! - 冒烟：目录、文件、改名、符号链接、硬链接、xattr、截断、删除；
 //! - inline 与 chunk 文件（`wmfs fs stat --json` 核对：≤ 64 KiB 只在元数据里，更大的按 4 MiB 的 chunk 存）；
 //! - `kill -9` / 重启：fsync 过的数据在服务端被 `kill -9`、重启之后完整，挂载进程在服务端不在的这段时间里自己重试（不报错）；
+//! - quota、qos 属性被拒绝（没有插件消费：minimal 停用了 quota 与 mclock，不静默忽略）；
 //! - 属性（M7）：在挂载点下的目录上 `wmfs set chunk=1M,replicas=1`（没有警告：只有 1 个故障域、声明也是 1 副本），新文件按 1 MiB 的
 //!   chunk 存，`wmfs get` 的来源与 `semantics:` 一行（replicas 声明 1/实际 1），`wmfs usage` 的字节数等于写进去的；
 //! - pjdfstest、fio verify、fsx 在容器里跑（`scripts/profiles.sh minimal`，没有镜像时显示 SKIP）。
@@ -11,34 +12,18 @@
 //! 用的是开发集群的固定端口 19100/19180，所以是 `#[ignore]`：只由 `scripts/profiles.sh minimal`（`scripts/accept.sh M6` 调用它）跑。
 //! 实现注记（M6）：这个文件是 cli 包的 `[[test]]`（`path = "../tests/profiles/minimal.rs"`）——要用 `CARGO_BIN_EXE_wmfs`。
 
+#[allow(dead_code)] // 与 nas_safe.rs、hpc_rdma.rs 共用：每个 profile 只用其中一部分
+mod common;
+
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
+use common::Cluster;
+
+/// 跑一条 `wmfs …`（1 个节点的开发集群、node1 的 admin key），失败就断言失败。
 fn wmfs(dir: &Path, args: &[&str]) -> String {
-    let o = Command::new(env!("CARGO_BIN_EXE_wmfs"))
-        .args(args)
-        .env("WMFS_DEV_DIR", dir)
-        .env("WMFS_CLUSTER", "127.0.0.1:19180")
-        .env("WMFS_KEY_FILE", dir.join("n1/keys/admin.key"))
-        .env("no_proxy", "127.0.0.1,localhost")
-        .output()
-        .unwrap();
-    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-    assert!(o.status.success(), "wmfs {args:?} 失败：{text}");
-    text
-}
-
-/// 无论成败，结束时停掉这个开发集群（先卸载挂载点，`dev down` 的清理顺序）并删掉目录。
-struct Cluster(PathBuf);
-
-impl Drop for Cluster {
-    fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_wmfs"))
-            .args(["dev", "down", "--purge"])
-            .env("WMFS_DEV_DIR", &self.0)
-            .status();
-    }
+    common::wmfs(dir, 1, args)
 }
 
 fn stat_json(dir: &Path, path: &str) -> String {
@@ -72,6 +57,11 @@ fn minimal_profile_smoke() {
     f.set_len(1000).unwrap();
     drop(f);
     assert_eq!(std::fs::metadata(mp.join("a/big")).unwrap().len(), 1000, "硬链接是同一个文件");
+    let py = "import os; os.setxattr('a/big','user.k',b'hi'); print(os.getxattr('a/big','user.k'), os.listxattr('a/big')); \
+              os.removexattr('a/big','user.k'); print(os.listxattr('a/big'))";
+    let o = Command::new("python3").args(["-c", py]).current_dir(&mp).output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!((o.status.success(), out.trim()), (true, "b'hi' ['user.k']\n[]"), "user.* xattr 的 set/get/list/remove");
     std::fs::remove_file(mp.join("a/big2")).unwrap();
     std::fs::remove_dir(mp.join("a/b")).unwrap();
     // inline 与 chunk 文件
@@ -94,6 +84,11 @@ fn minimal_profile_smoke() {
     assert!(get.contains("chunk=1M") && get.contains("来自 /attrs") && get.contains("replicas:声明1/实际1"), "{get}");
     let usage = wmfs(&dir, &["usage", d.to_str().unwrap(), "--json"]);
     assert!(usage.contains(&format!("\"bytes\":{}", big.len())), "递归用量：{usage}");
+    // 停用了 quota 与 mclock：quota、qos 属性没有插件消费——设置时被拒绝，而不是被静默忽略（9.7、semantics.md 第 4 节）
+    for kv in ["quota=1G", "qos=r=10,w=1,l=100"] {
+        let (ok, out) = common::run(&dir, 1, &["set", d.to_str().unwrap(), kv, "--json"]);
+        assert!(!ok && out.contains("\"error\""), "{kv} 应被拒绝：{out}");
+    }
     // kill -9 / 重启：fsync 过的数据完整
     let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 253) as u8).collect();
     let mut f = std::fs::File::create(mp.join("durable")).unwrap();

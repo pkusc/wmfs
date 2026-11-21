@@ -80,6 +80,7 @@ pub struct PendingWrite {
     pub sync: bool,             // O_SYNC：提交前 fdatasync
     pub clean: bool,            // 新版本没有从旧版本原样复制任何块：提交之后可以清除 Corrupt 标记
     pub committed: bool,        // 已在本地提交（3.4.2.6 规则 2：新的 last serving），还要推给后面的成员
+    pub dedup: (u64, u64),      // (session, write_id)：本地提交后记进去重表（ADR-0046）
 }
 
 impl PendingWrite {

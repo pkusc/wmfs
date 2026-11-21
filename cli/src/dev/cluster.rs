@@ -4,6 +4,7 @@
 //! M9：`dev restart-all`（[`restart_all`]，3.7.2 第 4 条）。M14：`dev restart <n>`（[`restart`]）；两者都先用 `--dylib` 给出的列表改写
 //! node.toml 的 `[plugins] dylib`（[`set_dylib`]，不给 = 清空；路径换成绝对路径）。
 
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -22,8 +23,8 @@ const MEMBERS_TIMEOUT_MS: u64 = 60_000;
 const CATCH_UP_TIMEOUT_MS: u64 = 30_000;
 
 /// 第 n 个开发节点加入 node1 所在的集群（node1 已经在运行）；动态库插件沿用 node1 的（M14：集群清单里有 `authz:deny-uid` 时新节点
-/// 也要装上它才能加入）。
-pub fn join(d: &Path, n: u32, profile: Profile) -> Result<(), String> {
+/// 也要装上它才能加入）。`rdma`：`dev up --rdma` 的 IP——加入时就公布 rdma 地址（M15，`dev/rdma.rs`）。
+pub fn join(d: &Path, n: u32, profile: Profile, rdma: Option<Ipv4Addr>) -> Result<(), String> {
     let nd = node_dir(d, n);
     let (rpc_port, mgmt_port) = ports(n);
     let disable = profile.disabled_plugins();
@@ -45,6 +46,7 @@ pub fn join(d: &Path, n: u32, profile: Profile) -> Result<(), String> {
         targets: vec![dev_target(&nd)],
         meta_auto: true,
         transports: registry::client_transports()?,
+        data_transport: rdma.map(|ip| super::rdma::transport(n, ip)).transpose()?,
     };
     join_node(&o).map(|_| ()).map_err(|e| format!("node{n} 加入集群失败：{}（{}）", e.msg, e.code))
 }

@@ -69,6 +69,7 @@ impl Cluster {
             plugins: plugins(&NodeConfig::default()).plugin_list(),
             targets: self.target(1),
             profile: Profile::Default,
+            data_transport: None,
         };
         init_node(&o).unwrap();
         self.nodes.push(Some(boot(&self.node_dir(1))));
@@ -99,6 +100,7 @@ impl Cluster {
             targets: self.target(i),
             meta_auto: true,
             transports: vec![Arc::new(tcp::TcpTransport::new(&Default::default(), 5000).unwrap())],
+            data_transport: None,
         };
         join_node(&o)?;
         let run = boot(&self.node_dir(i));

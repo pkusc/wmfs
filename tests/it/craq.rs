@@ -176,7 +176,8 @@ fn the_successor_table() {
     let mut b = head.pool.get(10, Lane::Normal, Duration::from_secs(1)).unwrap();
     b.as_mut_slice().copy_from_slice(b"0123456789");
     let kind = JobKind::Write { extents: vec![(0, 10)], sync: false };
-    let job = WriteJob { chunk: id(0), target: 1, cap: data::cap(CHUNK), kind, bulk: Some(b), reply: None };
+    let job =
+        WriteJob { chunk: id(0), target: 1, cap: data::cap(CHUNK), kind, bulk: Some(b), dedup: (0, 0), reply: None };
     let p = write::prepare(head, &job).unwrap().unwrap();
     let (header, blocks) = p.nv.forward_parts();
     let bulk = p.nv.into_bulk();
@@ -190,6 +191,7 @@ fn the_successor_table() {
         header: header.clone(),
         blocks: blocks.clone(),
         sync: false,
+        dedup: (0, 0),
     };
     let send = |to: u32, f: ForwardWrite| peer_call(&c, to, &PeerOp::ForwardWrite(f), bulk.clone());
     assert_eq!(send(2, fw(3, 1, 0)), Err((ErrCode::STALE_CHAIN, 1)), "不是当前前驱（I4）");

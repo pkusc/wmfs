@@ -19,9 +19,9 @@ pub struct DataCall {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum DataOp {
     ReadChunk { chunk: ChunkId, chain_ver: u64, off: u32, len: u32 }, // 响应 bulk = 明文
-    WriteChunk { chunk: ChunkId, chain_ver: u64, extents: Vec<(u32, u32)>, sync: bool }, // (chunk 内偏移, 长度)；请求 bulk = 各段依次拼接（发送方用 BufSlice 列表，不拷贝，3.6.2）
-    TruncateChunk { chunk: ChunkId, chain_ver: u64, new_len: u32 }, // 写一个新版本：new_len 之后全部清零（0 = 空版本）
-    SyncChunks { chain: u32, chain_ver: u64, chunks: Vec<ChunkId> }, // 链上每个成员 fdatasync
+    WriteChunk { chunk: ChunkId, chain_ver: u64, extents: Vec<(u32, u32)>, sync: bool, write_id: u64 }, // (chunk 内偏移, 长度)；请求 bulk = 各段依次拼接（发送方用 BufSlice 列表，不拷贝，3.6.2）；write_id = 重试去重号（ADR-0046，0 = 不去重）
+    TruncateChunk { chunk: ChunkId, chain_ver: u64, new_len: u32, write_id: u64 }, // 写一个新版本：new_len 之后全部清零（0 = 空版本）；write_id 同上
+    SyncChunks { chain: u32, chain_ver: u64, chunks: Vec<ChunkId> },               // 链上每个成员 fdatasync
     DeleteEpoch { chain: u32, chain_ver: u64, ino: u64, epoch: u32 }, // 需要 cap 的管理权限位（只签发给后台任务）
 }
 

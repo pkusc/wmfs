@@ -13,11 +13,14 @@
 //! - [`craq`]：CRAQ 组件测试——一个进程里几个数据服务经 mem 传输互连，集群图由测试下发（M9，9.3）
 //! - [`linear`]：寄存器历史的线性一致性检查（Wing-Gong 回溯，M9 的 Jepsen-lite）
 //! - [`bg`]：后台任务用例共用的管理 API 小工具（M11）
+//! - [`dev`]：多进程的开发集群（`wmfs dev`）上的捣乱：kill / SIGSTOP / 分区（`net.drop.to.*`）/ 网络延迟 / 时钟偏移，核对捣乱生效（M15，9.5）
+//! - [`register`]：Jepsen-lite 的寄存器负载（M9 起在 jepsen_register.rs 里，M15 挪来给 chaos 共用）
 
 pub mod bg;
 pub mod cluster;
 pub mod craq;
 pub mod data;
+pub mod dev;
 pub mod linear;
 pub mod mem_crash;
 pub mod mem_target;
@@ -26,4 +29,5 @@ pub mod meta_rpc;
 pub mod net;
 pub mod node;
 pub mod ns;
+pub mod register;
 pub mod sim_net;

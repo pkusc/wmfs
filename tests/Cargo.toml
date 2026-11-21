@@ -327,3 +327,14 @@ path = "it/dylib.rs"
 [[test]]
 name = "trace"
 path = "it/trace.rs"
+
+# M15：fail point net.drop.to/from.<节点> 与 net.delay（design.md 3.11 的首批：不用 iptables 模拟分区与慢网络；进程级：单独一个测试程序）。
+[[test]]
+name = "failpoint_net"
+path = "it/failpoint_net.rs"
+
+# M15：chaos（roadmap M15 的发布门槛：故障注入中客户端除重试外无错误、Jepsen-lite 线性一致）：对着跑着的 3 节点开发集群与一个挂载点，
+# kill -9、SIGSTOP、分区（net.drop.to.*）、时钟偏移（clock.*）轮流来（#[ignore]，由 scripts/accept.sh chaos 跑）。
+[[test]]
+name = "chaos"
+path = "it/chaos.rs"

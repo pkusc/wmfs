@@ -45,6 +45,7 @@ pub struct WriteJob {
     pub cap: CapV1,
     pub kind: JobKind,
     pub bulk: Option<Buf>,        // 写的数据（各 extent 依次拼接）
+    pub dedup: (u64, u64),        // (session, write_id)：重试去重（ADR-0046）
     pub reply: Option<Responder>, // 测试里直接调用时可以没有
 }
 
@@ -79,20 +80,36 @@ pub fn drain(node: &Arc<DataNode>, mut next: Option<Box<WriteJob>>) {
 /// 做一个写；返回 false = 已转发给后继（回复交给确认它的线程）。
 fn step(node: &Arc<DataNode>, job: Box<WriteJob>) -> bool {
     mark(&job, Stage::Queue); // 等这个 chunk 上前一个写的时间（慢日志的各阶段耗时，ADR-0045 第 9 条）
-    match head_view(node, &job) {
-        Err(e) => respond(job, Err(e)),
-        Ok(None) => {
+    let next = match head_view(node, &job) {
+        Ok(n) => n,
+        Err(e) => {
+            respond(job, Err(e));
+            return true;
+        }
+    };
+    if let Some(v) = node.dedup.get(job.chunk, job.dedup) {
+        respond(job, Ok(v)); // 重试命中去重表：这个写已经提交过，不再覆盖别人之后的写（ADR-0046）
+        return true;
+    }
+    match next {
+        None => {
             let r = run(node, &job);
+            if let Ok(v) = r {
+                node.dedup.record(job.chunk, job.dedup, v);
+            }
             mark(&job, Stage::Disk);
             respond(job, r);
         }
-        Ok(Some((s, ver))) => match prepare(node, &job) {
+        Some((s, ver)) => match prepare(node, &job) {
             Ok(Some(p)) => {
                 mark(&job, Stage::Disk);
                 forward::first_send(node, job, p, s, ver);
                 return false;
             }
-            Ok(None) => respond(job, Ok(0)), // 截断一个从未写过的 chunk
+            Ok(None) => {
+                node.dedup.record(job.chunk, job.dedup, 0);
+                respond(job, Ok(0)); // 截断一个从未写过的 chunk
+            }
             Err(e) => respond(job, Err(e)),
         },
     }

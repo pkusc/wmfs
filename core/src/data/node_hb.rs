@@ -172,9 +172,16 @@ fn beat(hb: &HbDeps, f: &mut Finder, poked: bool) -> Result<(), ErrCode> {
     let ep = f.pick(hb).ok_or(ErrCode::NOT_LEADER)?;
     let mut hint = None;
     let r = beat_to(hb, &ep, poked, &mut hint);
-    let scheme = &hb.rpc.net().control_scheme;
-    f.last = if r.is_ok() { Some(ep) } else { hint.map(|a| Endpoint { node: 0, addrs: vec![(scheme.clone(), a)] }) };
+    f.last = if r.is_ok() { Some(ep) } else { hint.map(|a| hinted(hb, a)) };
     r
+}
+
+/// leader_hint 指的地址（control_scheme 上的）是认识的节点里的哪一个：fail point `net.drop.to.<节点>` 按节点号丢（3.11），节点号 0 的
+/// 端点不受模拟的分区影响——不认出来的话，心跳会跟着 hint 穿过分区去续租。认不出（还不认识它）才用 0。
+fn hinted(hb: &HbDeps, addr: String) -> Endpoint {
+    let scheme = hb.rpc.net().control_scheme.clone();
+    let known = (hb.peers)().into_iter().find(|p| p.addrs.iter().any(|(s, a)| *s == scheme && *a == addr));
+    Endpoint { node: known.map_or(0, |p| p.node), addrs: vec![(scheme, addr)] }
 }
 
 /// 向 `ep` 发一次心跳；leader 的 map_epoch 更新（或被 poke 了）就拉新集群图。fail point `chain.map.delay`（实现注记（M10），sleep）：

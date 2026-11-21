@@ -57,6 +57,8 @@ serde_json.workspace = true
 # libc 只给测试取打开标志（O_SYNC、O_DIRECT）用，cli 本身经 core 接触系统接口（0.2 第 4 条）
 wmfs-testkit.workspace = true
 libc.workspace = true
+# M15：node.rs 的单元测试读 init 写下的元数据库，核对 NodeRecV1(1) 公布的地址
+redb.workspace = true
 
 [lints]
 workspace = true
@@ -71,4 +73,9 @@ path = "../tests/profiles/minimal.rs"
 [[test]]
 name = "profile_nas_safe"
 path = "../tests/profiles/nas_safe.rs"
+
+# M15：hpc-rdma profile（要 RDMA 设备；本机没有，用例开头就打印 SKIP 返回，scripts/profiles.sh hpc-rdma 直接显示 SKIP）
+[[test]]
+name = "profile_hpc_rdma"
+path = "../tests/profiles/hpc_rdma.rs"
 

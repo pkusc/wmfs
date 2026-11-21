@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Sender, bounded};
 use wmfs_api::metrics::{self, Counter, Gauge};
 use wmfs_api::types::KeyFile;
 
@@ -38,10 +38,13 @@ use crate::hooks::manifest::Hook;
 use crate::hooks::pipeline::HookCall;
 use crate::hooks::traits::Transport;
 use crate::net::conn::{self, ConnHandle};
-use crate::proto::frame::{FLAG_LAST_CHUNK, FrameKind, InFrame, OutFrame};
+use crate::proto::frame::{InFrame, OutFrame};
 use crate::proto::handshake::{ADMIN_KEY, SERVER_KEY};
 
+mod handle;
 mod link;
+
+pub use handle::{PendingCall, StreamRx};
 
 /// 消息族：按族选 scheme（3.3.3）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,6 +87,7 @@ impl Waiter {
 
 struct Pending {
     conn: u64,       // 走的哪条连接（连接断开时只结束它上面的调用）；0 = 还没发出去
+    node: u32,       // 发给哪个节点（fail point net.drop.from.<节点>）
     deadline: u64,   // mono_ms：到期由 rpc-timer 以 `fail` 结束
     timeout_ms: u64, // 流：相邻两帧之间的上限
     fail: ErrCode,   // 到期时的结果：一般是 ETIMEDOUT；"马上失败"的调用是它自己的错误码（deadline = 0）
@@ -104,6 +108,7 @@ pub struct RpcClient {
     next_req: AtomicU64,
     inflight_gauge: Arc<Gauge>,
     fallback: OnceLock<Arc<Counter>>, // wmfs_transport_fallback_total{from,to}：第一次退回时注册，之后不加锁
+    drop_names: Mutex<HashMap<u32, Arc<[String; 2]>>>, // fail point net.drop.to/from.<节点> 的名字：每个节点拼一次（link.rs）
 }
 
 /// init 的约定：key 0 = server（服务端之间）、key 1 = admin、其余 = client。
@@ -164,6 +169,7 @@ impl RpcClient {
             next_req: AtomicU64::new(1),
             inflight_gauge: metrics::gauge("wmfs_rpc_inflight", "客户端在途请求数", &[]),
             fallback: OnceLock::new(),
+            drop_names: Mutex::new(HashMap::new()),
         });
         let me = rpc.me.clone();
         std::thread::Builder::new()
@@ -228,6 +234,9 @@ impl RpcClient {
     /// OneWay 帧（RaftMsg，永远走 control_scheme）：取（必要时新建，最多等 `timeout`）到对端的连接，放进它的发送队列就返回。
     /// 没有回复，所以不进在途表；失败（建连失败、队列满……）原样返回，调用方丢掉这一帧（raft 会重发）。
     pub fn send_oneway(&self, to: &Endpoint, f: OutFrame, timeout: Duration) -> Result<(), ErrCode> {
+        if self.dropped_to(to.node) {
+            return Ok(()); // 丢在路上（raft 会重发）
+        }
         let deadline = clock::mono_ms() + timeout.as_millis() as u64 + 1; // +1：见文件头的实现注记 ④
         let (s, a) = self.route(to, Family::Control)?;
         self.connection(&s, &a, deadline)?.send(f)
@@ -243,9 +252,12 @@ impl RpcClient {
         let route = self.route(to, fam);
         let live = route.as_ref().ok().and_then(|(s, a)| self.live_conn(&(s.clone(), a.clone())));
         let conn = live.as_ref().map_or(0, |h| h.id());
-        self.track().insert(id, Pending { conn, deadline, timeout_ms, fail: ErrCode::ETIMEDOUT, w });
+        self.track().insert(id, Pending { conn, deadline, timeout_ms, fail: ErrCode::ETIMEDOUT, node: to.node, w });
         self.update_gauge();
         f.hdr.req_id = id;
+        if self.dropped_to(to.node) {
+            return; // 丢在路上：到期由 rpc-timer 以 ETIMEDOUT 结束
+        }
         match (route, live) {
             (Err(e), _) => self.fail_soon(id, e),
             (Ok(_), Some(h)) => {
@@ -358,34 +370,5 @@ impl Drop for RpcClient {
         for p in left.into_values() {
             p.w.finish(Err(ErrCode::ECONNRESET));
         }
-    }
-}
-
-pub struct PendingCall {
-    rx: Receiver<Result<InFrame, ErrCode>>,
-}
-
-impl PendingCall {
-    pub fn wait(self) -> Result<InFrame, ErrCode> {
-        self.rx.recv().unwrap_or(Err(ErrCode::ECONNRESET))
-    }
-}
-
-pub struct StreamRx {
-    rx: Receiver<Result<InFrame, ErrCode>>,
-    done: bool,
-}
-
-impl StreamRx {
-    /// None = 已收到 LAST_CHUNK。ERROR 帧 → 它的错误码；超时（相邻两帧之间）→ ETIMEDOUT；连接断开 → ECONNRESET。
-    #[allow(clippy::should_implement_trait)] // 名字按 design.md 3.12；它返回 Result，不是 Iterator
-    pub fn next(&mut self) -> Result<Option<InFrame>, ErrCode> {
-        if self.done {
-            return Ok(None);
-        }
-        let f = self.rx.recv().unwrap_or(Err(ErrCode::ECONNRESET)).and_then(check_reply);
-        let more = matches!(&f, Ok(f) if f.hdr.kind == FrameKind::StreamChunk && f.hdr.flags & FLAG_LAST_CHUNK == 0);
-        self.done = !more;
-        f.map(Some)
     }
 }

@@ -147,16 +147,6 @@ impl Service for DropIt {
         drop(r);
     }
 }
-/// 回三个 StreamChunk，最后一个带 LAST_CHUNK。
-struct Streamer;
-impl Service for Streamer {
-    fn call(&self, _f: InFrame, r: Responder) {
-        let mut tx = r.into_stream();
-        for i in 0..3u8 {
-            tx.send(vec![i], vec![], i == 2).unwrap();
-        }
-    }
-}
 
 #[test]
 fn start_call_cb_stream_timeout_and_dropped_responder() {

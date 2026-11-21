@@ -308,6 +308,7 @@ fn a_target_whose_commits_keep_failing_turns_read_only_and_leaves_the_write_path
         header: vec![],
         blocks: vec![],
         sync: false,
+        dedup: (0, 0),
     };
     let r = peer_call(&c, 3, &PeerOp::ForwardWrite(fw), vec![]);
     assert_eq!(r.err().map(|e| e.0), Some(ErrCode::NOT_SERVING), "只读的后继不收转发");

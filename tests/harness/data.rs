@@ -105,7 +105,7 @@ fn job(node: &DataNode, cs: u32, idx: u32, kind: JobKind, data: &[u8]) -> WriteJ
         b.as_mut_slice().copy_from_slice(data);
         b
     });
-    WriteJob { chunk: chunk(idx), target: 1, cap: cap(cs), kind, bulk, reply: None }
+    WriteJob { chunk: chunk(idx), target: 1, cap: cap(cs), kind, bulk, dedup: (0, 0), reply: None }
 }
 
 /// 写一些区间（`data` = 各段依次拼接）；返回新版本号。测试是单线程的，所以直接调用 `write::run`（调用方独占这个 chunk）。

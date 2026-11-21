@@ -47,6 +47,7 @@ pub struct ForwardWrite {
     pub header: Vec<u8>,             // 新版本的 256 字节固定头（含 header_crc，覆盖新块表）
     pub blocks: Vec<(u32, Vec<u8>)>, // 改动块的 (块号, 72 字节块表条目)；bulk = 这些块的存储字节按此顺序拼接
     pub sync: bool,                  // O_SYNC：每个成员提交前先 fdatasync
+    pub dedup: (u64, u64),           // (session, write_id)：随转发复制到每个成员，本地提交后记进去重表（ADR-0046）
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

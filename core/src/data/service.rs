@@ -279,15 +279,15 @@ fn exec(node: &Arc<DataNode>, call: DataCall, bulk: Option<Buf>, r: &Responder) 
             let (buf, n, version) = read::read(node, t, &chunk, off, len)?;
             Ok(Done::Reply(encode_body(&DataReply::Read { len: n, version }), (n > 0).then_some(buf)))
         }
-        DataOp::WriteChunk { chunk, chain_ver, extents, sync } => {
+        DataOp::WriteChunk { chunk, chain_ver, extents, sync, write_id } => {
             let total: u64 = extents.iter().map(|(_, l)| *l as u64).sum();
             if total != bulk.as_ref().map_or(0, |b| b.len() as u64) {
                 return Err(ErrCode::EINVAL.into());
             }
-            write_job(node, &map, cap, (chunk, chain_ver), JobKind::Write { extents, sync }, bulk, now)
+            write_job(node, &map, cap, (chunk, chain_ver), JobKind::Write { extents, sync }, bulk, write_id, now)
         }
-        DataOp::TruncateChunk { chunk, chain_ver, new_len } => {
-            write_job(node, &map, cap, (chunk, chain_ver), JobKind::Truncate { new_len }, None, now)
+        DataOp::TruncateChunk { chunk, chain_ver, new_len, write_id } => {
+            write_job(node, &map, cap, (chunk, chain_ver), JobKind::Truncate { new_len }, None, write_id, now)
         }
         DataOp::SyncChunks { chain, chain_ver, chunks } => {
             let (t, _) = member(node, &map, chain, chain_ver, true)?;
@@ -326,6 +326,7 @@ fn relay_or_reply(map: &ClusterMap, chain_id: u32, op: PeerOp, ok: Vec<u8>) -> D
 }
 
 /// 写类请求：本节点要是 head、cap 要有写权限、codec 说本成员存整块（replica），然后交给写队列。
+#[allow(clippy::too_many_arguments)]
 fn write_job(
     node: &DataNode,
     map: &ClusterMap,
@@ -333,6 +334,7 @@ fn write_job(
     (chunk, chain_ver): (ChunkId, u64),
     kind: JobKind,
     bulk: Option<Buf>,
+    write_id: u64,
     now: u64,
 ) -> Result<Done, Fail> {
     let target = member(node, map, chunk.chain, chain_ver, true)?.0.id;
@@ -342,7 +344,8 @@ fn write_job(
     if shards.first() != Some(&ShardSpec::Whole) {
         return Err(ErrCode::FEATURE_UNSUPPORTED.into()); // 首发只有多副本：每个成员存整块
     }
-    Ok(Done::Write(Box::new(WriteJob { chunk, target, cap, kind, bulk, reply: None })))
+    let dedup = (cap.session, write_id);
+    Ok(Done::Write(Box::new(WriteJob { chunk, target, cap, kind, bulk, dedup, reply: None })))
 }
 
 /// 本节点上这条链的成员与这条链的 last serving（3.4.2.3 第 1 步、3.4.2.5）：链版本与本地视图一致（`chain::current`）；`head` = 要

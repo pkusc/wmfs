@@ -224,8 +224,11 @@ fn golden_data() {
     );
     let ops = vec![
         ("ReadChunk", DataOp::ReadChunk { chunk: c, chain_ver: 5, off: 65536, len: 4096 }),
-        ("WriteChunk", DataOp::WriteChunk { chunk: c, chain_ver: 5, extents: vec![(0, 100), (200, 50)], sync: true }),
-        ("TruncateChunk", DataOp::TruncateChunk { chunk: c, chain_ver: 5, new_len: 6 }),
+        (
+            "WriteChunk",
+            DataOp::WriteChunk { chunk: c, chain_ver: 5, extents: vec![(0, 100), (200, 50)], sync: true, write_id: 42 },
+        ),
+        ("TruncateChunk", DataOp::TruncateChunk { chunk: c, chain_ver: 5, new_len: 6, write_id: 43 }),
         ("SyncChunks", DataOp::SyncChunks { chain: 7, chain_ver: 5, chunks: vec![c] }),
         ("DeleteEpoch", DataOp::DeleteEpoch { chain: 7, chain_ver: 5, ino: 18, epoch: 2 }),
     ];
@@ -281,6 +284,7 @@ fn golden_peer_and_node() {
         header: vec![0xAB; 256],
         blocks: vec![(0, vec![0xCD; 72])],
         sync: true,
+        dedup: (0x5E55, 42), // ADR-0046：数据写去重号，金样随之更新
     };
     let ops = vec![
         ("ForwardWrite", PeerOp::ForwardWrite(fw)),

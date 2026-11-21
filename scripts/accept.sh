@@ -4,9 +4,15 @@
 # 用法：
 #   scripts/accept.sh M0     跑 M0 的全部检查
 #   scripts/accept.sh all    依次重跑全部已完成的里程碑（回归：scripts/accept.d/ 里有哪些就跑哪些）
+#   scripts/accept.sh profile-minimal | profile-nas-safe | profile-hpc-rdma | chaos | release
+#                            M15 的发布门槛（函数在 scripts/accept.d/m15.sh，那里写着各自跑什么、大约多久）：三个 profile 的全套、
+#                            chaos（kill -9、SIGSTOP、分区、网络延迟、时钟偏移 + Jepsen-lite）、release = 以上全部 + clippy + 全部单元测试 +
+#                            文档齐全检查 + 行数。最后一行是 "<名字> PASS" / "<名字> FAIL（…）"；全部检查都是 SKIP 时（本机没有 RDMA 设备的
+#                            profile-hpc-rdma）是 "<名字> SKIP（未在本机验证…）"，退出码 0；有 SKIP 的 PASS 在同一行写明 SKIP 了几条。
 #
 # 输出：每条检查一行 "✓ 说明" / "✗ 说明" / "SKIP 说明（原因：…）"；SKIP 不算通过，也不算失败。
-#       最后一行是 "Mx PASS" 或 "Mx FAIL（第 n 条失败，请看 <日志路径>）"；all 模式最后再加一行 "all PASS/FAIL"。
+#       最后一行是 "Mx PASS"（有 SKIP 时同一行写明 SKIP 了几条）或 "Mx FAIL（第 n 条失败，请看 <日志路径>）"；all 模式最后再加
+#       一行 "all PASS/FAIL"。里程碑与发布门槛的入口共用 run_entry（日志目录、子 shell、最后一行）。
 # 规则：
 #   - 只解析命令的 --json 输出（用 jq），不解析给人看的文字；
 #   - 需要等待的地方一律用 `wmfs dev wait <条件>`（M3 起才有），不用固定的 sleep；
@@ -57,8 +63,16 @@ check() {
         return 0
     fi
     echo "✗ $desc"
+    keep_mount_logs
     echo "$CUR FAIL（第 $N 条失败，请看 $log）"
     exit 1
+}
+
+# 失败时把开发挂载的 mount.log 拷进 $LOGDIR/mount-logs：它们在 wmfs dev umount / dev down 时随挂载的记录目录一起删（cli/src/dev/mount.rs），
+# 而退出时的清理（各里程碑的 trap）会 dev down。
+keep_mount_logs() {
+    [ -n "${WMFS_DEV_DIR:-}" ] && [ -d "$WMFS_DEV_DIR/mounts" ] || return 0
+    mkdir -p "$LOGDIR/mount-logs" && (cd "$WMFS_DEV_DIR/mounts" && find . -name '*.log' -exec cp --parents {} "$LOGDIR/mount-logs/" \;)
 }
 
 # check_json "说明" 'jq 表达式' 命令…
@@ -88,6 +102,7 @@ json_expect() {
 skip() {
     N=$((N + 1))
     echo "SKIP $1（原因：$2）"
+    echo "$1" >>"$LOGDIR/skipped" # 最后一行写明 SKIP 了几条（run_entry）
 }
 
 # cargo build；cargo 与 rustc 的警告都打印在 stderr 上，有一行以 warning 开头就算失败。
@@ -180,37 +195,60 @@ poll() {
     return 1
 }
 
-# 跑一个里程碑（在子 shell 里，失败时 check 用 exit 结束它）。
-run_one() {
-    local m="$1"
-    local n="${m#M}"
-    local f="$ROOT/scripts/accept.d/m$n.sh"
+# run_entry <名字> <脚本> <函数>：加载脚本、在子 shell 里跑函数（失败时 check 用 exit 结束它），每条检查的日志在本次的日志目录里。
+# 最后一行：PASS（有 SKIP 时写明 SKIP 了几条：skip() 与 m15.sh 记进 $LOGDIR/skipped 的）；函数以 3 退出 = 全部检查都是 SKIP
+# （本机没有 RDMA 设备的 profile-hpc-rdma）→ "<名字> SKIP（…）"，退出码 0；失败时 check 已经打印了 FAIL 行。通过时删掉日志目录。
+run_entry() {
+    local name="$1" f="$2" fn="$3" rc skipped=0
     if [ ! -f "$f" ]; then
-        echo "没有 $m 的验收脚本：$f"
+        echo "没有 $name 的验收脚本：$f"
         return 2
     fi
     # shellcheck source=/dev/null
     source "$f"
     # 目录名带随机后缀：同一秒启动的两次验收（几个 agent 同时跑）不会共用、互删日志目录
     mkdir -p "$HOME/wmfs-dev/accept" || return 2
-    LOGDIR="$(mktemp -d "$HOME/wmfs-dev/accept/$m-$(date +%Y%m%d-%H%M%S)-XXXX")" || return 2
-    echo "== $m 验收（每条检查的日志在 $LOGDIR/）=="
+    LOGDIR="$(mktemp -d "$HOME/wmfs-dev/accept/$name-$(date +%Y%m%d-%H%M%S)-XXXX")" || return 2
+    echo "== $name（每条检查的日志在 $LOGDIR/）=="
     (
         N=0
-        CUR="$m"
+        CUR="$name"
         cd "$ROOT" || exit 1
-        "accept_m$n"
+        "$fn"
     )
-    local rc=$?
+    rc=$?
+    [ -f "$LOGDIR/skipped" ] && skipped="$(wc -l <"$LOGDIR/skipped")"
+    if [ "$rc" -eq 3 ]; then
+        echo "$name SKIP（未在本机验证：不算通过，也不算失败）"
+        rc=0
+    elif [ "$rc" -eq 0 ] && [ "$skipped" -gt 0 ]; then
+        echo "$name PASS（另有 $skipped 条 SKIP：未在本机验证，不算通过也不算失败）"
+    elif [ "$rc" -eq 0 ]; then
+        echo "$name PASS"
+    fi
     if [ "$rc" -eq 0 ]; then
-        echo "$m PASS"
         rm -rf "$LOGDIR"
         rmdir "$HOME/wmfs-dev/accept" "$HOME/wmfs-dev" 2>/dev/null || true
     fi
     return "$rc"
 }
 
+# 跑一个里程碑 Mn（scripts/accept.d/mn.sh 的 accept_mn）。
+run_one() {
+    local n="${1#M}"
+    run_entry "$1" "$ROOT/scripts/accept.d/m$n.sh" "accept_m$n"
+}
+
+# 发布门槛的入口（M15）：profile-minimal | profile-nas-safe | profile-hpc-rdma | chaos | release（函数 accept_<名字> 在 m15.sh）。
+run_named() {
+    run_entry "$1" "$ROOT/scripts/accept.d/m15.sh" "accept_${1//-/_}"
+}
+
 case "${1:-}" in
+    profile-minimal | profile-nas-safe | profile-hpc-rdma | chaos | release)
+        run_named "$1"
+        exit $?
+        ;;
     all)
         milestones=$(find "$ROOT/scripts/accept.d" -name 'm*.sh' | sed -E 's|.*/m([0-9]+)\.sh$|\1|' | sort -n)
         for n in $milestones; do
@@ -226,7 +264,7 @@ case "${1:-}" in
         exit $?
         ;;
     *)
-        echo "用法：scripts/accept.sh M0 | M1 | … | all"
+        echo "用法：scripts/accept.sh M0 | M1 | … | M15 | all | profile-minimal | profile-nas-safe | profile-hpc-rdma | chaos | release"
         exit 2
         ;;
 esac

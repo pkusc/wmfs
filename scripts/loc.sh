@@ -3,6 +3,8 @@
 #
 # 用法：scripts/loc.sh [Mx] [--json]
 #   Mx 省略时取 scripts/accept.d/ 里编号最大的里程碑（也就是当前做到的里程碑）；--json 输出机器可读的结果。
+#   发布门槛"scripts/loc.sh 在预算内"（roadmap M15）按人类 2026-11-05 定的上限判：非测试代码合计 ≤ 38,000 行（ADR-0041 第 2 条），
+#   不按 roadmap §1 的累计预算——JSON 的 `within_limit`（scripts/accept.sh release 用它），文字输出的最后一行也写明。
 #
 # 计数规则（简单、可复现）：
 #   - 只数 .rs 文件；不数 target/、测试 crate tests/（wmfs-testkit）、各 crate 的 tests/ 目录、名为 tests.rs 的文件；
@@ -142,9 +144,19 @@ LIMIT=38000
 # 最小版约 75（wmfs-api、core/mgmt、cli），changelog 至少留 1 万条约 6。超出的九个都已写完，按实际上调：wmfs-api 1265 → 1271、core/obs 117 → 163、
 # core/net 1298 → 1331、core/meta/engine 830 → 850、core/meta/ns 2080 → 2083、core/meta 3120 → 3124、core/data 3170 → 3219、core/mgmt 1508 → 1533、
 # dashboard 1365 → 1391。Σ max ≈ 37,727（超过上报线 37,000，没有超过上限 38,000）。
-MODULES="wmfs-api:1271 core/base:865 core/obs:163 core/proto:900 core/buf:420 core/net:1331 core/hooks:1193
+# M15（design.md 2.2 的 M15 注记）：连同审查修复净增约 100 行（共约 37,348）：fail point net.drop.to/from.<节点> 与 net.delay（core/net 约 +48：
+# 按节点存名字、不累加的 net.delay、PendingCall/StreamRx 拆到 client/handle.rs；wmfs-api 的 failpoint::active 约 +1）、--profile hpc-rdma
+# （core 约 +18：数据族另走的传输写进 node.toml 与 NodeRecV1.addrs，target 的部分拆到 init/targets.rs；cli 约 +1）、target 心跳认出 hint 的节点号
+# （core/data 约 +4）。超出的三个都已写完，按实际上调：core/net 1350 → 1379、core/data 3219 → 3223、core 935 → 953。Σ max ≈ 37,803；发布门槛按
+# 合计 ≤ 38,000 判。
+# M15 验收修复（design.md 2.2 的注记）：再新增约 40 行（共约 37,388）：MetaClient 换节点（core/client 约 +28：client/meta_client/peers.rs 与
+# call_once）、PendingCall::wait_timeout 与 net.delay 多睡 1 ms（core/net 约 +8）。按实际上调：core/net 1379 → 1387、core/client 2490 → 2518。
+# Σ max ≈ 37,839。
+# M15 收尾（ADR-0046，design.md 2.2 的注记）：数据写重试去重再新增约 97 行（最终合计 37,485 行 ≤ 上限 38,000）：core/data 约 +92（dedup.rs 与沿链登记）、
+# core/proto 约 +3、core/client 约 +2。按实际上调：core/data 3223 → 3315、core/client 2518 → 2522。最终 Σ max = 37,935 ≤ 38,000，零模块超出。
+MODULES="wmfs-api:1277 core/base:865 core/obs:163 core/proto:900 core/buf:420 core/net:1387 core/hooks:1193
 core/meta/raft:1780 core/meta/engine:850 core/meta/schema:620 core/meta/ns:2083 core/meta:3124 core/meta/cluster:1612
-core/data:3219 core/client:2490 core/bg:1212 core/mgmt:1533 core:935 plugins:4980 cli:5560 dashboard:1391
+core/data:3315 core/client:2522 core/bg:1212 core/mgmt:1533 core:953 plugins:4980 cli:5560 dashboard:1391
 examples/plugin-mem-transport:195"
 
 # 文件路径 → 模块名；测试文件返回空。
@@ -219,6 +231,7 @@ if [ "$JSON" -eq 1 ]; then
          | {name: .[0], lines: (.[1] | tonumber), estimate: (.[2] | tonumber), note: .[3]}] as $mods
         | {milestone: $m, budget: $budget, total: $total, over_budget: $over_budget,
            estimate_total: $est_total, projected: $projected, limit: $limit,
+           within_limit: ($total <= $limit),
            over_estimate_modules: [$mods[] | select(.note == "超出") | .name],
            near_estimate_modules: [$mods[] | select(.note == "≥90%") | .name],
            modules: [$mods[] | del(.note)]}'
@@ -242,6 +255,11 @@ if [ "$budget" -gt 0 ]; then
 fi
 echo "说明列：超出 = 当前行数已超过估算；≥90% = 已达估算的 90%（后续还要往里加代码就上调估算）"
 echo "按模块重估的首发总量 Σ max(当前, 估算) = $projected 行（上限 $LIMIT）"
+if [ "$total" -le "$LIMIT" ]; then
+    echo "发布门槛：非测试代码合计 $total 行 ≤ 上限 $LIMIT 行，在预算内"
+else
+    echo "发布门槛：非测试代码合计 $total 行 > 上限 $LIMIT 行，超出预算"
+fi
 if [ "$projected" -gt "$LIMIT" ]; then
     echo "注意：预计超过 $LIMIT 行，请先按 roadmap §4 简化储备删减；删完仍超就停下来和人类商量"
 fi

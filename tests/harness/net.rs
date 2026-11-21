@@ -24,9 +24,9 @@ use wmfs_core::hooks::registry::PluginSet;
 use wmfs_core::hooks::traits::{Conn, Transport};
 use wmfs_core::init::InitKeys;
 use wmfs_core::net::client::{Endpoint, RpcClient};
-use wmfs_core::net::server::{RpcServer, ServerId};
+use wmfs_core::net::server::{Responder, RpcServer, ServerId, Service};
 use wmfs_core::proto::frame::{
-    ErrorBody, FLAG_ERROR, FrameHeader, FrameKind, HEADER_LEN, MSG_AUTH, MSG_CHALLENGE, MSG_HELLO, MSG_PING,
+    ErrorBody, FLAG_ERROR, FrameHeader, FrameKind, HEADER_LEN, InFrame, MSG_AUTH, MSG_CHALLENGE, MSG_HELLO, MSG_PING,
     MSG_WELCOME, OutFrame,
 };
 use wmfs_core::proto::handshake::{
@@ -139,6 +139,18 @@ impl Transport for Counting {
         self.dials.fetch_add(1, Ordering::SeqCst);
         std::thread::sleep(self.connect_delay);
         self.inner.connect(addr, pool, timeout)
+    }
+}
+
+/// 回三个 StreamChunk（body 依次是 0、1、2），最后一个带 LAST_CHUNK（net_rpc.rs 与 failpoint_net.rs 的流用例共用）。
+pub struct Streamer;
+
+impl Service for Streamer {
+    fn call(&self, _f: InFrame, r: Responder) {
+        let mut tx = r.into_stream();
+        for i in 0..3u8 {
+            tx.send(vec![i], vec![], i == 2).unwrap();
+        }
     }
 }
 

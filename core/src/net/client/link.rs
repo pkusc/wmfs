@@ -5,6 +5,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
 use crossbeam_channel::{Sender, bounded};
+use wmfs_api::failpoint;
 
 use super::{RpcClient, Waiter};
 use crate::base::{ErrCode, clock, log};
@@ -140,6 +141,13 @@ impl RpcClient {
     /// （可重试）：缺数据的回复不能当成功（3.6.4 实现注记）。
     fn deliver(&self, f: InFrame) {
         let (id, kind, last) = (f.hdr.req_id, f.hdr.kind, f.hdr.flags & FLAG_LAST_CHUNK != 0);
+        let node = if failpoint::active() { self.track().get(&id).map(|p| p.node) } else { None };
+        if node.is_some_and(|n| self.dropped_from(n)) {
+            if kind == FrameKind::StreamChunk {
+                self.stream_chunk(id, Err(ErrCode::ETIMEDOUT), true); // 流不能中间缺一帧：当作链路卡住、这个流超时
+            }
+            return; // 回复丢在路上：调用到期由 rpc-timer 以 ETIMEDOUT 结束
+        }
         let r = if f.bulk_dropped { Err(ErrCode::BUSY) } else { Ok(f) };
         match kind {
             FrameKind::Response => {
@@ -184,6 +192,32 @@ impl RpcClient {
         for p in self.take_pending(|p| p.conn == conn_id) {
             p.w.finish(Err(ErrCode::ECONNRESET));
         }
+    }
+}
+
+impl RpcClient {
+    /// fail point `net.drop.to.<节点>`（3.11）：不用 iptables 就能模拟网络分区——发往节点 N 的请求与 OneWay 帧当作丢在了路上（调用到期以
+    /// `ETIMEDOUT` 结束）。节点号 0 的端点（手写的种子地址、跟随 leader_hint 时还不知道是谁）不受影响。
+    pub(super) fn dropped_to(&self, node: u32) -> bool {
+        self.dropped(node, 0)
+    }
+
+    /// fail point `net.drop.from.<节点>`：从节点 N 收到的回复当作丢在了路上。
+    pub(super) fn dropped_from(&self, node: u32) -> bool {
+        self.dropped(node, 1)
+    }
+
+    /// 没有配置任何 fail point 时只多一次原子读；配置了时名字按节点拼一次存起来（3.11：热路径上不每次 `format!`）。`way`：0 = to、1 = from。
+    fn dropped(&self, node: u32, way: usize) -> bool {
+        if !failpoint::active() {
+            return false;
+        }
+        let names = {
+            let mut m = self.drop_names.lock().unwrap_or_else(|e| e.into_inner());
+            let new = || Arc::new([format!("net.drop.to.{node}"), format!("net.drop.from.{node}")]);
+            m.entry(node).or_insert_with(new).clone()
+        };
+        failpoint::fail_point_hit(&names[way])
     }
 }
 

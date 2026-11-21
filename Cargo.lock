@@ -1741,6 +1741,7 @@ dependencies = [
  "fuser",
  "libc",
  "plugin-mem-transport",
+ "redb",
  "serde",
  "serde_json",
  "wmfs-core",

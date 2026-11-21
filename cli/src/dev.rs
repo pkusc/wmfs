@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use wmfs_core::api::types::{Health, KeyFile};
 use wmfs_core::base::config::NodeConfig;
 use wmfs_core::base::sys;
-use wmfs_core::init::{NodeFile, Profile};
+use wmfs_core::init::NodeFile;
 use wmfs_mgr::api::ApiClient;
 
 use crate::{fail, home, out};
@@ -60,7 +60,8 @@ pub enum DevCmd {
         #[arg(long, value_name = "IP")]
         rdma: Option<Ipv4Addr>,
         /// 按某个 profile 的部署模板建新节点（design.md 9.7、3.4.3）：default、minimal（1 节点、TCP、default 类 1 副本、停用 quota 与
-        /// mclock）或 nas-safe（阶段版：/home replicas=3）。已有的开发集群是按别的 profile 建的 → 报错（先 wmfs dev down --purge）
+        /// mclock）、nas-safe（/home replicas=3,trash=7d,audit=on，集群起好之后起一个 mgr）或 hpc-rdma（要同时给 --rdma）。
+        /// 已有的开发集群是按别的 profile 建的 → 报错（先 wmfs dev down --purge）
         #[arg(long, default_value = "default")]
         profile: String,
     },
@@ -151,7 +152,7 @@ pub fn run(cmd: DevCmd, dir: Option<PathBuf>) -> i32 {
     }
     let d = std::fs::canonicalize(&d).unwrap_or(d);
     let r = match cmd {
-        DevCmd::Up { nodes, rdma, profile } => Profile::parse(&profile).and_then(|p| up::up(&d, nodes, rdma, p)),
+        DevCmd::Up { nodes, rdma, profile } => up_profile(&d, nodes, rdma, &profile),
         DevCmd::Down { purge } => down(&d, purge),
         DevCmd::Env => info::env(&d),
         DevCmd::Status { json } => info::status(&d, json),
@@ -326,6 +327,16 @@ fn down(d: &Path, purge: bool) -> Result<Vec<String>, String> {
         lines.push("没有在运行的开发节点".into());
     }
     Ok(lines)
+}
+
+/// `dev up --profile P`（M15）：hpc-rdma 按 default 建（`node::parse_profile`），文件数据走 RDMA，所以必须同时给 `--rdma`——新节点在 init /
+/// join 时就公布 rdma 地址；不给的话 up 每次按参数改写 node.toml（`dev/rdma.rs`），会把 rdma 改回只用 tcp。
+fn up_profile(d: &Path, nodes: u32, rdma: Option<Ipv4Addr>, profile: &str) -> Result<Vec<String>, String> {
+    let (p, hpc_rdma) = crate::node::parse_profile(profile)?;
+    if hpc_rdma && rdma.is_none() {
+        return Err("--profile hpc-rdma 的数据走 RDMA：要同时给 --rdma <RoCE 网口的 IPv4>".into());
+    }
+    up::up(d, nodes, rdma, p)
 }
 
 #[cfg(test)]

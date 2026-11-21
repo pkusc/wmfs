@@ -75,7 +75,7 @@ m14_cleanup() {
 }
 
 m14_ports_free() {
-    dev_ports_free M14 3 || return 1
+    dev_ports_free "${CUR:-M14}" 3 || return 1 # 提示里写调用它的入口（M15、chaos、release……也用它）
     if (exec 3<>/dev/tcp/127.0.0.1/19090) 2>/dev/null; then
         echo "127.0.0.1:19090（wmfs dev mgr）已被占用：先 wmfs dev down"
         return 1

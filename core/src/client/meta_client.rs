@@ -15,6 +15,8 @@
 //!   集群图里的节点）。实现注记（M4）：core 里没有 HTTP 客户端，"按 health 找 leader"由调用方（CLI）在 `connect` 之前做，
 //!   给出种子；之后没有 hint 时在认识的节点之间轮换（不是 leader 的节点回 `NOT_LEADER`，换下一个）。实现注记（M9 审查）：`ETIMEDOUT`
 //!   也换下一个——被冻住（SIGSTOP）的 leader 既不回复也不断开，以前要等它恢复或连接保活断开才换，客户端停顿远超"leader 切换 1–3 s"。
+//!   实现注记（M15）：只在失败的节点还是当前选中的节点时才换、跳过与它同址的项（`peers.rs`）——同时超时的几个调用以前各换一次，会一起
+//!   换回那个冻住的节点、循环到总期限；换走之后，还在等那个节点回复的别的调用也不再等满各自的 10 s（`call_once`）。
 //! - **重试**（3.3.8）：可重试的错误（1000–1007、1019、`ECONNRESET`、`ETIMEDOUT`）按指数退避重试，10 ms 起、×2、上限 1 s，
 //!   直到总期限（[`MetaClientOpts::op_timeout`]：CLI 30 s，挂载参数 `--op-timeout` 默认 120 s）。每次重试写一行 INFO 日志
 //!   （`wmfs fs --verbose` 能看到）。超时之后的重试成功时，回复里的 ctime 早于重试的时刻 = 第一次其实已经执行、这是去重表
@@ -35,7 +37,9 @@ use crate::proto::meta::{MetaCall, MetaOp, MetaReply, ReqHead};
 use crate::proto::peer::{ClusterMap, NodeOp, NodeReply};
 use crate::proto::{decode_body, encode_body};
 
+mod peers;
 mod window;
+use peers::Peers;
 use window::Window;
 
 /// 连续跟随 `leader_hint` 的次数上限（之后照常退避，防止两个节点互相指来指去）。
@@ -69,13 +73,6 @@ impl Default for MetaClientOpts {
     fn default() -> MetaClientOpts {
         MetaClientOpts { rpc_timeout: Duration::from_secs(10), op_timeout: Duration::from_secs(120) }
     }
-}
-
-/// 认识的节点：当前认为的 leader、种子与集群图里的节点（轮流试）。
-struct Peers {
-    leader: Endpoint,
-    known: Vec<Endpoint>,
-    next: usize,
 }
 
 pub struct MetaClient {
@@ -134,7 +131,7 @@ impl MetaClient {
         let (uid, gid) = sys::euid_egid();
         Ok(MetaClient {
             rpc,
-            peers: Mutex::new(Peers { leader: first, known: seeds.to_vec(), next: 0 }),
+            peers: Mutex::new(Peers { leader: first, known: seeds.to_vec(), next: 0, left: None }),
             session: AtomicU64::new(new_session_id()),
             window: Window::new(),
             map: Mutex::new(Arc::new(ClusterMap::default())),
@@ -288,14 +285,17 @@ impl MetaClient {
         let (mut backoff, mut hops, mut attempt) = (BACKOFF_START_MS, 0, 0);
         let mut timed_out = false;
         loop {
-            let ep = lock(&self.peers).leader.clone();
+            let (ep, picked) = {
+                let p = lock(&self.peers);
+                (p.leader.clone(), clock::mono_ms()) // 选中它的时刻：在同一把锁里取，换节点的时刻不会早于它（`call_once`）
+            };
             let hdr = FrameHeader::new(FrameKind::Request, msg_type, 0, trace_id);
             let f = OutFrame { hdr, body: body.clone(), bulk: vec![], recv_into: None };
             let sent = clock::wall_ms();
             let have = if need == 0 { Ok(0) } else { self.rpc.features(&ep, Family::Control, self.opts.rpc_timeout) };
             let r = match have {
                 Ok(h) if h & need != need => return Err(ErrCode::EOPNOTSUPP), // 对端没在握手里声明：不发（见上）
-                Ok(_) => self.rpc.call(&ep, Family::Control, f, self.opts.rpc_timeout),
+                Ok(_) => self.call_once(&ep, picked, f),
                 Err(e) => Err(e), // 建连失败等：照常按下面的规则重试
             };
             let (code, hint) = match r {
@@ -326,7 +326,7 @@ impl MetaClient {
                 log::info("meta-client", format_args!("{what}：{code}，退避重试（第 {attempt} 次，{backoff} ms 后）"));
             }
             if matches!(code, ErrCode::NOT_LEADER | ErrCode::ECONNRESET | ErrCode::ETIMEDOUT) {
-                self.rotate(); // 没有 hint、连不上或卡住（例如被冻住的 leader）：换下一个认识的节点试试
+                lock(&self.peers).rotate_from(&ep, clock::mono_ms()); // 没有 hint、连不上或卡住（例如被冻住的 leader）：换下一个认识的节点
             }
             std::thread::sleep(Duration::from_millis(backoff));
             backoff = (backoff * 2).min(BACKOFF_MAX_MS);
@@ -334,11 +334,19 @@ impl MetaClient {
         }
     }
 
-    fn rotate(&self) {
-        let mut p = lock(&self.peers);
-        if !p.known.is_empty() {
-            p.next = (p.next + 1) % p.known.len();
-            p.leader = p.known[p.next].clone();
+    /// 发一次、等回复（最多 `rpc_timeout`）。`picked`（mono_ms）之后别的调用已经因为 `ep` 没回复、连不上而把它换走了（`peers.rs` 的
+    /// `gave_up_on`），就不再等，按 `ETIMEDOUT` 交给调用方马上到新选中的节点重试（实现注记（M15），`peers.rs` 的文件头）。
+    fn call_once(&self, ep: &Endpoint, picked: u64, f: OutFrame) -> Result<InFrame, ErrCode> {
+        let call = self.rpc.start(ep, Family::Control, f, self.opts.rpc_timeout)?;
+        loop {
+            if let Some(r) = call.wait_timeout(Duration::from_millis(100)) {
+                return r;
+            }
+            if lock(&self.peers).gave_up_on(ep, picked) {
+                let addr = ep.addrs.first().map_or("?", |(_, a)| a.as_str());
+                log::info("meta-client", format_args!("别的请求已经因为 {addr} 没有回复换了节点：这个请求也不再等它"));
+                return Err(ErrCode::ETIMEDOUT);
+            }
         }
     }
 }

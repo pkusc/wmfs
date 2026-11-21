@@ -30,13 +30,13 @@ fn job(idx: u32) -> Box<WriteJob> {
         expires_ms: 0,
     };
     let kind = JobKind::Truncate { new_len: idx };
-    Box::new(WriteJob { chunk: chunk(idx % 2), target: 1, cap, kind, bulk: None, reply: None })
+    Box::new(WriteJob { chunk: chunk(idx % 2), target: 1, cap, kind, bulk: None, dedup: (0, 0), reply: None })
 }
 
 fn pending(version: u64) -> PendingWrite {
     let (successor, chain_ver, last_sent) = (Some(2), 1, 0);
-    let (sync, clean, committed) = (false, true, false);
-    PendingWrite { version, target: 1, upstream: None, successor, chain_ver, last_sent, sync, clean, committed }
+    let (sync, clean, committed, dedup) = (false, true, false, (0, 0));
+    PendingWrite { version, target: 1, upstream: None, successor, chain_ver, last_sent, sync, clean, committed, dedup }
 }
 
 #[test]

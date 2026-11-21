@@ -1,15 +1,23 @@
-//! nas-safe profile（design.md 9.7：M9–M11 的阶段版 = 3 节点、replicas=3，只设置已经有消费者的属性；M12 起 `/home` 加上
-//! `trash=7d`、`audit=on`；M14 起是完整版：`wmfs dev up --profile nas-safe` 在集群起好之后起一个 mgr，审计日志由它的 audit-log 写）：
-//! 按 `wmfs dev up --nodes 3 --profile nas-safe` 起 3 个节点（`/home replicas=3,trash=7d,audit=on`），`wmfs dev mount` 挂上一个客户端，
-//! 然后跑 9.5 里这个阶段已有的检查器（M12：另有回收站恢复——删掉的文件在 `.wmfs-trash/<uid>/` 里、mv 回来内容不变——与审计标记）：
+//! nas-safe profile（design.md 9.7；M15 定稿）：`wmfs dev up --nodes 3 --profile nas-safe` 起 3 个节点（`/home replicas=3,trash=7d,
+//! audit=on`），集群起好之后自动起一个 mgr（审计日志由它的 audit-log 写），`wmfs dev mount` 挂上两个客户端，然后跑 9.7 表里 nas-safe 的
+//! 必过测试：
 //! - ⑥ 单点故障无错误：写入中**依次** `kill -9` 每个节点（含元数据 leader），客户端一个错误也没有（只是等一会儿）；节点回来之后
 //!   `wmfs dev wait chains-serving`（先 Syncing、后 Serving）；
 //! - ① 已确认写不丢：每个文件写完都 fsync，全部 kill 做完之后逐一读回校验（经挂载点，并另用 `wmfs fs get` 绕过页缓存）；
-//! - ⑦ Jepsen-lite（寄存器）在 `tests/it/jepsen_register.rs`，`scripts/profiles.sh nas-safe` 一起跑；
-//! - M14：审计日志在 mgr 重启后仍完整——mgr 被 kill -9、停着的时候写的文件，重启之后补进审计日志；按 seq 去重之后每个文件的 Create
-//!   恰好一条（至少一次投递：同一条可能写了两遍，seq 相同）。
+//! - 回收站恢复：删掉的文件在 `.wmfs-trash/<属主 uid>/` 里，mv 回来内容不变；审计日志里有它的 Unlink（带 trash）；
+//! - ②–⑤（`common.rs`，经两个挂载点）：rename 原子性、strong 追加、锁互斥（F_SETLKW 下各加 1000 次，计数器恰好 2000）、配额（多写者
+//!   并发时用量不超过 hard + quantum × 写者数）；
+//! - scrub 发现注入的损坏并修复：`wmfs debug corrupt-chunk` 坏掉一个副本的一块，`wmfs task run scrub` 之后 changelog 有
+//!   `ChecksumRepaired`、内容不变；
+//! - 审计日志在 mgr 重启后仍完整：mgr 被 kill -9、停着的时候写的文件，重启之后补进审计日志；按 seq 去重之后每个文件的 Create 恰好一条
+//!   （至少一次投递：同一条可能写了两遍，seq 相同）；
+//! - ⑦ Jepsen-lite 在 `tests/it/jepsen_register.rs`，`scripts/profiles.sh nas-safe` 一起跑（单个 chunk 的寄存器；`--full` 另跑经两个挂载点的
+//!   strong 文件寄存器，并在容器里跑 fio、fsx 10 万次、fsstress、IOR/mdtest）。
 //!
 //! 用开发集群的固定端口，所以是 `#[ignore]`：只由 `scripts/profiles.sh nas-safe` 跑。
+
+#[allow(dead_code)] // 与 minimal.rs、hpc_rdma.rs 共用：每个 profile 只用其中一部分
+mod common;
 
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -19,30 +27,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use common::Cluster;
+
 fn wmfs(dir: &Path, args: &[&str]) -> String {
-    let o = Command::new(env!("CARGO_BIN_EXE_wmfs"))
-        .args(args)
-        .env("WMFS_DEV_DIR", dir)
-        .env("WMFS_CLUSTER", "127.0.0.1:19180,127.0.0.1:19280,127.0.0.1:19380")
-        .env("WMFS_KEY_FILE", dir.join("n1/keys/admin.key"))
-        .env("no_proxy", "127.0.0.1,localhost")
-        .output()
-        .unwrap();
-    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-    assert!(o.status.success(), "wmfs {args:?} 失败：{text}");
-    text
-}
-
-/// 无论成败，结束时停掉这个开发集群（先卸载挂载点）并删掉目录。
-struct Cluster(PathBuf);
-
-impl Drop for Cluster {
-    fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_wmfs"))
-            .args(["dev", "down", "--purge"])
-            .env("WMFS_DEV_DIR", &self.0)
-            .status();
-    }
+    common::wmfs(dir, 3, args)
 }
 
 fn content(i: usize) -> Vec<u8> {
@@ -51,7 +39,7 @@ fn content(i: usize) -> Vec<u8> {
 
 #[test]
 #[ignore = "用开发集群的固定端口：由 scripts/profiles.sh nas-safe 跑"]
-fn nas_safe_staged_profile() {
+fn nas_safe_profile() {
     let dir = std::env::var_os("WMFS_PROFILE_DIR") // scripts/profiles.sh 给的目录（超时被杀时它来兜底清理）
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("wmfs-profile-nas-safe-{}", std::process::id())));
@@ -61,7 +49,7 @@ fn nas_safe_staged_profile() {
     assert!(get.contains("replicas=3") && get.contains("/home"), "nas-safe：/home replicas=3：{get}");
     for (k, v) in [("trash", "trash=7d"), ("audit", "audit=on")] {
         let got = wmfs(&dir, &["get", "/home", k]);
-        assert!(got.contains(v), "nas-safe 阶段版（M12）：/home {v}：{got}");
+        assert!(got.contains(v), "nas-safe：/home {v}：{got}");
     }
     let mp = dir.join("mnt");
     std::fs::create_dir_all(&mp).unwrap();
@@ -129,10 +117,54 @@ fn nas_safe_staged_profile() {
         v["op"] == "Unlink" && v["name"] == "f0" && v["extra"].as_array().unwrap().iter().any(|kv| kv[0] == "trash")
     };
     assert!(audit_events(&dir).iter().any(trashed), "审计日志里有 rm f0（进回收站）的 Unlink");
+    two_mounts(&dir, &mp);
+    scrub_repairs_an_injected_corruption(&dir, &home);
     audit_survives_a_mgr_restart(&dir, &home, n);
     wmfs(&dir, &["dev", "umount", mp.to_str().unwrap()]);
-    println!("nas-safe：写了 {n} 个 fsync 过的文件，依次 kill 了 3 个节点，0 个错误；审计日志在 mgr 重启后完整");
+    println!(
+        "nas-safe：写了 {n} 个 fsync 过的文件，依次 kill 了 3 个节点，0 个错误；②–⑤、scrub 修复、mgr 重启后审计日志完整"
+    );
     drop(c);
+}
+
+/// ②–⑤（`common.rs`）：再挂一个客户端，两个挂载点上 rename 原子、strong 追加（strong 子树）、锁互斥、配额（/home 下的 cto 目录）。
+fn two_mounts(dir: &Path, mp: &Path) {
+    let mp2 = dir.join("mnt2");
+    std::fs::create_dir_all(&mp2).unwrap();
+    wmfs(dir, &["dev", "mount", mp2.to_str().unwrap()]);
+    for d in ["strong", "locks", "q"] {
+        std::fs::create_dir(mp.join("home").join(d)).unwrap();
+    }
+    wmfs(dir, &["set", "/home/strong", "consistency=strong", "--json"]);
+    let (a, b) = (mp.join("home/strong"), mp2.join("home/strong"));
+    common::rename_is_atomic(&a, &b);
+    common::strong_append(&a, &b, 200);
+    common::lock_counter(&mp.join("home/locks"), &mp2.join("home/locks"), 1000);
+    let (hard_mib, writers) = (32, 4);
+    common::quota_bound(dir, 3, &mp.join("home/q"), &mp2.join("home/q"), "/home/q", hard_mib, writers);
+    wmfs(dir, &["dev", "umount", mp2.to_str().unwrap()]);
+}
+
+/// scrub 发现注入的损坏并修复（9.7）：坏掉 node2 上一个副本的第 0 块，跑一轮 scrub → changelog 里有这个文件的 `ChecksumRepaired`，
+/// 内容不变（`wmfs fs get` 绕过页缓存）。
+fn scrub_repairs_an_injected_corruption(dir: &Path, home: &Path) {
+    let data: Vec<u8> = (0..(4u32 << 20)).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    let mut f = std::fs::File::create(home.join("scrub")).unwrap();
+    f.write_all(&data).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let st: serde_json::Value = serde_json::from_str(&wmfs(dir, &["fs", "stat", "/home/scrub", "--json"])).unwrap();
+    wmfs(dir, &["debug", "corrupt-chunk", "/home/scrub", "0", "--node", "2", "--block", "0"]);
+    wmfs(dir, &["task", "run", "scrub", "--json"]);
+    wmfs(dir, &["dev", "wait", "task-idle", "scrub", "--timeout", "300"]);
+    let page: serde_json::Value =
+        serde_json::from_str(&wmfs(dir, &["changelog", "tail", "-n", "200", "--json"])).unwrap();
+    let repaired =
+        page["events"].as_array().unwrap().iter().any(|e| e["op"] == "ChecksumRepaired" && e["ino"] == st["ino"]);
+    assert!(repaired, "scrub 修好了注入的损坏：changelog 有 ChecksumRepaired：{page}");
+    let back = dir.join("scrub.back");
+    wmfs(dir, &["fs", "get", "/home/scrub", back.to_str().unwrap()]);
+    assert!(std::fs::read(&back).unwrap() == data, "修复之后内容不变");
 }
 
 /// 审计日志（mgr 的 audit-log 写的全部文件）里的每一行（M14）；只有 audited 的记录才会写进去。

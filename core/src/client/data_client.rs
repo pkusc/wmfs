@@ -164,7 +164,7 @@ impl DataClient {
         Ok((buf, n))
     }
 
-    /// 返回 version
+    /// 返回 version；同一次调用的重试沿用同一个 `write_id`（ADR-0046：head 与各副本按 `(session, write_id)` 去重）。
     pub fn write(
         &self,
         cap: &[u8],
@@ -173,12 +173,14 @@ impl DataClient {
         data: Vec<BufSlice>,
         sync: bool,
     ) -> Result<u64 /*version*/, ErrCode> {
-        let op = |ver| DataOp::WriteChunk { chunk, chain_ver: ver, extents: extents.clone(), sync };
+        let write_id = rand::random_u64().max(1);
+        let op = |ver| DataOp::WriteChunk { chunk, chain_ver: ver, extents: extents.clone(), sync, write_id };
         written(&self.exchange(cap, chunk.chain, &op, &data, To::Head)?)
     }
 
     pub fn truncate(&self, cap: &[u8], chunk: ChunkId, new_len: u32) -> Result<u64, ErrCode> {
-        let op = |ver| DataOp::TruncateChunk { chunk, chain_ver: ver, new_len };
+        let write_id = rand::random_u64().max(1);
+        let op = |ver| DataOp::TruncateChunk { chunk, chain_ver: ver, new_len, write_id };
         written(&self.exchange(cap, chunk.chain, &op, &[], To::Head)?)
     }
 

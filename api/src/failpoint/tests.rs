@@ -22,6 +22,13 @@ fn return_code_by_name() {
 }
 
 #[test]
+fn active_is_true_while_any_point_is_configured() {
+    set("test.active", "return(EIO)").unwrap();
+    assert!(active(), "配置了 fail point：热路径要去拼带后缀的名字");
+    clear("test.active"); // 别的测试可能还开着自己的，所以清掉之后不断言 false
+}
+
+#[test]
 fn internal_const_matches_code_table() {
     assert_eq!(codes::from_name("INTERNAL"), Some(INTERNAL));
 }

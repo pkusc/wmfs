@@ -29,7 +29,7 @@ pub fn up(d: &Path, want: u32, rdma: Option<Ipv4Addr>, profile: Profile) -> Resu
         if nd.join("NODE").exists() {
             check_profile(&nd, profile)?;
         } else if n > 1 {
-            cluster::join(d, n, profile)?; // node1 已经在运行（上一轮起的）
+            cluster::join(d, n, profile, rdma)?; // node1 已经在运行（上一轮起的）
         } else {
             let (rpc_port, mgmt_port) = ports(n);
             let o = InitOpts {
@@ -44,6 +44,7 @@ pub fn up(d: &Path, want: u32, rdma: Option<Ipv4Addr>, profile: Profile) -> Resu
                 plugins: crate::registry::init_plugin_list(&profile.disabled_plugins(), &[])?,
                 targets: vec![dev_target(&nd)],
                 profile,
+                data_transport: rdma.map(|ip| super::rdma::transport(n, ip)).transpose()?,
             };
             init_node(&o)?;
         }

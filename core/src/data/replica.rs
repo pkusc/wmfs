@@ -156,6 +156,9 @@ fn apply(node: &Arc<DataNode>, fw: ForwardWrite, bulk: Option<Buf>, here: Here, 
     };
     match node.chunks.take_held(&id) {
         Some(mut p) if p.version == fw.version => {
+            if p.dedup.1 == 0 {
+                p.dedup = fw.dedup;
+            }
             if let Some(prev) = p.upstream.replace(up) {
                 prev.fail(ErrCode::RETRY); // 前驱重新驱动了：以新的这个请求为准
             }
@@ -172,6 +175,7 @@ fn apply(node: &Arc<DataNode>, fw: ForwardWrite, bulk: Option<Buf>, here: Here, 
                 if let Some(p) = old {
                     node.chunks.put_held(&id, p); // 更新的 pending 留着
                 }
+                node.dedup.record(id, fw.dedup, fw.version);
                 sync::touch(node, &id, here.target);
                 done(node, &id, || up.ok(c)) // 重复：同版本即同内容（I6）
             }
@@ -221,6 +225,7 @@ fn accept(node: &Arc<DataNode>, mut fw: ForwardWrite, data: Option<FrozenBuf>, h
         sync: fw.sync,
         clean,
         committed: false,
+        dedup: fw.dedup,
     };
     match here.succ {
         None => write::drain(node, forward::settle(node, &id, p)), // 自己是尾：提交并确认
